@@ -1,0 +1,135 @@
+// Command ssh-agent-proxy is a filtering proxy in front of an SSH agent.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/app"
+	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/proxy"
+	"github.com/krisiasty/ssh-agent-proxy/internal/service"
+)
+
+// Build metadata, injected via -ldflags by GoReleaser.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var (
+		fInstall    = flag.Bool("install", false, "install and start the service, then exit")
+		fUninstall  = flag.Bool("uninstall", false, "stop and remove the service, then exit")
+		fStart      = flag.Bool("start", false, "start the service, then exit")
+		fStop       = flag.Bool("stop", false, "stop the service, then exit")
+		fRestart    = flag.Bool("restart", false, "restart the service, then exit")
+		fStatus     = flag.Bool("status", false, "print service status, then exit")
+		fList       = flag.Bool("list", false, "list upstream keys as ready-to-paste config entries")
+		fForeground = flag.Bool("foreground", false, "run in the foreground, logging to stdout")
+		fConfig     = flag.String("config", "", "path to config file (default: <user config dir>/ssh-agent-proxy/config.yaml)")
+		fVersion    = flag.Bool("version", false, "print version and exit")
+	)
+	flag.Parse()
+
+	if *fVersion {
+		fmt.Printf("ssh-agent-proxy %s (commit %s, built %s)\n", version, commit, date)
+		return nil
+	}
+
+	cfgPath := *fConfig
+	if cfgPath == "" {
+		p, err := config.DefaultPath()
+		if err != nil {
+			return err
+		}
+		cfgPath = p
+	}
+
+	// Ensure at most one lifecycle action is requested.
+	actions := map[string]bool{
+		"-install": *fInstall, "-uninstall": *fUninstall, "-start": *fStart,
+		"-stop": *fStop, "-restart": *fRestart, "-status": *fStatus, "-list": *fList,
+	}
+	var chosen string
+	for name, set := range actions {
+		if !set {
+			continue
+		}
+		if chosen != "" {
+			return fmt.Errorf("%s and %s cannot be combined", chosen, name)
+		}
+		chosen = name
+	}
+
+	switch {
+	case *fList:
+		return listKeys(cfgPath)
+	case *fInstall, *fUninstall, *fStart, *fStop, *fRestart, *fStatus:
+		return manageService(cfgPath, *fInstall, *fUninstall, *fStart, *fStop, *fRestart, *fStatus)
+	default:
+		// No lifecycle action: run the service runtime.
+		return app.Run(cfgPath, *fForeground)
+	}
+}
+
+func listKeys(cfgPath string) error {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	return proxy.ListUpstream(cfg.Upstream, os.Stdout)
+}
+
+func manageService(cfgPath string, install, uninstall, start, stop, restart, status bool) error {
+	mgr, err := service.New(cfgPath)
+	if err != nil {
+		return err
+	}
+	switch {
+	case install:
+		if err := mgr.Install(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy installed and started.")
+	case uninstall:
+		if err := mgr.Uninstall(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy uninstalled.")
+	case start:
+		if err := mgr.Start(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy started.")
+	case stop:
+		if err := mgr.Stop(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy stopped.")
+	case restart:
+		if err := mgr.Restart(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy restarted.")
+	case status:
+		st, err := mgr.Status()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("installed: %t\nrunning:   %t\n", st.Installed, st.Running)
+		if st.Detail != "" {
+			fmt.Printf("\n%s\n", st.Detail)
+		}
+	}
+	return nil
+}
