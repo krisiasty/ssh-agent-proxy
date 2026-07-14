@@ -38,10 +38,17 @@ type Manager interface {
 	LogHint() string
 }
 
-// reinstall replaces an existing installation: uninstall, then install.
+// reinstall replaces an existing installation: uninstall (only if currently
+// installed, to avoid spurious "not loaded" errors), then install.
 func reinstall(m Manager) error {
-	if err := m.Uninstall(); err != nil {
+	st, err := m.Status()
+	if err != nil {
 		return err
+	}
+	if st.Installed {
+		if err := m.Uninstall(); err != nil {
+			return err
+		}
 	}
 	return m.Install()
 }
