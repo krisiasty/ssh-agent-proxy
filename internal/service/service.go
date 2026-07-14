@@ -90,15 +90,11 @@ debug: false
 
 # Filtered views of the upstream agent. Each group is exposed on its own socket;
 # point a client at it with: export SSH_AUTH_SOCK=<socket>
-groups: []
-#  - name: work
-#    enabled: true
-#    socket: ~/.ssh/agent-work.sock
-#    keys:
-#      - type: comment
-#        value: laptop@work
-#      - type: sha256
-#        value: SHA256:...
-#      - type: md5
-#        value: MD5:aa:bb:cc:...
+# Populate a group's keys with entries from 'ssh-agent-proxy -list'
+# (match by comment, sha256 or md5).
+groups:
+  - name: default
+    enabled: false
+    socket: ~/.ssh/agent-default.sock
+    keys: []
 `

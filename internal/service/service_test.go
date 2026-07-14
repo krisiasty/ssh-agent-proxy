@@ -1,9 +1,27 @@
 package service
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 )
+
+func TestSampleConfigIsValid(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(p, []byte(sampleConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("sample config does not parse: %v", err)
+	}
+	if len(cfg.Groups) != 1 || cfg.Groups[0].Name != "default" || cfg.Groups[0].IsEnabled() {
+		t.Errorf("unexpected sample groups: %+v", cfg.Groups)
+	}
+}
 
 // fakeManager records the lifecycle calls made against it.
 type fakeManager struct {
