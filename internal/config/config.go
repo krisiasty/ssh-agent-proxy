@@ -22,14 +22,20 @@ type KeyEntry struct {
 
 // Group is a named set of keys exposed on its own socket.
 type Group struct {
-	Socket string     `yaml:"socket"`
-	Keys   []KeyEntry `yaml:"keys"`
+	Name    string     `yaml:"name"`
+	Enabled *bool      `yaml:"enabled"`
+	Socket  string     `yaml:"socket"`
+	Keys    []KeyEntry `yaml:"keys"`
 
 	matchers []keys.Matcher
 }
 
 // Matchers returns the compiled matchers for the group, in config order.
 func (g *Group) Matchers() []keys.Matcher { return g.matchers }
+
+// IsEnabled reports whether the group is active. Groups are enabled unless
+// 'enabled: false' is set explicitly.
+func (g *Group) IsEnabled() bool { return g.Enabled == nil || *g.Enabled }
 
 // Config is the parsed and resolved configuration.
 type Config struct {
@@ -79,14 +85,23 @@ func (c *Config) resolve() error {
 	}
 	c.Upstream = up
 
+	seenNames := make(map[string]bool)
 	for i := range c.Groups {
 		g := &c.Groups[i]
+		if strings.TrimSpace(g.Name) == "" {
+			return fmt.Errorf("config: group #%d: 'name' is required", i+1)
+		}
+		if seenNames[g.Name] {
+			return fmt.Errorf("config: duplicate group name %q", g.Name)
+		}
+		seenNames[g.Name] = true
+
 		if strings.TrimSpace(g.Socket) == "" {
-			return fmt.Errorf("config: group #%d: 'socket' is required", i+1)
+			return fmt.Errorf("config: group %q: 'socket' is required", g.Name)
 		}
 		sock, err := expandPath(g.Socket)
 		if err != nil {
-			return fmt.Errorf("config: group #%d: socket: %w", i+1, err)
+			return fmt.Errorf("config: group %q: socket: %w", g.Name, err)
 		}
 		g.Socket = sock
 
@@ -94,7 +109,7 @@ func (c *Config) resolve() error {
 		for j, ke := range g.Keys {
 			m, err := keys.NewMatcher(ke.Type, ke.Value)
 			if err != nil {
-				return fmt.Errorf("config: group #%d, key #%d: %w", i+1, j+1, err)
+				return fmt.Errorf("config: group %q, key #%d: %w", g.Name, j+1, err)
 			}
 			g.matchers = append(g.matchers, m)
 		}

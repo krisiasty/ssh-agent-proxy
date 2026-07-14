@@ -29,7 +29,15 @@ func New(cfgPath string) (Manager, error) {
 	}, nil
 }
 
+func (m *systemdManager) installed() bool {
+	_, err := os.Stat(m.unitPath)
+	return err == nil
+}
+
 func (m *systemdManager) Install() error {
+	if m.installed() {
+		return ErrAlreadyInstalled
+	}
 	if err := ensureConfigScaffold(m.cfgPath); err != nil {
 		return err
 	}
@@ -71,22 +79,44 @@ func (m *systemdManager) Uninstall() error {
 	return m.systemctl("daemon-reload")
 }
 
+func (m *systemdManager) Reinstall() error { return reinstall(m) }
+
+func (m *systemdManager) LogHint() string {
+	return "systemd journal (journalctl --user -u " + unitName + ")"
+}
+
 func (m *systemdManager) Start() error   { return m.systemctl("start", unitName) }
 func (m *systemdManager) Stop() error    { return m.systemctl("stop", unitName) }
 func (m *systemdManager) Restart() error { return m.systemctl("restart", unitName) }
 
 func (m *systemdManager) Status() (Status, error) {
-	installed := true
-	if _, err := os.Stat(m.unitPath); os.IsNotExist(err) {
-		installed = false
+	st := Status{}
+	if _, err := os.Stat(m.unitPath); err == nil {
+		st.Installed = true
 	}
 	active := strings.TrimSpace(m.systemctlOut("is-active", unitName))
-	detail := strings.TrimSpace(m.systemctlOut("--no-pager", "status", unitName))
-	return Status{
-		Installed: installed,
-		Running:   active == "active",
-		Detail:    detail,
-	}, nil
+	st.Running = active == "active"
+	if pid := strings.TrimSpace(m.systemctlOut("show", "-p", "MainPID", "--value", unitName)); pid != "" && pid != "0" {
+		st.PID = pid
+	}
+	st.Program = m.execStartBinary()
+	return st, nil
+}
+
+// execStartBinary reads the binary path from the unit file's ExecStart line.
+func (m *systemdManager) execStartBinary() string {
+	data, err := os.ReadFile(m.unitPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "ExecStart="); ok {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+	return ""
 }
 
 func (m *systemdManager) systemctl(args ...string) error {

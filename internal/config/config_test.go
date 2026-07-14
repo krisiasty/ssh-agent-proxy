@@ -22,10 +22,19 @@ func TestLoadValid(t *testing.T) {
 upstream: ${SSH_AUTH_SOCK}
 debug: true
 groups:
-  - socket: /tmp/work.sock
+  - name: work
+    socket: /tmp/work.sock
     keys:
-      - {type: comment, value: laptop@work}
-      - {type: sha256, value: SHA256:abc}
+      - type: comment
+        value: laptop@work
+      - type: sha256
+        value: SHA256:abc
+  - name: personal
+    enabled: false
+    socket: /tmp/personal.sock
+    keys:
+      - type: comment
+        value: home
 `)
 	cfg, err := Load(p)
 	if err != nil {
@@ -37,17 +46,29 @@ groups:
 	if !cfg.Debug {
 		t.Error("debug should be true")
 	}
-	if len(cfg.Groups) != 1 || len(cfg.Groups[0].Matchers()) != 2 {
-		t.Fatalf("expected 1 group with 2 matchers, got %+v", cfg.Groups)
+	if len(cfg.Groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(cfg.Groups))
+	}
+	if cfg.Groups[0].Name != "work" || len(cfg.Groups[0].Matchers()) != 2 {
+		t.Errorf("group 0 = %q with %d matchers", cfg.Groups[0].Name, len(cfg.Groups[0].Matchers()))
+	}
+	// enabled defaults to true when omitted, is false when set false.
+	if !cfg.Groups[0].IsEnabled() {
+		t.Error("group 'work' should be enabled by default")
+	}
+	if cfg.Groups[1].IsEnabled() {
+		t.Error("group 'personal' should be disabled")
 	}
 }
 
 func TestLoadErrors(t *testing.T) {
 	cases := map[string]string{
 		"missing upstream": "groups: []\n",
-		"group no socket":  "upstream: /a\ngroups:\n  - keys: []\n",
-		"bad key type":     "upstream: /a\ngroups:\n  - socket: /s\n    keys:\n      - {type: foo, value: x}\n",
-		"empty key value":  "upstream: /a\ngroups:\n  - socket: /s\n    keys:\n      - {type: comment, value: \"\"}\n",
+		"missing name":     "upstream: /a\ngroups:\n  - socket: /s\n",
+		"duplicate name":   "upstream: /a\ngroups:\n  - {name: g, socket: /s1}\n  - {name: g, socket: /s2}\n",
+		"group no socket":  "upstream: /a\ngroups:\n  - name: g\n",
+		"bad key type":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: foo, value: x}\n",
+		"empty key value":  "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: comment, value: \"\"}\n",
 		"unknown field":    "upstream: /a\nnope: 1\n",
 		"not yaml":         "upstream: [unterminated\n",
 	}

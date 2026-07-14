@@ -88,7 +88,8 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 
 | Flag           | Description                                                            |
 | -------------- | ---------------------------------------------------------------------- |
-| `-install`     | Install and start the service, then exit.                              |
+| `-install`     | Install and start the service, then exit. Fails if already installed.  |
+| `-reinstall`   | Reinstall (uninstall then install), then exit. Use to update the installed binary path. |
 | `-uninstall`   | Stop and remove the service, then exit.                                |
 | `-start`       | Start the service, then exit.                                          |
 | `-stop`        | Stop the service, then exit.                                           |
@@ -108,14 +109,18 @@ the foreground of the current process — this is how the service manager runs i
 ssh-agent-proxy -list
 ```
 
-prints every key in the upstream agent together with all three ways to match it, as
-commented YAML you can paste under a group's `keys:`:
+prints every key in the upstream agent with all three ways to match it, as YAML entries
+you can paste under a group's `keys:`. Each key is preceded by a header line with its
+index, algorithm, and size in bits:
 
 ```yaml
-# [1] ssh-ed25519 — laptop@work
-    # - {type: comment, value: laptop@work}
-    # - {type: sha256, value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI}
-    # - {type: md5,    value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9}
+[1] ssh-ed25519 256
+  - type: comment
+    value: laptop@work
+  - type: sha256
+    value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI
+  - type: md5
+    value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9
 ```
 
 ## Configuration
@@ -133,6 +138,8 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 | `upstream`          | yes      | Path to the upstream SSH agent socket. Env vars (`${VAR}`) and `~` are expanded. |
 | `debug`             | no       | `true` for verbose logging (default `false`).                           |
 | `groups`            | no       | List of groups. With none defined, no keys are exposed.                 |
+| `groups[].name`     | yes\*    | Unique name for the group (used in logs). \*Required if the group exists.|
+| `groups[].enabled`  | no       | `true` (default) to expose the group, `false` to skip it.               |
 | `groups[].socket`   | yes\*    | Socket path this group is exposed on (\*required if the group exists).  |
 | `groups[].keys`     | no       | Ordered list of key entries assigned to the group.                      |
 | `groups[].keys[].type`  | yes  | `comment`, `md5`, or `sha256`.                                          |
@@ -140,6 +147,9 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 
 Notes:
 
+- Each group needs a **unique `name`**; it appears in log messages.
+- A group with **`enabled: false`** is not exposed (its socket is not created). Omitting
+  `enabled` means the group is enabled.
 - **`comment`** matches the key comment exactly (case-sensitive).
 - **`md5`** matches the MD5 fingerprint; the `MD5:` prefix is optional.
 - **`sha256`** matches the SHA256 hash; the `SHA256:` prefix is optional.
@@ -161,14 +171,21 @@ debug: false
 # Filtered views of the upstream agent. Point a client at a group with:
 #   export SSH_AUTH_SOCK=<socket>
 groups:
-  - socket: ~/.ssh/agent-work.sock
+  - name: work
+    enabled: true
+    socket: ~/.ssh/agent-work.sock
     keys:
-      - {type: comment, value: laptop@work}
-      - {type: sha256,  value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI}
+      - type: comment
+        value: laptop@work
+      - type: sha256
+        value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI
 
-  - socket: ~/.ssh/agent-personal.sock
+  - name: personal
+    enabled: false
+    socket: ~/.ssh/agent-personal.sock
     keys:
-      - {type: md5, value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9}
+      - type: md5
+        value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9
 ```
 
 Configuration is read once at startup; run `ssh-agent-proxy -restart` to apply changes.

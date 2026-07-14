@@ -3,6 +3,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,21 +12,38 @@ import (
 // Label is the reverse-DNS identifier used for the service/agent.
 const Label = "io.github.krisiasty.ssh-agent-proxy"
 
+// ErrAlreadyInstalled is returned by Install when the service is already
+// installed. Use Reinstall to replace an existing installation.
+var ErrAlreadyInstalled = errors.New("ssh-agent-proxy is already installed; use -reinstall to reinstall")
+
 // Status describes the current install/run state of the service.
 type Status struct {
 	Installed bool
 	Running   bool
-	Detail    string
+	PID       string // process id if running, else ""
+	Program   string // binary path the service is configured to run, else ""
 }
 
 // Manager installs and controls the platform service.
 type Manager interface {
 	Install() error
+	Reinstall() error
 	Uninstall() error
 	Start() error
 	Stop() error
 	Restart() error
 	Status() (Status, error)
+	// LogHint describes where the service's logs go, phrased to read after
+	// "logs:" (a file path on macOS, a journalctl command on Linux).
+	LogHint() string
+}
+
+// reinstall replaces an existing installation: uninstall, then install.
+func reinstall(m Manager) error {
+	if err := m.Uninstall(); err != nil {
+		return err
+	}
+	return m.Install()
 }
 
 // executablePath returns the absolute, symlink-resolved path to this binary.
@@ -66,9 +84,14 @@ debug: false
 # Filtered views of the upstream agent. Each group is exposed on its own socket;
 # point a client at it with: export SSH_AUTH_SOCK=<socket>
 groups: []
-#  - socket: ~/.ssh/agent-work.sock
+#  - name: work
+#    enabled: true
+#    socket: ~/.ssh/agent-work.sock
 #    keys:
-#      - {type: comment, value: laptop@work}
-#      - {type: sha256,  value: SHA256:...}
-#      - {type: md5,     value: MD5:aa:bb:cc:...}
+#      - type: comment
+#        value: laptop@work
+#      - type: sha256
+#        value: SHA256:...
+#      - type: md5
+#        value: MD5:aa:bb:cc:...
 `

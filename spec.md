@@ -57,6 +57,9 @@ This is the tool's core guarantee and must hold for every group socket:
   variables are expanded (e.g. `${SSH_AUTH_SOCK}`).
 - **`debug`** (optional, default `false`): enable verbose logging.
 - **`groups`** (optional): a list of groups. Each group has:
+  - **`name`** (required): a unique name for the group, used in log messages.
+  - **`enabled`** (optional, default `true`): set `false` to skip the group entirely
+    (its socket is not created).
   - **`socket`** (required): path to the socket this group is exposed on.
   - **`keys`** (optional): an ordered list of key entries. Each entry is an object:
     - **`type`** (required): one of `comment`, `md5`, `sha256`.
@@ -75,13 +78,17 @@ upstream: ${SSH_AUTH_SOCK}
 debug: false
 
 groups:
-  - socket: ~/.ssh/agent-work.sock
+  - name: work
+    enabled: true
+    socket: ~/.ssh/agent-work.sock
     keys:
       - type: comment
         value: laptop@work
       - type: sha256
         value: SHA256:abc123...
-  - socket: ~/.ssh/agent-personal.sock
+  - name: personal
+    enabled: false
+    socket: ~/.ssh/agent-personal.sock
     keys:
       - type: md5
         value: MD5:aa:bb:cc:dd:...
@@ -96,9 +103,10 @@ Clients select a group by pointing `SSH_AUTH_SOCK` at that group's socket, e.g.
   restricted to the group's keys as described in the security model.
 - All **mutating requests** (add identity, remove identity, remove all, lock, unlock,
   add smartcard, extensions) are **rejected read-only** with `SSH_AGENT_FAILURE`.
-- On start, each group socket is created; a pre-existing (stale) socket file at that
-  path is removed and replaced. Sockets are created with `0600` permissions and are
-  removed on clean shutdown.
+- On start, each **enabled** group's socket is created; disabled groups
+  (`enabled: false`) are skipped. A pre-existing (stale) socket file at that path is
+  removed and replaced. Sockets are created with `0600` permissions and are removed on
+  clean shutdown.
 - If the upstream agent is unreachable when a request arrives, the proxy returns a
   failure to the client and logs the condition; it keeps running.
 - A single-instance guard (lock/PID file) prevents two daemons from binding the same
@@ -117,7 +125,10 @@ Clients select a group by pointing `SSH_AUTH_SOCK` at that group's socket, e.g.
 
 The tool manages its own installation and lifecycle via command-line flags:
 
-- `-install` — install as a per-user service and create the config directory.
+- `-install` — install as a per-user service and create the config directory. Fails
+  with an error if the service is already installed (use `-reinstall`).
+- `-reinstall` — reinstall the service (uninstall then install); used to update the
+  recorded binary path after moving/upgrading the binary.
 - `-uninstall` — remove the service.
 - `-start`, `-stop`, `-restart` — control the running service.
 - `-status` — report whether the service is running, its PID, each group and its
@@ -132,18 +143,23 @@ The tool manages its own installation and lifecycle via command-line flags:
 
 ### `-list` output format
 
-For each upstream key, all three match forms are printed as commented, correctly
-indented YAML so the user can uncomment whichever they prefer and paste it under a
-group's `keys:`. Example:
+Each upstream key is printed with a header line — index, algorithm and key size in
+bits — followed by all applicable match forms as YAML entries the user can paste under
+a group's `keys:`. The `comment` entry is omitted for keys with no comment. Example:
 
 ```yaml
-# [1] ssh-ed25519 256 — laptop@work
-    # - {type: comment, value: laptop@work}
-    # - {type: sha256,  value: SHA256:abc123...}
-    # - {type: md5,     value: MD5:aa:bb:cc:dd:...}
-# [2] ssh-rsa 4096 — (no comment)
-    # - {type: sha256,  value: SHA256:def456...}
-    # - {type: md5,     value: MD5:11:22:33:44:...}
+[1] ssh-ed25519 256
+  - type: comment
+    value: laptop@work
+  - type: sha256
+    value: SHA256:abc123...
+  - type: md5
+    value: MD5:aa:bb:cc:dd:...
+[2] ssh-rsa 4096
+  - type: sha256
+    value: SHA256:def456...
+  - type: md5
+    value: MD5:11:22:33:44:...
 ```
 
 Per-OS integration:

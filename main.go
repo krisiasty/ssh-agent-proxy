@@ -29,6 +29,7 @@ func main() {
 func run() error {
 	var (
 		fInstall    = flag.Bool("install", false, "install and start the service, then exit")
+		fReinstall  = flag.Bool("reinstall", false, "reinstall (uninstall then install) the service, then exit")
 		fUninstall  = flag.Bool("uninstall", false, "stop and remove the service, then exit")
 		fStart      = flag.Bool("start", false, "start the service, then exit")
 		fStop       = flag.Bool("stop", false, "stop the service, then exit")
@@ -57,8 +58,9 @@ func run() error {
 
 	// Ensure at most one lifecycle action is requested.
 	actions := map[string]bool{
-		"-install": *fInstall, "-uninstall": *fUninstall, "-start": *fStart,
-		"-stop": *fStop, "-restart": *fRestart, "-status": *fStatus, "-list": *fList,
+		"-install": *fInstall, "-reinstall": *fReinstall, "-uninstall": *fUninstall,
+		"-start": *fStart, "-stop": *fStop, "-restart": *fRestart,
+		"-status": *fStatus, "-list": *fList,
 	}
 	var chosen string
 	for name, set := range actions {
@@ -71,14 +73,14 @@ func run() error {
 		chosen = name
 	}
 
-	switch {
-	case *fList:
+	switch chosen {
+	case "-list":
 		return listKeys(cfgPath)
-	case *fInstall, *fUninstall, *fStart, *fStop, *fRestart, *fStatus:
-		return manageService(cfgPath, *fInstall, *fUninstall, *fStart, *fStop, *fRestart, *fStatus)
-	default:
+	case "":
 		// No lifecycle action: run the service runtime.
 		return app.Run(cfgPath, *fForeground)
+	default:
+		return manageService(cfgPath, chosen)
 	}
 }
 
@@ -90,46 +92,66 @@ func listKeys(cfgPath string) error {
 	return proxy.ListUpstream(cfg.Upstream, os.Stdout)
 }
 
-func manageService(cfgPath string, install, uninstall, start, stop, restart, status bool) error {
+func manageService(cfgPath, action string) error {
 	mgr, err := service.New(cfgPath)
 	if err != nil {
 		return err
 	}
-	switch {
-	case install:
+	switch action {
+	case "-install":
 		if err := mgr.Install(); err != nil {
 			return err
 		}
-		fmt.Println("ssh-agent-proxy installed and started.")
-	case uninstall:
+		printInstalled(cfgPath, mgr)
+	case "-reinstall":
+		if err := mgr.Reinstall(); err != nil {
+			return err
+		}
+		printInstalled(cfgPath, mgr)
+	case "-uninstall":
 		if err := mgr.Uninstall(); err != nil {
 			return err
 		}
 		fmt.Println("ssh-agent-proxy uninstalled.")
-	case start:
+	case "-start":
 		if err := mgr.Start(); err != nil {
 			return err
 		}
 		fmt.Println("ssh-agent-proxy started.")
-	case stop:
+	case "-stop":
 		if err := mgr.Stop(); err != nil {
 			return err
 		}
 		fmt.Println("ssh-agent-proxy stopped.")
-	case restart:
+	case "-restart":
 		if err := mgr.Restart(); err != nil {
 			return err
 		}
 		fmt.Println("ssh-agent-proxy restarted.")
-	case status:
+	case "-status":
 		st, err := mgr.Status()
 		if err != nil {
 			return err
 		}
-		fmt.Printf("installed: %t\nrunning:   %t\n", st.Installed, st.Running)
-		if st.Detail != "" {
-			fmt.Printf("\n%s\n", st.Detail)
+		fmt.Printf("installed: %t\n", st.Installed)
+		fmt.Printf("running:   %t\n", st.Running)
+		if st.PID != "" {
+			fmt.Printf("pid:       %s\n", st.PID)
 		}
+		if st.Program != "" {
+			fmt.Printf("binary:    %s\n", st.Program)
+		}
+		fmt.Printf("config:    %s\n", cfgPath)
+		fmt.Printf("logs:      %s\n", mgr.LogHint())
 	}
 	return nil
+}
+
+// printInstalled reports the config and log locations after a successful
+// install or reinstall.
+func printInstalled(cfgPath string, mgr service.Manager) {
+	fmt.Println("ssh-agent-proxy installed and started.")
+	fmt.Printf("  config: %s\n", cfgPath)
+	fmt.Printf("  logs:   %s\n", mgr.LogHint())
+	fmt.Println("\nEdit the config, then run: ssh-agent-proxy -restart")
 }

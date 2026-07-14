@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -29,7 +30,15 @@ func New(cfgPath string) (Manager, error) {
 	}, nil
 }
 
+func (m *launchdManager) installed() bool {
+	_, err := os.Stat(m.plistPath)
+	return err == nil
+}
+
 func (m *launchdManager) Install() error {
+	if m.installed() {
+		return ErrAlreadyInstalled
+	}
 	if err := ensureConfigScaffold(m.cfgPath); err != nil {
 		return err
 	}
@@ -83,6 +92,10 @@ func (m *launchdManager) Uninstall() error {
 	return nil
 }
 
+func (m *launchdManager) Reinstall() error { return reinstall(m) }
+
+func (m *launchdManager) LogHint() string { return m.logPath }
+
 func (m *launchdManager) Start() error { return m.launchctl("start", Label) }
 func (m *launchdManager) Stop() error  { return m.launchctl("stop", Label) }
 
@@ -91,18 +104,31 @@ func (m *launchdManager) Restart() error {
 	return m.Start()
 }
 
+var (
+	reLaunchdPID     = regexp.MustCompile(`"PID"\s*=\s*(\d+);`)
+	reLaunchdProgram = regexp.MustCompile(`"Program"\s*=\s*"([^"]*)";`)
+	reLaunchdArg0    = regexp.MustCompile(`"ProgramArguments"\s*=\s*\(\s*"([^"]*)"`)
+)
+
 func (m *launchdManager) Status() (Status, error) {
-	installed := true
-	if _, err := os.Stat(m.plistPath); os.IsNotExist(err) {
-		installed = false
+	st := Status{}
+	if _, err := os.Stat(m.plistPath); err == nil {
+		st.Installed = true
 	}
 	out, err := exec.Command("launchctl", "list", Label).CombinedOutput()
-	running := err == nil && strings.Contains(string(out), "\"PID\"")
-	detail := strings.TrimSpace(string(out))
-	if !installed {
-		detail = "not installed"
+	if err == nil {
+		s := string(out)
+		if mt := reLaunchdPID.FindStringSubmatch(s); mt != nil {
+			st.Running = true
+			st.PID = mt[1]
+		}
+		if mt := reLaunchdProgram.FindStringSubmatch(s); mt != nil {
+			st.Program = mt[1]
+		} else if mt := reLaunchdArg0.FindStringSubmatch(s); mt != nil {
+			st.Program = mt[1]
+		}
 	}
-	return Status{Installed: installed, Running: running, Detail: detail}, nil
+	return st, nil
 }
 
 func (m *launchdManager) launchctl(args ...string) error {

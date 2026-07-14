@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,15 +38,19 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 	var listeners []net.Listener
 	for i := range groups {
 		g := groups[i]
+		if !g.IsEnabled() {
+			s.log.Info("group disabled, skipping", "group", g.Name)
+			continue
+		}
 		ln, err := s.listen(g.Socket)
 		if err != nil {
 			for _, l := range listeners {
 				l.Close()
 			}
-			return fmt.Errorf("group socket %q: %w", g.Socket, err)
+			return fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
 		}
 		listeners = append(listeners, ln)
-		s.log.Info("serving group", "socket", g.Socket, "keys", len(g.Keys))
+		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
 		go s.acceptLoop(ln, g)
 	}
 
@@ -92,7 +99,7 @@ func (s *Server) serveConn(client net.Conn, g config.Group) {
 
 	up, err := net.Dial("unix", s.upstream)
 	if err != nil {
-		s.log.Warn("upstream agent unreachable", "socket", g.Socket, "upstream", s.upstream, "err", err)
+		s.log.Warn("upstream agent unreachable", "group", g.Name, "upstream", s.upstream, "err", err)
 		return
 	}
 	defer up.Close()
@@ -100,7 +107,7 @@ func (s *Server) serveConn(client net.Conn, g config.Group) {
 	fa := &filterAgent{
 		up:       agent.NewClient(up),
 		matchers: g.Matchers(),
-		group:    g.Socket,
+		group:    g.Name,
 		log:      s.log,
 	}
 	if err := agent.ServeAgent(fa, client); err != nil && err != io.EOF {
@@ -122,21 +129,44 @@ func ListUpstream(upstream string, w io.Writer) error {
 		return fmt.Errorf("listing upstream keys: %w", err)
 	}
 	if len(ks) == 0 {
-		fmt.Fprintln(w, "# upstream agent has no keys")
+		fmt.Fprintln(w, "upstream agent has no keys")
 		return nil
 	}
 
 	for i, k := range ks {
-		label := k.Comment
-		if label == "" {
-			label = "(no comment)"
+		if bits := keyBits(k.Blob); bits > 0 {
+			fmt.Fprintf(w, "[%d] %s %d\n", i+1, k.Format, bits)
+		} else {
+			fmt.Fprintf(w, "[%d] %s\n", i+1, k.Format)
 		}
-		fmt.Fprintf(w, "# [%d] %s — %s\n", i+1, k.Format, label)
 		if k.Comment != "" {
-			fmt.Fprintf(w, "    # - {type: comment, value: %s}\n", k.Comment)
+			fmt.Fprintf(w, "  - type: comment\n    value: %s\n", k.Comment)
 		}
-		fmt.Fprintf(w, "    # - {type: sha256, value: %s}\n", ssh.FingerprintSHA256(k))
-		fmt.Fprintf(w, "    # - {type: md5,    value: MD5:%s}\n", ssh.FingerprintLegacyMD5(k))
+		fmt.Fprintf(w, "  - type: sha256\n    value: %s\n", ssh.FingerprintSHA256(k))
+		fmt.Fprintf(w, "  - type: md5\n    value: MD5:%s\n", ssh.FingerprintLegacyMD5(k))
 	}
 	return nil
+}
+
+// keyBits returns the key size in bits for the given public-key blob, or 0 if
+// it cannot be determined.
+func keyBits(blob []byte) int {
+	pk, err := ssh.ParsePublicKey(blob)
+	if err != nil {
+		return 0
+	}
+	cpk, ok := pk.(ssh.CryptoPublicKey)
+	if !ok {
+		return 0
+	}
+	switch key := cpk.CryptoPublicKey().(type) {
+	case *rsa.PublicKey:
+		return key.N.BitLen()
+	case *ecdsa.PublicKey:
+		return key.Curve.Params().BitSize
+	case ed25519.PublicKey:
+		return len(key) * 8
+	default:
+		return 0
+	}
 }
