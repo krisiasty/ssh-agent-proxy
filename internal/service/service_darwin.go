@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 )
 
 type launchdManager struct {
@@ -40,7 +42,7 @@ func (m *launchdManager) Install() error {
 	if m.installed() {
 		return ErrAlreadyInstalled
 	}
-	if err := ensureConfigScaffold(m.cfgPath); err != nil {
+	if _, err := config.EnsureScaffold(m.cfgPath); err != nil {
 		return err
 	}
 	exe, err := executablePath()

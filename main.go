@@ -77,7 +77,18 @@ func run() error {
 	case "-list":
 		return listKeys(cfgPath)
 	case "":
-		// No lifecycle action: run the service runtime.
+		// No lifecycle action: run the service runtime. In foreground mode,
+		// scaffold a default config if none exists yet so the tool can be
+		// tried without installing a service first.
+		if *fForeground {
+			created, err := config.EnsureScaffold(cfgPath)
+			if err != nil {
+				return err
+			}
+			if created {
+				fmt.Printf("created default config: %s\nedit it, then restart\n", cfgPath)
+			}
+		}
 		return app.Run(cfgPath, *fForeground)
 	default:
 		return manageService(cfgPath, chosen)

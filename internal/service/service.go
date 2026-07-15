@@ -68,37 +68,3 @@ func executablePath() (string, error) {
 	}
 	return exe, nil
 }
-
-// ensureConfigScaffold creates the config directory and, if no config exists
-// yet, writes a commented sample so the user has a starting point.
-func ensureConfigScaffold(cfgPath string) error {
-	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
-		return fmt.Errorf("creating config dir: %w", err)
-	}
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		if err := os.WriteFile(cfgPath, []byte(sampleConfig), 0o600); err != nil {
-			return fmt.Errorf("writing sample config: %w", err)
-		}
-	}
-	return nil
-}
-
-const sampleConfig = `# ssh-agent-proxy configuration.
-# Run 'ssh-agent-proxy -list' to print your upstream keys as ready-to-paste entries.
-
-# Path to the upstream SSH agent socket (required). Env vars are expanded.
-upstream: ${SSH_AUTH_SOCK}
-
-# Verbose logging.
-debug: false
-
-# Filtered views of the upstream agent. Each group is exposed on its own socket;
-# point a client at it with: export SSH_AUTH_SOCK=<socket>
-# Populate a group's keys with entries from 'ssh-agent-proxy -list'
-# (match by comment, sha256 or md5).
-groups:
-  - name: default
-    enabled: false
-    socket: ~/.ssh/agent-default.sock
-    keys: []
-`

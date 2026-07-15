@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 )
 
 const unitName = "ssh-agent-proxy.service"
@@ -39,7 +41,7 @@ func (m *systemdManager) Install() error {
 	if m.installed() {
 		return ErrAlreadyInstalled
 	}
-	if err := ensureConfigScaffold(m.cfgPath); err != nil {
+	if _, err := config.EnsureScaffold(m.cfgPath); err != nil {
 		return err
 	}
 	exe, err := executablePath()
