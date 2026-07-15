@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Label is the reverse-DNS identifier used for the service/agent.
 const Label = "io.github.krisiasty.ssh-agent-proxy"
+
+// commandTimeout bounds each launchctl/systemctl invocation.
+const commandTimeout = 15 * time.Second
 
 // ErrAlreadyInstalled is returned by Install when the service is already
 // installed. Use Reinstall to replace an existing installation.

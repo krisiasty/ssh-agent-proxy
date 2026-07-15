@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -45,7 +46,7 @@ func (m *systemdManager) Install() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.unitPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.unitPath), 0o700); err != nil {
 		return err
 	}
 	unit := fmt.Sprintf(`[Unit]
@@ -61,7 +62,7 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 `, exe, m.cfgPath)
-	if err := os.WriteFile(m.unitPath, []byte(unit), 0o644); err != nil {
+	if err := os.WriteFile(m.unitPath, []byte(unit), 0o600); err != nil {
 		return fmt.Errorf("writing unit file: %w", err)
 	}
 	if err := m.systemctl("daemon-reload"); err != nil {
@@ -105,6 +106,7 @@ func (m *systemdManager) Status() (Status, error) {
 
 // execStartBinary reads the binary path from the unit file's ExecStart line.
 func (m *systemdManager) execStartBinary() string {
+	//nolint:gosec // G304: unitPath is derived from the user config dir, not untrusted input.
 	data, err := os.ReadFile(m.unitPath)
 	if err != nil {
 		return ""
@@ -120,7 +122,10 @@ func (m *systemdManager) execStartBinary() string {
 }
 
 func (m *systemdManager) systemctl(args ...string) error {
-	cmd := exec.Command("systemctl", append([]string{"--user"}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	//nolint:gosec // fixed command; args are program-controlled, not shell-interpreted.
+	cmd := exec.CommandContext(ctx, "systemctl", append([]string{"--user"}, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -130,7 +135,10 @@ func (m *systemdManager) systemctl(args ...string) error {
 }
 
 func (m *systemdManager) systemctlOut(args ...string) string {
-	cmd := exec.Command("systemctl", append([]string{"--user"}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	//nolint:gosec // fixed command; args are program-controlled, not shell-interpreted.
+	cmd := exec.CommandContext(ctx, "systemctl", append([]string{"--user"}, args...)...)
 	out, _ := cmd.CombinedOutput()
 	return string(out)
 }

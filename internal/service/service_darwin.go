@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,10 +47,10 @@ func (m *launchdManager) Install() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.plistPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.plistPath), 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.logPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.logPath), 0o700); err != nil {
 		return err
 	}
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -78,7 +79,7 @@ func (m *launchdManager) Install() error {
 </dict>
 </plist>
 `, Label, exe, m.cfgPath, m.logPath, m.logPath)
-	if err := os.WriteFile(m.plistPath, []byte(plist), 0o644); err != nil {
+	if err := os.WriteFile(m.plistPath, []byte(plist), 0o600); err != nil {
 		return fmt.Errorf("writing plist: %w", err)
 	}
 	return m.launchctl("load", "-w", m.plistPath)
@@ -115,7 +116,9 @@ func (m *launchdManager) Status() (Status, error) {
 	if _, err := os.Stat(m.plistPath); err == nil {
 		st.Installed = true
 	}
-	out, err := exec.Command("launchctl", "list", Label).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "launchctl", "list", Label).CombinedOutput() //nolint:gosec // fixed command; Label is a package constant.
 	if err == nil {
 		s := string(out)
 		if mt := reLaunchdPID.FindStringSubmatch(s); mt != nil {
@@ -132,7 +135,9 @@ func (m *launchdManager) Status() (Status, error) {
 }
 
 func (m *launchdManager) launchctl(args ...string) error {
-	cmd := exec.Command("launchctl", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "launchctl", args...) //nolint:gosec // fixed command; args are program-controlled, not shell-interpreted.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
