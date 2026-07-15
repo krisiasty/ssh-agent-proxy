@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,10 +159,10 @@ func formatKeys(ks []*agent.Key) string {
 			lines = append(lines, fmt.Sprintf("[%d] %s\n", i+1, k.Format))
 		}
 		if k.Comment != "" {
-			lines = append(lines, fmt.Sprintf("  - type: comment\n    value: %s\n", k.Comment))
+			lines = append(lines, fmt.Sprintf("  - comment: %s\n", strconv.Quote(k.Comment)))
 		}
-		lines = append(lines, fmt.Sprintf("  - type: sha256\n    value: %s\n", ssh.FingerprintSHA256(k)))
-		lines = append(lines, fmt.Sprintf("  - type: md5\n    value: MD5:%s\n", ssh.FingerprintLegacyMD5(k)))
+		lines = append(lines, fmt.Sprintf("  - sha256: %s\n", strconv.Quote(ssh.FingerprintSHA256(k))))
+		lines = append(lines, fmt.Sprintf("  - md5: %s\n", strconv.Quote("MD5:"+ssh.FingerprintLegacyMD5(k))))
 	}
 	return strings.Join(lines, "")
 }

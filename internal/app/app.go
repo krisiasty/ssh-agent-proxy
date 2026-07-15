@@ -37,11 +37,12 @@ func Run(cfgPath string, foreground bool) error {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log := logging.Setup(false)
-		log.Error("configuration error", "path", cfgPath, "err", err)
 		if foreground {
 			return err
 		}
+
+		log := logging.Setup(false)
+		log.Error("configuration error", "err", err)
 		log.Error("idling until stopped; fix the config and restart the service")
 		<-ctx.Done()
 		return nil

@@ -61,11 +61,9 @@ This is the tool's core guarantee and must hold for every group socket:
   - **`enabled`** (optional, default `true`): set `false` to skip the group entirely
     (its socket is not created).
   - **`socket`** (required): path to the socket this group is exposed on.
-  - **`keys`** (optional): an ordered list of key entries. Each entry is an object:
-    - **`type`** (required): one of `comment`, `md5`, `sha256`.
-    - **`value`** (required): the comment string, MD5 fingerprint, or SHA256 hash to
-      match. Comment matches are exact and case-sensitive. `md5`/`sha256` values are
-      accepted with or without the `MD5:` / `SHA256:` prefix.
+  - **`keys`** (optional): an ordered list of key entries. Each entry contains exactly
+    one of `comment`, `md5`, or `sha256`. Comment matches are exact and case-sensitive.
+    MD5 and SHA256 values are accepted with or without their standard prefixes.
 
 The **only required option is `upstream`**. No groups are required, but any group
 that is defined must include `socket`, and its `keys` list (if present) must contain
@@ -82,16 +80,13 @@ groups:
     enabled: true
     socket: ~/.ssh/agent-work.sock
     keys:
-      - type: comment
-        value: laptop@work
-      - type: sha256
-        value: SHA256:abc123...
+      - comment: "laptop@work"
+      - sha256: "SHA256:abc123..."
   - name: personal
     enabled: false
     socket: ~/.ssh/agent-personal.sock
     keys:
-      - type: md5
-        value: MD5:aa:bb:cc:dd:...
+      - md5: "MD5:aa:bb:cc:dd:..."
 ```
 
 Clients select a group by pointing `SSH_AUTH_SOCK` at that group's socket, e.g.
@@ -149,17 +144,12 @@ a group's `keys:`. The `comment` entry is omitted for keys with no comment. Exam
 
 ```yaml
 [1] ssh-ed25519 256
-  - type: comment
-    value: laptop@work
-  - type: sha256
-    value: SHA256:abc123...
-  - type: md5
-    value: MD5:aa:bb:cc:dd:...
+  - comment: "laptop@work"
+  - sha256: "SHA256:abc123..."
+  - md5: "MD5:aa:bb:cc:dd:..."
 [2] ssh-rsa 4096
-  - type: sha256
-    value: SHA256:def456...
-  - type: md5
-    value: MD5:11:22:33:44:...
+  - sha256: "SHA256:def456..."
+  - md5: "MD5:11:22:33:44:..."
 ```
 
 Per-OS integration:

@@ -29,7 +29,7 @@ type Matcher struct {
 	value string // normalized comparison value
 }
 
-// NewMatcher validates and normalizes a (type, value) pair from the config.
+// NewMatcher validates and normalizes a match criterion.
 func NewMatcher(typ, value string) (Matcher, error) {
 	if value == "" {
 		return Matcher{}, fmt.Errorf("key match value must not be empty")

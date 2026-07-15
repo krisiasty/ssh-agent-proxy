@@ -115,12 +115,9 @@ index, algorithm, and size in bits:
 
 ```yaml
 [1] ssh-ed25519 256
-  - type: comment
-    value: laptop@work
-  - type: sha256
-    value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI
-  - type: md5
-    value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9
+  - comment: "laptop@work"
+  - sha256: "SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI"
+  - md5: "MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9"
 ```
 
 ## Configuration
@@ -142,8 +139,9 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 | `groups[].enabled`  | no       | `true` (default) to expose the group, `false` to skip it.               |
 | `groups[].socket`   | yes\*    | Socket path this group is exposed on (\*required if the group exists).  |
 | `groups[].keys`     | no       | Ordered list of key entries assigned to the group.                      |
-| `groups[].keys[].type`  | yes  | `comment`, `md5`, or `sha256`.                                          |
-| `groups[].keys[].value` | yes  | The comment, MD5 fingerprint, or SHA256 hash to match.                  |
+| `groups[].keys[].comment` | no\* | Exact, case-sensitive key comment. \*Exactly one match field is required per entry. |
+| `groups[].keys[].md5` | no\* | MD5 fingerprint, with an optional `MD5:` prefix.                        |
+| `groups[].keys[].sha256` | no\* | SHA256 hash, with an optional `SHA256:` prefix.                         |
 
 Notes:
 
@@ -153,6 +151,7 @@ Notes:
 - **`comment`** matches the key comment exactly (case-sensitive).
 - **`md5`** matches the MD5 fingerprint; the `MD5:` prefix is optional.
 - **`sha256`** matches the SHA256 hash; the `SHA256:` prefix is optional.
+- Each key entry must contain exactly one of `comment`, `md5`, or `sha256`.
 - Keys appear in a group in the order their entries are listed.
 - A config entry that matches several upstream keys includes them all; one that matches
   no upstream key is skipped.
@@ -175,17 +174,14 @@ groups:
     enabled: true
     socket: ~/.ssh/agent-work.sock
     keys:
-      - type: comment
-        value: laptop@work
-      - type: sha256
-        value: SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI
+      - comment: "laptop@work"
+      - sha256: "SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI"
 
   - name: personal
     enabled: false
     socket: ~/.ssh/agent-personal.sock
     keys:
-      - type: md5
-        value: MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9
+      - md5: "MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9"
 ```
 
 Configuration is read once at startup; run `ssh-agent-proxy -restart` to apply changes.

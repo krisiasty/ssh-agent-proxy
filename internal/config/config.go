@@ -16,8 +16,9 @@ const AppName = "ssh-agent-proxy"
 
 // KeyEntry is one entry in a group's key list.
 type KeyEntry struct {
-	Type  string `yaml:"type"`
-	Value string `yaml:"value"`
+	Comment *string `yaml:"comment,omitempty"`
+	MD5     *string `yaml:"md5,omitempty"`
+	SHA256  *string `yaml:"sha256,omitempty"`
 }
 
 // Group is a named set of keys exposed on its own socket.
@@ -87,7 +88,10 @@ groups:
   - name: default
     enabled: false
     socket: ~/.ssh/agent-default.sock
-    keys: []
+    keys:
+      - comment: "laptop@work"
+      - md5: "MD5:aa:bb:cc:dd:..."
+      - sha256: "SHA256:abc123..."
 `
 
 // Load reads, parses, validates and resolves the config at path.
@@ -144,7 +148,7 @@ func (c *Config) resolve() error {
 
 		g.matchers = g.matchers[:0]
 		for j, ke := range g.Keys {
-			m, err := keys.NewMatcher(ke.Type, ke.Value)
+			m, err := ke.matcher()
 			if err != nil {
 				return fmt.Errorf("config: group %q, key #%d: %w", g.Name, j+1, err)
 			}
@@ -152,6 +156,27 @@ func (c *Config) resolve() error {
 		}
 	}
 	return nil
+}
+
+func (ke KeyEntry) matcher() (keys.Matcher, error) {
+	var typ, value string
+	count := 0
+	if ke.Comment != nil {
+		typ, value = "comment", *ke.Comment
+		count++
+	}
+	if ke.MD5 != nil {
+		typ, value = "md5", *ke.MD5
+		count++
+	}
+	if ke.SHA256 != nil {
+		typ, value = "sha256", *ke.SHA256
+		count++
+	}
+	if count != 1 {
+		return keys.Matcher{}, fmt.Errorf("key entry must contain exactly one of 'comment', 'md5' or 'sha256'")
+	}
+	return keys.NewMatcher(typ, value)
 }
 
 // expandPath expands environment variables and a leading "~" to the home dir.
