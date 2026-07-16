@@ -1,16 +1,22 @@
 # ssh-agent-proxy
 
-A filtering proxy in front of an existing SSH agent (OpenSSH's `ssh-agent`, or one
-provided by a password manager such as Bitwarden or KeePassXC).
+`ssh-agent-proxy` is a filtering proxy that sits in front of an existing SSH agent —
+especially the agent built into a password manager such as **Bitwarden, KeePassXC,
+1Password, or Secretive**.
 
-`ssh-agent-proxy` exposes one or more **filtered views** ("groups") of the upstream
-agent's keys, each on its own socket. A client that points `SSH_AUTH_SOCK` at a group's
-socket can only **see** and only **sign with** the keys assigned to that group — every
-other key in the upstream agent is invisible and unusable through that socket.
+**The problem.** Password-manager SSH agents expose *every* key they hold to every
+client, all at once and in no particular order. You can't scope which keys a given
+host, repo, or container sees, and you can't control their order. Beyond being untidy,
+it breaks logins: ssh offers agent keys one at a time, so once you have more than a
+handful the server rejects you with *"Too many authentication failures"* (it hits
+`MaxAuthTries`) before ever reaching the key you actually needed.
 
-This is useful when you keep many keys in a single agent but want to expose only a
-specific subset to a given context (a work directory, a container, a remote host you
-forward your agent to, etc.).
+**What this does.** `ssh-agent-proxy` sits in front of that agent and exposes one or
+more **filtered views** ("groups") of its keys, each on its own socket. A client that
+points `SSH_AUTH_SOCK` at a group's socket sees — and can sign with — *only* the keys
+you assigned to that group, **in the order you listed them**. Every other key is
+invisible and unusable through that socket. The private keys never leave the upstream
+agent, and any confirmation/biometric prompt it enforces still applies.
 
 ## How it works
 
