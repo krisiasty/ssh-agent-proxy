@@ -27,16 +27,11 @@ type Group struct {
 	Enabled  *bool      `yaml:"enabled"`
 	Socket   string     `yaml:"socket"`
 	Keys     []KeyEntry `yaml:"keys"`
-	upstream string     // set after config is resolved
 	matchers []keys.Matcher
-	allowSet keys.AllowSet
 }
 
 // Matchers returns the compiled matchers for the group, in config order.
 func (g *Group) Matchers() []keys.Matcher { return g.matchers }
-
-// AllowedSet returns the precomputed allow set for this group.
-func (g *Group) AllowedSet() keys.AllowSet { return g.allowSet }
 
 // IsEnabled reports whether the group is active. Groups are enabled unless
 // 'enabled: false' is set explicitly.
@@ -119,17 +114,16 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// resolve validates required fields, expands paths, builds the allow set,
-// and compiles matchers.
+// resolve validates required fields, expands paths and compiles matchers.
 func (c *Config) resolve() error {
 	if strings.TrimSpace(c.Upstream) == "" {
 		return fmt.Errorf("config: 'upstream' is required")
 	}
-	up, err := expandPath(c.Upstream)
+	expanded, err := expandPath(c.Upstream)
 	if err != nil {
 		return fmt.Errorf("config: upstream: %w", err)
 	}
-	c.Upstream = up
+	c.Upstream = expanded
 
 	seenNames := make(map[string]bool)
 	for i := range c.Groups {
@@ -150,7 +144,6 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("config: group %q: socket: %w", g.Name, err)
 		}
 		g.Socket = sock
-		g.upstream = up
 
 		g.matchers = g.matchers[:0]
 		for j, ke := range g.Keys {

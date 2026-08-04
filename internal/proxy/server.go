@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -43,9 +44,34 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		s.log.Info("no groups configured; exposing nothing", "upstream", s.upstream)
 	}
 
+	// Precompute allow sets by connecting to the upstream agent once.
+	// This eliminates the per-sign round-trip and the TOCTOU race.
+	upConn, err := dialer.DialContext(context.Background(), "unix", s.upstream)
+	if err != nil {
+		return fmt.Errorf("connecting to upstream agent: %w", err)
+	}
+	upClient := agent.NewClient(upConn)
+	upstreamKeys, err := upClient.List()
+	if err != nil {
+		_ = upConn.Close()
+		return fmt.Errorf("listing upstream keys: %w", err)
+	}
+	_ = upConn.Close()
+
+	// Enrich each group with its allow set.
+	type enrichedGroup struct {
+		g        config.Group
+		allowSet keys.AllowSet
+	}
+	egs := make([]enrichedGroup, 0, len(groups))
+	for _, g := range groups {
+		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
+		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
+	}
+
 	var listeners []net.Listener
-	for i := range groups {
-		g := groups[i]
+	for _, eg := range egs {
+		g := eg.g
 		if !g.IsEnabled() {
 			s.log.Info("group disabled, skipping", "group", g.Name)
 			continue
@@ -59,7 +85,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g)
+		go s.acceptLoop(ctx, ln, g, eg.allowSet)
 	}
 
 	<-ctx.Done()
@@ -92,18 +118,18 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 	return ln, nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return // listener closed during shutdown
 		}
-		go s.serveConn(ctx, conn, g)
+		go s.serveConn(ctx, conn, g, allowSet)
 	}
 }
 
 // serveConn dials the upstream agent and serves one client with a filtered view.
-func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group) {
+func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet) {
 	defer func() { _ = client.Close() }()
 
 	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
@@ -118,7 +144,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group)
 	fa := &filterAgent{
 		up:       agent.NewClient(up),
 		matchers: g.Matchers(),
-		allowSet: g.AllowedSet(),
+		allowSet: allowSet,
 		group:    g.Name,
 		log:      s.log,
 	}
