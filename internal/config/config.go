@@ -23,12 +23,13 @@ type KeyEntry struct {
 
 // Group is a named set of keys exposed on its own socket.
 type Group struct {
-	Name    string     `yaml:"name"`
-	Enabled *bool      `yaml:"enabled"`
-	Socket  string     `yaml:"socket"`
-	Keys    []KeyEntry `yaml:"keys"`
-
-	matchers []keys.Matcher
+	Name       string     `yaml:"name"`
+	Enabled    *bool      `yaml:"enabled"`
+	Socket     string     `yaml:"socket"`
+	Keys       []KeyEntry `yaml:"keys"`
+	upstream   string     // set after config is resolved
+	matchers   []keys.Matcher
+	allowSet   keys.AllowSet
 }
 
 // Matchers returns the compiled matchers for the group, in config order.

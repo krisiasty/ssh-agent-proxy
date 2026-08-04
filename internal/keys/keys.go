@@ -89,3 +89,30 @@ func Filter(upstream []*agent.Key, matchers []Matcher) []*agent.Key {
 	}
 	return out
 }
+
+// AllowSet is a precomputed set of key blobs that are allowed for a group.
+// Built at config load time from matchers and the upstream key list, so the
+// runtime path can check membership without calling the upstream agent.
+type AllowSet struct {
+	blobs map[string]bool // marshal() → true
+}
+
+// BuildAllowSet connects to the upstream agent, lists all keys, and returns
+// an AllowSet containing every key that matches at least one matcher.
+func BuildAllowSet(upstream []*agent.Key, matchers []Matcher) AllowSet {
+	allowed := make(map[string]bool)
+	for _, m := range matchers {
+		for _, k := range upstream {
+			blob := string(k.Marshal())
+			if !allowed[blob] && m.Matches(k) {
+				allowed[blob] = true
+			}
+		}
+	}
+	return AllowSet{blobs: allowed}
+}
+
+// Allowed reports whether the given public key blob is in the allow set.
+func (s AllowSet) Allowed(pub ssh.PublicKey) bool {
+	return s.blobs[string(pub.Marshal())]
+}
