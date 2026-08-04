@@ -25,10 +25,18 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Build the allow set from the upstream key list (simulates config resolution).
+	allowedKeys, err := up.List()
+	if err != nil {
+		t.Fatal(err)
+	}
 	m, _ := keys.NewMatcher("comment", "allowed")
+	allowSet := keys.BuildAllowSet(allowedKeys, []keys.Matcher{m})
+
 	fa := &filterAgent{
 		up:       up,
 		matchers: []keys.Matcher{m},
+		allowSet: allowSet,
 		group:    "test",
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}

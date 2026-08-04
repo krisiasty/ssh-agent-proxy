@@ -20,6 +20,7 @@ var errReadOnly = errors.New("ssh-agent-proxy: read-only agent, request refused"
 type filterAgent struct {
 	up       agent.ExtendedAgent
 	matchers []keys.Matcher
+	allowSet keys.AllowSet
 	group    string
 	log      *slog.Logger
 }
@@ -44,28 +45,15 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 	return ks, nil
 }
 
-// isAllowed reports whether key is one of this group's keys.
-func (f *filterAgent) isAllowed(key ssh.PublicKey) (bool, error) {
-	ks, err := f.allowed()
-	if err != nil {
-		return false, err
-	}
-	want := string(key.Marshal())
-	for _, k := range ks {
-		if string(k.Marshal()) == want {
-			return true, nil
-		}
-	}
-	return false, nil
+// isAllowed reports whether key is one of this group's keys, using the
+// precomputed allow set so it never needs to call the upstream agent.
+func (f *filterAgent) isAllowed(key ssh.PublicKey) bool {
+	return f.allowSet.Allowed(key)
 }
 
 // SignWithFlags signs with key only if it belongs to this group.
 func (f *filterAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	ok, err := f.isAllowed(key)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
+	if !f.isAllowed(key) {
 		f.log.Warn("sign refused: key not in group",
 			"group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
 		return nil, errors.New("ssh-agent-proxy: key not in group")

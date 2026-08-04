@@ -118,6 +118,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group)
 	fa := &filterAgent{
 		up:       agent.NewClient(up),
 		matchers: g.Matchers(),
+		allowSet: g.AllowedSet(),
 		group:    g.Name,
 		log:      s.log,
 	}

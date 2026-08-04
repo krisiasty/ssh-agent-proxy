@@ -23,17 +23,20 @@ type KeyEntry struct {
 
 // Group is a named set of keys exposed on its own socket.
 type Group struct {
-	Name       string     `yaml:"name"`
-	Enabled    *bool      `yaml:"enabled"`
-	Socket     string     `yaml:"socket"`
-	Keys       []KeyEntry `yaml:"keys"`
-	upstream   string     // set after config is resolved
-	matchers   []keys.Matcher
-	allowSet   keys.AllowSet
+	Name     string     `yaml:"name"`
+	Enabled  *bool      `yaml:"enabled"`
+	Socket   string     `yaml:"socket"`
+	Keys     []KeyEntry `yaml:"keys"`
+	upstream string     // set after config is resolved
+	matchers []keys.Matcher
+	allowSet keys.AllowSet
 }
 
 // Matchers returns the compiled matchers for the group, in config order.
 func (g *Group) Matchers() []keys.Matcher { return g.matchers }
+
+// AllowedSet returns the precomputed allow set for this group.
+func (g *Group) AllowedSet() keys.AllowSet { return g.allowSet }
 
 // IsEnabled reports whether the group is active. Groups are enabled unless
 // 'enabled: false' is set explicitly.
@@ -116,7 +119,8 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// resolve validates required fields, expands paths and compiles matchers.
+// resolve validates required fields, expands paths, builds the allow set,
+// and compiles matchers.
 func (c *Config) resolve() error {
 	if strings.TrimSpace(c.Upstream) == "" {
 		return fmt.Errorf("config: 'upstream' is required")
@@ -146,6 +150,7 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("config: group %q: socket: %w", g.Name, err)
 		}
 		g.Socket = sock
+		g.upstream = up
 
 		g.matchers = g.matchers[:0]
 		for j, ke := range g.Keys {
