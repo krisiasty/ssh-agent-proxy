@@ -19,9 +19,8 @@ func writeConfig(t *testing.T, body string) string {
 }
 
 func TestLoadValid(t *testing.T) {
-	t.Setenv("SSH_AUTH_SOCK", "/run/agent.sock")
 	p := writeConfig(t, `
-upstream: ${SSH_AUTH_SOCK}
+upstream: /run/agent.sock
 debug: true
 groups:
   - name: work
@@ -40,7 +39,7 @@ groups:
 		t.Fatal(err)
 	}
 	if cfg.Upstream != "/run/agent.sock" {
-		t.Errorf("upstream not expanded: %q", cfg.Upstream)
+		t.Errorf("upstream = %q, want %q", cfg.Upstream, "/run/agent.sock")
 	}
 	if !cfg.Debug {
 		t.Error("debug should be true")
@@ -73,17 +72,21 @@ groups:
 
 func TestLoadErrors(t *testing.T) {
 	cases := map[string]string{
-		"missing upstream":   "groups: []\n",
-		"missing name":       "upstream: /a\ngroups:\n  - socket: /s\n",
-		"duplicate name":     "upstream: /a\ngroups:\n  - {name: g, socket: /s1}\n  - {name: g, socket: /s2}\n",
-		"group no socket":    "upstream: /a\ngroups:\n  - name: g\n",
-		"old key form":       "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: comment, value: x}\n",
-		"unknown key form":   "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {fingerprint: x}\n",
-		"missing key form":   "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {}\n",
-		"multiple key forms": "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: x, md5: y}\n",
-		"empty key value":    "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: \"\"}\n",
-		"unknown field":      "upstream: /a\nnope: 1\n",
-		"not yaml":           "upstream: [unterminated\n",
+		"missing upstream":     "groups: []\n",
+		"missing name":         "upstream: /a\ngroups:\n  - socket: /s\n",
+		"duplicate name":       "upstream: /a\ngroups:\n  - {name: g, socket: /s1}\n  - {name: g, socket: /s2}\n",
+		"group no socket":      "upstream: /a\ngroups:\n  - name: g\n",
+		"relative upstream":    "upstream: ./agent.sock\ngroups: []\n",
+		"relative group socket": "upstream: /a\ngroups:\n  - {name: g, socket: ./s.sock}\n",
+		"tilde upstream":       "upstream: ~/.ssh/agent.sock\ngroups: []\n",
+		"envvar upstream":      "upstream: ${SSH_AUTH_SOCK}\ngroups: []\n",
+		"old key form":         "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: comment, value: x}\n",
+		"unknown key form":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {fingerprint: x}\n",
+		"missing key form":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {}\n",
+		"multiple key forms":   "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: x, md5: y}\n",
+		"empty key value":      "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: \"\"}\n",
+		"unknown field":        "upstream: /a\nnope: 1\n",
+		"not yaml":             "upstream: [unterminated\n",
 	}
 	for name, body := range cases {
 		p := writeConfig(t, body)
@@ -100,7 +103,6 @@ func TestLoadMissingFile(t *testing.T) {
 }
 
 func TestEnsureScaffoldCreatesValidDisabledDefaultGroup(t *testing.T) {
-	t.Setenv("SSH_AUTH_SOCK", "/run/agent.sock")
 	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
 
 	created, err := EnsureScaffold(path)
@@ -133,13 +135,14 @@ func TestEnsureScaffoldCreatesValidDisabledDefaultGroup(t *testing.T) {
 	}
 }
 
-func TestExpandTilde(t *testing.T) {
-	home, _ := os.UserHomeDir()
-	got, err := expandPath("~/x")
-	if err != nil {
-		t.Fatal(err)
+func TestRequireAbsolute(t *testing.T) {
+	if err := requireAbsolute("/abs/path", "label"); err != nil {
+		t.Errorf("requireAbsolute(/abs/path) = %v, want nil", err)
 	}
-	if got != filepath.Join(home, "x") {
-		t.Errorf("expandPath(~/x) = %q, want %q", got, filepath.Join(home, "x"))
+	if err := requireAbsolute("relative/path", "label"); err == nil {
+		t.Error("requireAbsolute(relative/path) = nil, want error")
+	}
+	if err := requireAbsolute("~/home/path", "label"); err == nil {
+		t.Error("requireAbsolute(~/home/path) = nil, want error")
 	}
 }

@@ -74,8 +74,9 @@ func EnsureScaffold(path string) (created bool, err error) {
 const sampleConfig = `# ssh-agent-proxy configuration.
 # Run 'ssh-agent-proxy -list' to print your upstream keys as ready-to-paste entries.
 
-# Path to the upstream SSH agent socket (required). Env vars are expanded.
-upstream: ${SSH_AUTH_SOCK}
+# Path to the upstream SSH agent socket (required).
+# Must be an absolute path; environment variables and ~ are NOT expanded.
+upstream: /run/user/1000/keyrings/bitwarden/agent.sock
 
 # Verbose logging.
 debug: false
@@ -87,7 +88,7 @@ debug: false
 groups:
   - name: default
     enabled: false
-    socket: ~/.ssh/agent-default.sock
+    socket: /run/user/1000/ssh-agent-proxys/default.sock
     keys:
       - comment: "laptop@work"
       - md5: "MD5:aa:bb:cc:dd:..."
@@ -115,16 +116,14 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// resolve validates required fields, expands paths and compiles matchers.
+// resolve validates required fields, checks paths are absolute, and compiles matchers.
 func (c *Config) resolve() error {
 	if strings.TrimSpace(c.Upstream) == "" {
 		return errors.New("config: 'upstream' is required")
 	}
-	expanded, err := expandPath(c.Upstream)
-	if err != nil {
-		return fmt.Errorf("config: upstream: %w", err)
+	if err := requireAbsolute(c.Upstream, "upstream"); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
-	c.Upstream = expanded
 
 	seenNames := make(map[string]bool)
 	for i := range c.Groups {
@@ -140,11 +139,9 @@ func (c *Config) resolve() error {
 		if strings.TrimSpace(g.Socket) == "" {
 			return fmt.Errorf("config: group %q: 'socket' is required", g.Name)
 		}
-		sock, err := expandPath(g.Socket)
-		if err != nil {
-			return fmt.Errorf("config: group %q: socket: %w", g.Name, err)
+		if err := requireAbsolute(g.Socket, fmt.Sprintf("group %q: socket", g.Name)); err != nil {
+			return fmt.Errorf("config: %w", err)
 		}
-		g.Socket = sock
 
 		g.matchers = g.matchers[:0]
 		for j, ke := range g.Keys {
@@ -179,15 +176,11 @@ func (ke KeyEntry) matcher() (keys.Matcher, error) {
 	return keys.NewMatcher(typ, value)
 }
 
-// expandPath expands environment variables and a leading "~" to the home dir.
-func expandPath(p string) (string, error) {
-	p = os.ExpandEnv(p)
-	if p == "~" || strings.HasPrefix(p, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("expanding ~: %w", err)
-		}
-		p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+// requireAbsolute ensures the path starts with "/". Socket paths must be
+// absolute; the program does not perform ~ or environment-variable expansion.
+func requireAbsolute(p, label string) error {
+	if filepath.IsAbs(p) {
+		return nil
 	}
-	return p, nil
+	return fmt.Errorf("%s: %q is not an absolute path", label, p)
 }

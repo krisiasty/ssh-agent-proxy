@@ -27,7 +27,7 @@ only those keys assigned to the group's socket are visible and usable.
 |-------------|------------------------------------------------|
 | `main`      | CLI parsing, flag dispatch, service lifecycle   |
 | `app`       | Wires config, logging, and proxy server together |
-| `config`    | YAML config loading, validation, path expansion |
+| `config`    | YAML config loading, validation, absolute-path enforcement |
 | `keys`      | Key matching (comment/MD5/SHA256) and allow sets |
 | `proxy`     | Socket server, filtering agent, upstream connection |
 | `logging`   | slog setup, legacy `log` package redirection   |
@@ -48,7 +48,7 @@ main()
            ├─ signal.NotifyContext(SIGINT, SIGTERM)
            ├─ config.Load(path)
            │  ├─ parse YAML
-           │  ├─ expand ${ENV} and ~ in upstream/socket paths
+           │  ├─ validate upstream/socket paths are absolute
            │  └─ compile matchers from key entries
            ├─ logging.Setup(debug)
            │  └─ redirect legacy log package → slog logger
