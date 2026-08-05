@@ -20,6 +20,7 @@ import (
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
+	"github.com/krisiasty/ssh-agent-proxy/internal/peercreds"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -146,6 +147,19 @@ func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, a
 
 	id := s.nextConnID()
 	log := s.log.With("conn", id, "group", g.Name)
+
+	// Try to read peer credentials from the Unix socket.
+	// On Linux this gives PID+UID+process name; on macOS, UID only.
+	if peer, err := peercreds.Get(client); err == nil {
+		log = log.With("uid", peer.UID)
+		if peer.PID != 0 {
+			log = log.With("pid", peer.PID)
+		}
+		if peer.Process != "" {
+			log = log.With("process", peer.Process)
+		}
+	}
+
 	log.Info("client connected")
 
 	fa := &filterAgent{
