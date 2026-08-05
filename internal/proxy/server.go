@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -46,6 +47,28 @@ func NewServer(upstream string, log *slog.Logger) *Server {
 	return &Server{upstream: upstream, log: log}
 }
 
+// connectUpstream dials the upstream agent and returns a client ready for use.
+// It also lists all upstream keys so callers can build allow sets.
+func (s *Server) connectUpstream(ctx context.Context) (agent.ExtendedAgent, []*agent.Key, error) {
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+
+	conn, err := dialer.DialContext(dctx, "unix", s.upstream)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
+	}
+
+	upClient := agent.NewClient(conn)
+
+	keyList, err := upClient.List()
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("listing upstream keys: %w", err)
+	}
+
+	return upClient, keyList, nil
+}
+
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
 func (s *Server) Run(ctx context.Context, groups []config.Group) error {
@@ -53,8 +76,30 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		s.log.Info("no groups configured; exposing nothing", "upstream", s.upstream)
 	}
 
-	var listeners []net.Listener
+	// Open a single shared connection to the upstream agent. All proxy clients
+	// funnel through it — this avoids overwhelming agents (e.g. Bitwarden) that
+	// cannot handle many concurrent connections. agent.NewClient pipelines
+	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
+	upClient, upstreamKeys, err := s.connectUpstream(ctx)
+	if err != nil {
+		return err
+	}
+	s.log.Debug("upstream connected", "keys", len(upstreamKeys))
+
+	// Precompute allow sets for each group from the single upstream key list.
+	type enrichedGroup struct {
+		g        config.Group
+		allowSet keys.AllowSet
+	}
+	egs := make([]enrichedGroup, 0, len(groups))
 	for _, g := range groups {
+		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
+		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
+	}
+
+	var listeners []net.Listener
+	for _, eg := range egs {
+		g := eg.g
 		if !g.IsEnabled() {
 			s.log.Info("group disabled, skipping", "group", g.Name)
 			continue
@@ -68,7 +113,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g)
+		go s.acceptLoop(ctx, ln, g, eg.allowSet, upClient)
 	}
 
 	<-ctx.Done()
@@ -101,38 +146,29 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 	return ln, nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return // listener closed during shutdown
 		}
-		go s.serveConn(ctx, conn, g)
+		go s.serveConn(ctx, conn, g, allowSet, upClient)
 	}
 }
 
-// serveConn dials the upstream agent and serves one client with a filtered view.
-func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group) {
+// serveConn handles one client with a filtered view over the shared upstream
+// connection. No per-client dial is needed.
+func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	defer func() { _ = client.Close() }()
 
 	id := s.nextConnID()
 	log := s.log.With("conn", id, "group", g.Name)
 	log.Info("client connected")
 
-	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	up, err := dialer.DialContext(dctx, "unix", s.upstream)
-	if err != nil {
-		log.Warn("upstream agent unreachable", "upstream", s.upstream, "err", err)
-		return
-	}
-	defer func() { _ = up.Close() }()
-
-	upClient := agent.NewClient(up)
-
 	fa := &filterAgent{
 		up:       upClient,
 		matchers: g.Matchers(),
+		allowSet: allowSet,
 		group:    g.Name,
 		log:      log,
 	}
