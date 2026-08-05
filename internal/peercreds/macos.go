@@ -4,17 +4,26 @@ package peercreds
 
 import (
 	"io"
-	"runtime"
+	"net"
+	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 func get(conn io.Reader) (Info, error) {
-	fd, ok := fdOf(conn)
+	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return Info{}, io.EOF
 	}
 
+	f, err := uc.File()
+	if err != nil {
+		return Info{}, err
+	}
+	defer f.Close()
+
+	fd := int(f.Fd())
 	cred, err := unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 	if err != nil {
 		return Info{}, err
@@ -26,18 +35,6 @@ func get(conn io.Reader) (Info, error) {
 	}, nil
 }
 
-// fdOf extracts the underlying file descriptor from a net.UnixConn.
-func fdOf(conn io.Reader) (int, bool) {
-	type fileDescriptor interface {
-		Fd() (fd uintptr, err error)
-	}
-	if fc, ok := conn.(fileDescriptor); ok {
-		fp, err := fc.Fd()
-		if err != nil {
-			return 0, false
-		}
-		runtime.KeepAlive(fc)
-		return int(fp), true
-	}
-	return 0, false
-}
+// suppress unused imports
+var _ = os.Getpid()
+var _ = syscall.Errno(0)
