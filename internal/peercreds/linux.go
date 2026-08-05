@@ -4,8 +4,8 @@ package peercreds
 
 import (
 	"io"
+	"net"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -13,11 +13,18 @@ import (
 )
 
 func get(conn io.Reader) (Info, error) {
-	fd, ok := fdOf(conn)
+	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return Info{}, io.EOF
 	}
 
+	f, err := uc.File()
+	if err != nil {
+		return Info{}, err
+	}
+	defer f.Close()
+
+	fd := int(f.Fd())
 	cred, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
 	if err != nil {
 		return Info{}, err
@@ -46,20 +53,4 @@ func processName(pid int32) string {
 		return string(data[:idx])
 	}
 	return strings.TrimRight(string(data), "\x00")
-}
-
-// fdOf extracts the underlying file descriptor from a net.UnixConn.
-func fdOf(conn io.Reader) (int, bool) {
-	type fileDescriptor interface {
-		Fd() (fd uintptr, err error)
-	}
-	if fc, ok := conn.(fileDescriptor); ok {
-		fp, err := fc.Fd()
-		if err != nil {
-			return 0, false
-		}
-		runtime.KeepAlive(fc)
-		return int(fp), true
-	}
-	return 0, false
 }
