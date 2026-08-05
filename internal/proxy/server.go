@@ -47,28 +47,6 @@ func NewServer(upstream string, log *slog.Logger) *Server {
 	return &Server{upstream: upstream, log: log}
 }
 
-// connectUpstream dials the upstream agent and returns a client ready for use.
-// It also lists all upstream keys so callers can build allow sets.
-func (s *Server) connectUpstream(ctx context.Context) (agent.ExtendedAgent, []*agent.Key, error) {
-	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-
-	conn, err := dialer.DialContext(dctx, "unix", s.upstream)
-	if err != nil {
-		return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
-	}
-
-	upClient := agent.NewClient(conn)
-
-	keyList, err := upClient.List()
-	if err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("listing upstream keys: %w", err)
-	}
-
-	return upClient, keyList, nil
-}
-
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
 func (s *Server) Run(ctx context.Context, groups []config.Group) error {
@@ -80,13 +58,18 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 	// funnel through it — this avoids overwhelming agents (e.g. Bitwarden) that
 	// cannot handle many concurrent connections. agent.NewClient pipelines
 	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
-	upClient, upstreamKeys, err := s.connectUpstream(ctx)
-	if err != nil {
-		return err
-	}
-	s.log.Debug("upstream connected", "keys", len(upstreamKeys))
+	// The reconnecting wrapper will dial a fresh connection if the current one
+	// dies, so a single failure does not kill all clients.
+	rc := newReconnectClient(s.upstream, s.log)
 
-	// Precompute allow sets for each group from the single upstream key list.
+	// Precompute allow sets from the initial upstream key list.
+	upstreamKeys, err := rc.List()
+	if err != nil {
+		return fmt.Errorf("listing upstream keys: %w", err)
+	}
+	s.log.Debug("upstream keys listed at startup", "keys", len(upstreamKeys))
+
+	// Enrich each group with its precomputed allow set.
 	type enrichedGroup struct {
 		g        config.Group
 		allowSet keys.AllowSet
@@ -113,7 +96,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g, eg.allowSet, upClient)
+		go s.acceptLoop(ctx, ln, g, eg.allowSet, rc)
 	}
 
 	<-ctx.Done()
