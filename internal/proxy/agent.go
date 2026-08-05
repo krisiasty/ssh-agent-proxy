@@ -1,5 +1,3 @@
-// Package proxy implements the filtering SSH agent and the socket server that
-// exposes one filtered view of the upstream agent per group.
 package proxy
 
 import (

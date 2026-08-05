@@ -120,7 +120,7 @@ func (m *launchdManager) Status() (Status, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "launchctl", "list", Label).CombinedOutput() //nolint:gosec // fixed command; Label is a package constant.
+	out, err := exec.CommandContext(ctx, "launchctl", "list", Label).CombinedOutput()
 	if err == nil {
 		s := string(out)
 		if mt := reLaunchdPID.FindStringSubmatch(s); mt != nil {

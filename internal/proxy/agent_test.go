@@ -3,7 +3,7 @@ package proxy
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"io"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -17,7 +17,10 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	_, privAllowed, _ := ed25519.GenerateKey(rand.Reader)
 	_, privHidden, _ := ed25519.GenerateKey(rand.Reader)
 
-	up := agent.NewKeyring().(agent.ExtendedAgent)
+	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
+	}
 	if err := up.Add(agent.AddedKey{PrivateKey: privAllowed, Comment: "allowed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +41,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		matchers: []keys.Matcher{m},
 		allowSet: allowSet,
 		group:    "test",
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log:      slog.New(slog.DiscardHandler),
 	}
 
 	// List exposes only the allowed key.
@@ -77,7 +80,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	if err := fa.Lock([]byte("x")); err == nil {
 		t.Error("Lock should be refused")
 	}
-	if _, err := fa.Extension("query", nil); err != agent.ErrExtensionUnsupported {
+	if _, err := fa.Extension("query", nil); !errors.Is(err, agent.ErrExtensionUnsupported) {
 		t.Errorf("Extension err = %v, want ErrExtensionUnsupported", err)
 	}
 

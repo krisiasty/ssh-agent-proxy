@@ -3,6 +3,7 @@
 package keys
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -32,7 +33,7 @@ type Matcher struct {
 // NewMatcher validates and normalizes a match criterion.
 func NewMatcher(typ, value string) (Matcher, error) {
 	if value == "" {
-		return Matcher{}, fmt.Errorf("key match value must not be empty")
+		return Matcher{}, errors.New("key match value must not be empty")
 	}
 	switch MatchType(typ) {
 	case MatchComment:

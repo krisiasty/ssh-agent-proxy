@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -117,7 +118,7 @@ func Load(path string) (*Config, error) {
 // resolve validates required fields, expands paths and compiles matchers.
 func (c *Config) resolve() error {
 	if strings.TrimSpace(c.Upstream) == "" {
-		return fmt.Errorf("config: 'upstream' is required")
+		return errors.New("config: 'upstream' is required")
 	}
 	expanded, err := expandPath(c.Upstream)
 	if err != nil {
@@ -173,7 +174,7 @@ func (ke KeyEntry) matcher() (keys.Matcher, error) {
 		count++
 	}
 	if count != 1 {
-		return keys.Matcher{}, fmt.Errorf("key entry must contain exactly one of 'comment', 'md5' or 'sha256'")
+		return keys.Matcher{}, errors.New("key entry must contain exactly one of 'comment', 'md5' or 'sha256'")
 	}
 	return keys.NewMatcher(typ, value)
 }

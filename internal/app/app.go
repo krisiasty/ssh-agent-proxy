@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
@@ -19,6 +20,19 @@ import (
 // the thread/memory footprint down without affecting throughput.
 const maxProcs = 2
 
+// Version holds the build metadata logged at startup — equivalent to the
+// output of --version.
+type Version struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
+// String returns the version line in the same format as --version.
+func (v Version) String() string {
+	return fmt.Sprintf("ssh-agent-proxy %s (commit %s, built %s)", v.Version, v.Commit, v.Date)
+}
+
 // Run loads the config and serves the group sockets until terminated by
 // SIGINT/SIGTERM.
 //
@@ -26,7 +40,7 @@ const maxProcs = 2
 // and idles until terminated instead of exiting, so the service manager does
 // not restart it in a tight loop. In foreground mode a config error is returned
 // to the caller (which exits non-zero).
-func Run(cfgPath string, foreground bool) error {
+func Run(cfgPath string, foreground bool, version Version) error {
 	// Cap parallelism unless the operator set GOMAXPROCS explicitly.
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(maxProcs)
@@ -49,6 +63,7 @@ func Run(cfgPath string, foreground bool) error {
 	}
 
 	log := logging.Setup(cfg.Debug)
+	log.Info("ssh-agent-proxy", "version", version.Version, "commit", version.Commit, "built", version.Date)
 	log.Info("starting", "upstream", cfg.Upstream, "groups", len(cfg.Groups), "config", cfgPath)
 
 	srv := proxy.NewServer(cfg.Upstream, log)

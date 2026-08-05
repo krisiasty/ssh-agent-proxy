@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,8 +54,35 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		s.log.Info("no groups configured; exposing nothing", "upstream", s.upstream)
 	}
 
-	var listeners []net.Listener
+	// Open a single shared connection to the upstream agent. All proxy clients
+	// funnel through it — this avoids overwhelming agents (e.g. Bitwarden) that
+	// cannot handle many concurrent connections. agent.NewClient pipelines
+	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
+	// The reconnecting wrapper will dial a fresh connection if the current one
+	// dies, so a single failure does not kill all clients.
+	rc := newReconnectClient(s.upstream, s.log)
+
+	// Precompute allow sets from the initial upstream key list.
+	upstreamKeys, err := rc.List()
+	if err != nil {
+		return fmt.Errorf("listing upstream keys: %w", err)
+	}
+	s.log.Debug("upstream keys listed at startup", "keys", len(upstreamKeys))
+
+	// Enrich each group with its precomputed allow set.
+	type enrichedGroup struct {
+		g        config.Group
+		allowSet keys.AllowSet
+	}
+	egs := make([]enrichedGroup, 0, len(groups))
 	for _, g := range groups {
+		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
+		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
+	}
+
+	var listeners []net.Listener
+	for _, eg := range egs {
+		g := eg.g
 		if !g.IsEnabled() {
 			s.log.Info("group disabled, skipping", "group", g.Name)
 			continue
@@ -68,7 +96,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g)
+		go s.acceptLoop(ctx, ln, g, eg.allowSet, rc)
 	}
 
 	<-ctx.Done()
@@ -101,45 +129,24 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 	return ln, nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return // listener closed during shutdown
 		}
-		go s.serveConn(ctx, conn, g)
+		go s.serveConn(ctx, conn, g, allowSet, upClient)
 	}
 }
 
-// serveConn dials the upstream agent and serves one client with a filtered view.
-func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group) {
+// serveConn handles one client with a filtered view over the shared upstream
+// connection. No per-client dial is needed.
+func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	defer func() { _ = client.Close() }()
 
 	id := s.nextConnID()
 	log := s.log.With("conn", id, "group", g.Name)
 	log.Info("client connected")
-
-	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	up, err := dialer.DialContext(dctx, "unix", s.upstream)
-	if err != nil {
-		log.Warn("upstream agent unreachable", "upstream", s.upstream, "err", err)
-		return
-	}
-	defer func() { _ = up.Close() }()
-
-	upClient := agent.NewClient(up)
-	upstreamKeys, err := upClient.List()
-	if err != nil {
-		log.Warn("upstream list failed during connection setup",
-			"upstream", s.upstream, "err", err)
-	}
-
-	var allowSet keys.AllowSet
-	if len(upstreamKeys) > 0 {
-		allowSet = keys.BuildAllowSet(upstreamKeys, g.Matchers())
-	}
-	log.Debug("allow set built", "keys", allowSet.Len())
 
 	fa := &filterAgent{
 		up:       upClient,
@@ -148,7 +155,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group)
 		group:    g.Name,
 		log:      log,
 	}
-	if err := agent.ServeAgent(fa, client); err != nil && err != io.EOF {
+	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
 		log.Debug("client connection ended", "err", err)
 	}
 	log.Info("client disconnected")

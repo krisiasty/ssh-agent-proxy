@@ -89,7 +89,7 @@ func run() error {
 				fmt.Printf("created default config: %s\nedit it, then restart\n", cfgPath)
 			}
 		}
-		return app.Run(cfgPath, *fForeground)
+		return app.Run(cfgPath, *fForeground, app.Version{Version: version, Commit: commit, Date: date})
 	default:
 		return manageService(cfgPath, chosen)
 	}
