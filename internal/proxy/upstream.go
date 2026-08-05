@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
@@ -19,12 +20,20 @@ type upstreamConn struct {
 
 // reconnectClient wraps a shared upstream agent client and reconnects
 // transparently if the connection dies.
+//
+// The current pointer is an atomic.Pointer that is never nil — get() is
+// always a lock-free load. Reconnect is serialized so only one goroutine
+// dials at a time, and the new connection is dialed **before** swapping to
+// eliminate the nil-window panic that existed in the previous Swap(nil) →
+// dial → Store sequence.
 type reconnectClient struct {
 	upstream string
 	log      *slog.Logger
 	current  atomic.Pointer[upstreamConn]
 
 	dial func() (agent.ExtendedAgent, net.Conn, error)
+
+	mu sync.Mutex // guards reconnect: only one goroutine reconnects at a time
 }
 
 func newReconnectClient(upstream string, log *slog.Logger) *reconnectClient {
@@ -52,18 +61,26 @@ func (r *reconnectClient) get() agent.ExtendedAgent {
 	return r.current.Load().client
 }
 
+// reconnect replaces the upstream connection if it is broken.
+//
+// Only one goroutine performs the actual dial (guarded by mu). The new
+// connection is dialed **before** swapping, so r.current is never nil and
+// concurrent readers always get a valid pointer. If the dial fails, the old
+// connection is kept intact.
 func (r *reconnectClient) reconnect() {
-	old := r.current.Swap(nil)
-	if old != nil {
-		_ = old.conn.Close()
-	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Dial the replacement **before** touching the live pointer.
 	client, conn, err := r.dial()
 	if err != nil {
 		r.log.Warn("upstream reconnect failed, proxy may not work", "err", err)
-		return
+		return // keep old connection alive
 	}
+
+	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
 	r.log.Warn("upstream reconnected")
-	r.current.Store(&upstreamConn{client: client, conn: conn})
+	_ = old.conn.Close()
 }
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {
