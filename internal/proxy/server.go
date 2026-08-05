@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +34,13 @@ type Server struct {
 	log      *slog.Logger
 }
 
+// nextConnID returns a random 8-character hex string for log correlation.
+func (s *Server) nextConnID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // NewServer returns a Server that forwards to the upstream agent socket.
 func NewServer(upstream string, log *slog.Logger) *Server {
 	return &Server{upstream: upstream, log: log}
@@ -44,34 +53,8 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		s.log.Info("no groups configured; exposing nothing", "upstream", s.upstream)
 	}
 
-	// Precompute allow sets by connecting to the upstream agent once.
-	// This eliminates the per-sign round-trip and the TOCTOU race.
-	upConn, err := dialer.DialContext(context.Background(), "unix", s.upstream)
-	if err != nil {
-		return fmt.Errorf("connecting to upstream agent: %w", err)
-	}
-	upClient := agent.NewClient(upConn)
-	upstreamKeys, err := upClient.List()
-	if err != nil {
-		_ = upConn.Close()
-		return fmt.Errorf("listing upstream keys: %w", err)
-	}
-	_ = upConn.Close()
-
-	// Enrich each group with its allow set.
-	type enrichedGroup struct {
-		g        config.Group
-		allowSet keys.AllowSet
-	}
-	egs := make([]enrichedGroup, 0, len(groups))
-	for _, g := range groups {
-		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
-		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
-	}
-
 	var listeners []net.Listener
-	for _, eg := range egs {
-		g := eg.g
+	for _, g := range groups {
 		if !g.IsEnabled() {
 			s.log.Info("group disabled, skipping", "group", g.Name)
 			continue
@@ -85,7 +68,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g, eg.allowSet)
+		go s.acceptLoop(ctx, ln, g)
 	}
 
 	<-ctx.Done()
@@ -118,39 +101,57 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 	return ln, nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return // listener closed during shutdown
 		}
-		go s.serveConn(ctx, conn, g, allowSet)
+		go s.serveConn(ctx, conn, g)
 	}
 }
 
 // serveConn dials the upstream agent and serves one client with a filtered view.
-func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet) {
+func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group) {
 	defer func() { _ = client.Close() }()
+
+	id := s.nextConnID()
+	log := s.log.With("conn", id, "group", g.Name)
+	log.Info("client connected")
 
 	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	up, err := dialer.DialContext(dctx, "unix", s.upstream)
 	if err != nil {
-		s.log.Warn("upstream agent unreachable", "group", g.Name, "upstream", s.upstream, "err", err)
+		log.Warn("upstream agent unreachable", "upstream", s.upstream, "err", err)
 		return
 	}
 	defer func() { _ = up.Close() }()
 
+	upClient := agent.NewClient(up)
+	upstreamKeys, err := upClient.List()
+	if err != nil {
+		log.Warn("upstream list failed during connection setup",
+			"upstream", s.upstream, "err", err)
+	}
+
+	var allowSet keys.AllowSet
+	if len(upstreamKeys) > 0 {
+		allowSet = keys.BuildAllowSet(upstreamKeys, g.Matchers())
+	}
+	log.Debug("allow set built", "keys", allowSet.Len())
+
 	fa := &filterAgent{
-		up:       agent.NewClient(up),
+		up:       upClient,
 		matchers: g.Matchers(),
 		allowSet: allowSet,
 		group:    g.Name,
-		log:      s.log,
+		log:      log,
 	}
 	if err := agent.ServeAgent(fa, client); err != nil && err != io.EOF {
-		s.log.Debug("client connection ended", "group", g.Name, "err", err)
+		log.Debug("client connection ended", "err", err)
 	}
+	log.Info("client disconnected")
 }
 
 // ListUpstream connects to the upstream agent and writes each key as
