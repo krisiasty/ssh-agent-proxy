@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -148,7 +149,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group)
 		group:    g.Name,
 		log:      log,
 	}
-	if err := agent.ServeAgent(fa, client); err != nil && err != io.EOF {
+	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
 		log.Debug("client connection ended", "err", err)
 	}
 	log.Info("client disconnected")
