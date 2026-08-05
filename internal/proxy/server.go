@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
-	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -130,22 +129,10 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group)
 	defer func() { _ = up.Close() }()
 
 	upClient := agent.NewClient(up)
-	upstreamKeys, err := upClient.List()
-	if err != nil {
-		log.Warn("upstream list failed during connection setup",
-			"upstream", s.upstream, "err", err)
-	}
-
-	var allowSet keys.AllowSet
-	if len(upstreamKeys) > 0 {
-		allowSet = keys.BuildAllowSet(upstreamKeys, g.Matchers())
-	}
-	log.Debug("allow set built", "keys", allowSet.Len())
 
 	fa := &filterAgent{
 		up:       upClient,
 		matchers: g.Matchers(),
-		allowSet: allowSet,
 		group:    g.Name,
 		log:      log,
 	}
