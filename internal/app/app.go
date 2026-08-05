@@ -63,7 +63,7 @@ func Run(cfgPath string, foreground bool, version Version) error {
 	}
 
 	log := logging.Setup(cfg.Debug)
-	log.Info("version", "version", version.String())
+	log.Info("ssh-agent-proxy", "version", version.Version, "commit", version.Commit, "built", version.Date)
 	log.Info("starting", "upstream", cfg.Upstream, "groups", len(cfg.Groups), "config", cfgPath)
 
 	srv := proxy.NewServer(cfg.Upstream, log)
