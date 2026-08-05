@@ -20,7 +20,7 @@ func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 		os.Stdout = stdout
 	})
 
-	runErr := Run(path, true)
+	runErr := Run(path, true, Version{Version: "test", Commit: "none", Date: "unknown"})
 	if err := write.Close(); err != nil {
 		t.Fatal(err)
 	}
