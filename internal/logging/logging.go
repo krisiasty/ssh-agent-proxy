@@ -2,11 +2,28 @@
 package logging
 
 import (
+	"bytes"
+	"log"
 	"log/slog"
 	"os"
 )
 
-// Setup returns a slog.Logger writing to stdout.
+// redirectOutput bridges the legacy log package to the slog logger.
+//
+// agent.ServeAgent uses log.Printf for errors; we redirect those messages
+// here so they appear in the same structured stream as everything else.
+type redirectOutput struct {
+	log *slog.Logger
+}
+
+func (r *redirectOutput) Write(p []byte) (int, error) {
+	line := bytes.TrimSpace(p)
+	r.log.Warn(string(line))
+	return len(p), nil
+}
+
+// Setup returns a slog.Logger writing to stdout and configures the global
+// log package to forward its output through the returned logger.
 //
 // In foreground mode this is what the user sees directly. As a managed service
 // stdout is captured by the platform: the systemd journal on Linux, and the
@@ -17,5 +34,12 @@ func Setup(debug bool) *slog.Logger {
 		level = slog.LevelDebug
 	}
 	h := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})
-	return slog.New(h)
+	logger := slog.New(h)
+
+	// Redirect the legacy log package so messages from agent.ServeAgent
+	// flow through slog instead of going directly to stderr.
+	log.SetOutput(&redirectOutput{log: logger})
+	log.SetFlags(0)
+
+	return logger
 }
