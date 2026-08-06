@@ -149,17 +149,20 @@ func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, a
 	log := s.log.With("conn", id, "group", g.Name)
 
 	// Try to read peer credentials from the Unix socket.
-	// On Linux this gives PID+UID+process name; on macOS, UID only.
-	if peer, err := peercreds.Get(client); err == nil {
-		log = log.With("uid", peer.UID)
-		if peer.PID != 0 {
-			log = log.With("pid", peer.PID)
-		}
-		if peer.Process != "" {
-			log = log.With("process", peer.Process)
-		}
+	// On Linux this gives PID+UID+process name; on macOS, PID+UID+process name.
+	peer, err := peercreds.Get(client)
+	if err != nil {
+		log.Info("failed to read peer credentials", "err", err)
 	}
-
+	if peer.UID != 0 {
+		log = log.With("uid", peer.UID)
+	}
+	if peer.PID != 0 {
+		log = log.With("pid", peer.PID)
+	}
+	if peer.Process != "" {
+		log = log.With("process", peer.Process)
+	}
 	log.Info("client connected")
 
 	fa := &filterAgent{
