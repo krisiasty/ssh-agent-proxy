@@ -57,24 +57,24 @@ func TestNewMatcherNormalization(t *testing.T) {
 func TestMatchByFingerprint(t *testing.T) {
 	k := makeKey(t, "keyA")
 
-	md5m, _ := NewMatcher("md5", ssh.FingerprintLegacyMD5(k))
+	md5m := mustMatcher(t, "md5", ssh.FingerprintLegacyMD5(k))
 	if !md5m.Matches(k) {
 		t.Error("md5 matcher should match its own key")
 	}
 	sha := ssh.FingerprintSHA256(k)
-	shaMWithPrefix, _ := NewMatcher("sha256", sha)
+	shaMWithPrefix := mustMatcher(t, "sha256", sha)
 	if !shaMWithPrefix.Matches(k) {
 		t.Error("sha256 matcher (with prefix) should match")
 	}
-	shaMBare, _ := NewMatcher("sha256", sha[len("SHA256:"):])
+	shaMBare := mustMatcher(t, "sha256", sha[len("SHA256:"):])
 	if !shaMBare.Matches(k) {
 		t.Error("sha256 matcher (bare base64) should match")
 	}
-	commentM, _ := NewMatcher("comment", "keyA")
+	commentM := mustMatcher(t, "comment", "keyA")
 	if !commentM.Matches(k) {
 		t.Error("comment matcher should match")
 	}
-	if wrong, _ := NewMatcher("comment", "KEYA"); wrong.Matches(k) {
+	if wrong := mustMatcher(t, "comment", "KEYA"); wrong.Matches(k) {
 		t.Error("comment match must be case-sensitive")
 	}
 }
@@ -86,15 +86,15 @@ func TestFilterOrderAndDedup(t *testing.T) {
 	upstream := []*agent.Key{a, b, c}
 
 	// Order follows matcher order, not upstream order.
-	mBeta, _ := NewMatcher("comment", "beta")
-	mAlpha, _ := NewMatcher("comment", "alpha")
+	mBeta := mustMatcher(t, "comment", "beta")
+	mAlpha := mustMatcher(t, "comment", "alpha")
 	got := Filter(upstream, []Matcher{mBeta, mAlpha})
 	if len(got) != 2 || got[0].Comment != "beta" || got[1].Comment != "alpha" {
 		t.Fatalf("got %v, want [beta alpha]", comments(got))
 	}
 
 	// A key matched twice appears once, at its first position.
-	mBetaFp, _ := NewMatcher("sha256", ssh.FingerprintSHA256(b))
+	mBetaFp := mustMatcher(t, "sha256", ssh.FingerprintSHA256(b))
 	got = Filter(upstream, []Matcher{mBeta, mBetaFp})
 	if len(got) != 1 {
 		t.Fatalf("dedup failed: got %v", comments(got))
@@ -104,6 +104,15 @@ func TestFilterOrderAndDedup(t *testing.T) {
 	if got := Filter(upstream, nil); len(got) != 0 {
 		t.Fatalf("expected empty, got %v", comments(got))
 	}
+}
+
+func mustMatcher(t *testing.T, typ, value string) Matcher {
+	t.Helper()
+	m, err := NewMatcher(typ, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
 }
 
 func comments(ks []*agent.Key) []string {

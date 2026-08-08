@@ -192,9 +192,11 @@ groups:
 
 Configuration is read once at startup; run `ssh-agent-proxy -restart` to apply changes.
 
-If the config cannot be read, parsed, or is missing required options, the service logs
-an error and idles (rather than exiting) so it is not restarted in a loop. Fix the
-config and restart. In `-foreground` mode it exits with an error instead.
+If the config cannot be read or validated, or the upstream agent is unavailable during
+startup, the service logs the error and idles rather than exiting into a restart loop.
+Fix the config or upstream agent and restart the service. In `-foreground` mode it
+returns the error and exits instead. With no enabled groups, it idles without connecting
+to the upstream agent because it has no sockets to serve.
 
 ## Platform support
 
