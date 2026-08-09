@@ -189,10 +189,11 @@ func TestInfoLogsClientRequestSummariesOnly(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("info logs = %d, want list and sign summaries only: %v", len(entries), entries)
 	}
-	if entries[0]["level"] != "INFO" || entries[0]["msg"] != "list identities" || entries[0]["count"] != float64(1) {
+	if entries[0]["level"] != "INFO" || entries[0]["msg"] != "list identities" ||
+		entries[0]["group"] != "work" || entries[0]["count"] != float64(1) {
 		t.Errorf("list summary = %v", entries[0])
 	}
-	if entries[1]["level"] != "INFO" || entries[1]["msg"] != "sign" ||
+	if entries[1]["level"] != "INFO" || entries[1]["msg"] != "sign" || entries[1]["group"] != "work" ||
 		entries[1]["fingerprint"] != ssh.FingerprintSHA256(pub) {
 		t.Errorf("sign summary = %v", entries[1])
 	}

@@ -33,7 +33,7 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 		f.log.Warn("upstream list failed", "group", f.group, "err", err)
 		return nil, err
 	}
-	f.log.Info("list identities", "group", f.group, "count", len(ks))
+	f.log.Info("list identities", "count", len(ks))
 	identityLog := f.identityLog
 	if identityLog == nil {
 		identityLog = f.log
@@ -62,7 +62,7 @@ func (f *filterAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.
 			"group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
 		return nil, errKeyNotInGroup
 	}
-	f.log.Info("sign", "group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
+	f.log.Info("sign", "fingerprint", ssh.FingerprintSHA256(key))
 	return f.up.SignWithFlags(key, data, flags)
 }
 

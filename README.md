@@ -77,8 +77,7 @@ ssh-agent-proxy -install
 - **macOS:** a **LaunchAgent** (`~/Library/LaunchAgents/io.github.krisiasty.ssh-agent-proxy.plist`);
   logs go to `~/Library/Logs/ssh-agent-proxy.log`.
 
-Runtime logs use JSON Lines: every line is a complete JSON object with `time`, `level`,
-`msg`, and any event-specific structured fields.
+Runtime logs use JSON Lines; see [Logging](#logging) for the default and debug output.
 
 Then edit the config (see below) and restart:
 
@@ -134,6 +133,80 @@ index, algorithm, and size in bits:
   - md5: "MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9"
 ```
 
+## Logging
+
+Runtime logs use JSON Lines (JSONL): every line is a complete JSON object with `time`,
+`level`, `msg`, and event-specific structured fields. This makes the output suitable
+for both command-line processing and ingestion by log-management systems.
+
+### Default logging
+
+With the default `debug: false` configuration, the proxy logs:
+
+- version, configuration path, upstream socket, cache duration, and group startup;
+- client connections and disconnections, including UID, PID, and process name when the
+  operating system provides them;
+- successful client identity-list requests, including the group and number of returned
+  identities;
+- successful client sign requests, including the group and public-key fingerprint;
+- shutdown, refused operations, reconnects, and any warnings or errors.
+
+For example:
+
+```jsonl
+{"time":"2026-08-09T22:55:55.870+02:00","level":"INFO","msg":"client connected","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh"}
+{"time":"2026-08-09T22:55:55.873+02:00","level":"INFO","msg":"list identities","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","count":2}
+{"time":"2026-08-09T22:55:55.893+02:00","level":"INFO","msg":"sign","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","fingerprint":"SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM"}
+{"time":"2026-08-09T22:55:55.921+02:00","level":"INFO","msg":"client disconnected","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh"}
+```
+
+### Debug logging
+
+Set `debug: true` in the configuration and restart the proxy to include debug records.
+Debug mode adds:
+
+- every upstream operation, with its attempt number, duration, result count, error, or
+  other operation-specific metadata;
+- every identity returned by an upstream list, numbered as `identity n/m`, with its
+  fingerprint, comment, algorithm, and key size;
+- configuration-key resolution summaries;
+- every identity returned to a client, numbered as `group identity n/m`, with the same
+  public-key metadata and only the relevant connection and group context;
+- low-level client and upstream connection diagnostics.
+
+For example, these records are added to the normal output:
+
+```jsonl
+{"time":"2026-08-09T22:37:37.445+02:00","level":"DEBUG","msg":"upstream call","operation":"list","attempt":1,"keys":10,"duration":"9.836284ms"}
+{"time":"2026-08-09T22:37:37.445+02:00","level":"DEBUG","msg":"identity 1/10","fingerprint":"SHA256:0KAYsd1LwHitQ6zCUWoRw2FPSLWjsfLMRU6Fn/CyFBw","comment":"laptop@work","algorithm":"ssh-ed25519","key_size":256}
+{"time":"2026-08-09T22:37:37.445+02:00","level":"DEBUG","msg":"config keys resolved","group":"work","trigger":"client-list","configured_keys":2,"upstream_keys":10,"resolved_keys":2}
+{"time":"2026-08-09T22:37:42.821+02:00","level":"DEBUG","msg":"group identity 1/2","conn":"bb411e20","group":"work","fingerprint":"SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM","comment":"laptop@work","algorithm":"ssh-ed25519","key_size":256}
+```
+
+Only public-key metadata is logged. Private keys, signing payloads, and passphrases are
+never included.
+
+### Human-friendly output with `hl`
+
+The excellent [`hl`](https://github.com/pamburus/hl) log processor understands JSONL
+and renders these structured records in a compact, colored, human-friendly format. For
+example:
+
+```text
+2026-08-09 22:55:55.873 [INF] list identities :: conn=67d54585 group=work uid=501 pid=60181 process=ssh count=2
+2026-08-09 22:55:55.893 [INF] sign :: conn=67d54585 group=work uid=501 pid=60181 process=ssh fingerprint=SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM
+2026-08-09 22:37:37.445 [DBG] identity 1/10 :: fingerprint=SHA256:0KAYsd1LwHitQ6zCUWoRw2FPSLWjsfLMRU6Fn/CyFBw comment=laptop@work algorithm=ssh-ed25519 key-size=256
+2026-08-09 22:37:42.821 [DBG] group identity 1/2 :: conn=bb411e20 group=work fingerprint=SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM comment=laptop@work algorithm=ssh-ed25519 key-size=256
+```
+
+View the macOS log file, follow it live, or process live systemd journal output with:
+
+```sh
+hl ~/Library/Logs/ssh-agent-proxy.log
+tail -f ~/Library/Logs/ssh-agent-proxy.log | hl -P
+journalctl --user -u ssh-agent-proxy -f -o cat | hl -P
+```
+
 ## Configuration
 
 The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.yaml`:
@@ -169,9 +242,8 @@ Notes:
 - **`md5`** matches the MD5 fingerprint; the `MD5:` prefix is optional.
 - **`sha256`** matches the SHA256 hash; the `SHA256:` prefix is optional.
 - Each key entry must contain exactly one of `comment`, `md5`, or `sha256`.
-- With `debug: true`, logs show one completion record for every upstream call and
-  one compact count summary for each configuration-key refresh. Private keys,
-  signing payloads, and passphrases are never logged.
+- See [Logging](#logging) for the records enabled by `debug: true` and the public-key
+  metadata they contain.
 - Keys appear in a group in the order their entries are listed.
 - A config entry that matches several upstream keys includes them all; one that matches
   no upstream key is skipped.
