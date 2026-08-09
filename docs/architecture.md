@@ -180,7 +180,7 @@ On SIGINT or SIGTERM:
 
 ## Logging
 
-- Structured logging via `log/slog`, writing to stdout as text.
+- Structured logging via `log/slog`, writing one JSON object per line to stdout.
 - In foreground mode, stdout goes to the terminal.
 - As a managed service, stdout is captured by the platform (systemd journal
   on Linux, launchd log file on macOS).

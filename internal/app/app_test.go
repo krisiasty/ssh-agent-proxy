@@ -1,12 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -82,23 +83,33 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 		t.Fatal("run() error = nil, want proxy startup error")
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
 	if len(lines) != 3 {
 		t.Fatalf("startup emitted %d log lines, want 3:\n%s", len(lines), output)
 	}
-	if !strings.Contains(lines[1], `msg="configuration loaded"`) ||
-		!strings.Contains(lines[1], "config="+path) ||
-		!strings.Contains(lines[1], "groups=1") {
-		t.Errorf("config log = %q, want configuration path and group count", lines[1])
+	entries := make([]map[string]any, 0, len(lines))
+	for i, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("startup log line %d is not valid JSON: %v\n%s", i+1, err, line)
+		}
+		entries = append(entries, entry)
 	}
-	if strings.Contains(lines[1], "upstream=") {
-		t.Errorf("config log unexpectedly contains upstream: %q", lines[1])
+	configLog := entries[1]
+	if configLog["msg"] != "configuration loaded" ||
+		configLog["config"] != path ||
+		configLog["groups"] != float64(1) {
+		t.Errorf("config log = %v, want configuration path and group count", configLog)
 	}
-	if !strings.Contains(lines[2], "msg=starting") || !strings.Contains(lines[2], "upstream="+upstream) {
-		t.Errorf("upstream log = %q, want starting and upstream path", lines[2])
+	if _, ok := configLog["upstream"]; ok {
+		t.Errorf("config log unexpectedly contains upstream: %v", configLog)
 	}
-	if strings.Contains(lines[2], "config=") {
-		t.Errorf("upstream log unexpectedly contains config: %q", lines[2])
+	upstreamLog := entries[2]
+	if upstreamLog["msg"] != "starting" || upstreamLog["upstream"] != upstream {
+		t.Errorf("upstream log = %v, want starting and upstream path", upstreamLog)
+	}
+	if _, ok := upstreamLog["config"]; ok {
+		t.Errorf("upstream log unexpectedly contains config: %v", upstreamLog)
 	}
 }
 
