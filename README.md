@@ -225,6 +225,11 @@ fails without removing that socket. A socket is replaced only when a connection 
 proves that the endpoint is stale. The adjacent `.lock` files are intentionally retained
 between runs so every instance locks the same file inode.
 
+Temporary listener accept failures are logged and retried with exponential backoff
+capped at one second. A terminal listener failure closes every group listener and exits
+non-zero so launchd or systemd can restart the complete proxy instead of leaving one
+group silently unavailable.
+
 ## Platform support
 
 | Platform | Service          | Logging          | Status  |

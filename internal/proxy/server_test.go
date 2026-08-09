@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,161 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+func TestAcceptLoopTreatsShutdownClosureAsClean(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer("unused", 0, log)
+	listener := newScriptedListener(net.ErrClosed)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := srv.acceptLoop(ctx, listener, config.Group{Name: "work", Socket: "/tmp/work.sock"}, nil, nil)
+	if err != nil {
+		t.Fatalf("acceptLoop() error = %v, want nil", err)
+	}
+	if output.Len() != 0 {
+		t.Errorf("shutdown closure logged %q, want no output", output.String())
+	}
+}
+
+func TestAcceptLoopRetriesTemporaryFailure(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer("unused", 0, log)
+	temporaryErr := &injectedTemporaryError{err: errors.New("file descriptor pressure")}
+	listener := newScriptedListener(temporaryErr, net.ErrClosed)
+
+	err := srv.acceptLoop(t.Context(), listener, config.Group{Name: "work", Socket: "/tmp/work.sock"}, nil, nil)
+	if err != nil {
+		t.Fatalf("acceptLoop() error = %v, want nil", err)
+	}
+	if got := listener.AcceptCalls(); got != 2 {
+		t.Fatalf("Accept() calls = %d, want 2", got)
+	}
+	entries := decodeDebugLogs(t, output.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("temporary failure logs = %d, want 1: %v", len(entries), entries)
+	}
+	entry := entries[0]
+	if entry["level"] != "WARN" || entry["msg"] != "temporary listener accept failure; retrying" ||
+		entry["group"] != "work" || entry["socket"] != "/tmp/work.sock" || entry["retry_in"] != "5ms" {
+		t.Errorf("temporary failure log = %v", entry)
+	}
+}
+
+func TestAcceptLoopReportsTerminalFailure(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer("unused", 0, log)
+	terminalErr := errors.New("terminal accept error")
+	listener := newScriptedListener(terminalErr)
+
+	err := srv.acceptLoop(t.Context(), listener, config.Group{Name: "home", Socket: "/tmp/home.sock"}, nil, nil)
+	if !errors.Is(err, ErrListenerFailure) {
+		t.Fatalf("acceptLoop() error = %v, want ErrListenerFailure", err)
+	}
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("acceptLoop() error = %v, want wrapped terminal error", err)
+	}
+	entries := decodeDebugLogs(t, output.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("terminal failure logs = %d, want 1: %v", len(entries), entries)
+	}
+	entry := entries[0]
+	if entry["level"] != "ERROR" || entry["msg"] != "listener accept failure" ||
+		entry["group"] != "home" || entry["socket"] != "/tmp/home.sock" || entry["err"] != terminalErr.Error() {
+		t.Errorf("terminal failure log = %v", entry)
+	}
+}
+
+func TestServerRunPropagatesTerminalAcceptFailure(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	srv := NewServer("unused", 0, log)
+	terminalErr := errors.New("terminal accept error")
+	listener := newScriptedListener(terminalErr)
+	srv.listen = func(context.Context, string) (net.Listener, error) {
+		return listener, nil
+	}
+
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing upstream server connection: %v", err)
+		}
+	})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
+		rc := &reconnectClient{upstream: "unused", log: logger, ctx: ctx}
+		rc.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
+		return rc, nil
+	}
+
+	socket := filepath.Join(t.TempDir(), "group.sock")
+	err := srv.Run(t.Context(), []config.Group{{Name: "work", Socket: socket}})
+	if !errors.Is(err, ErrListenerFailure) {
+		t.Fatalf("Server.Run() error = %v, want ErrListenerFailure", err)
+	}
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("Server.Run() error = %v, want wrapped terminal error", err)
+	}
+	if !listener.Closed() {
+		t.Error("Server.Run() did not close listeners after terminal failure")
+	}
+}
+
+type injectedTemporaryError struct {
+	err error
+}
+
+func (e *injectedTemporaryError) Error() string   { return e.err.Error() }
+func (e *injectedTemporaryError) Unwrap() error   { return e.err }
+func (e *injectedTemporaryError) Temporary() bool { return true }
+
+type scriptedListener struct {
+	mu          sync.Mutex
+	errs        []error
+	acceptCalls int
+	closed      bool
+}
+
+func newScriptedListener(errs ...error) *scriptedListener {
+	return &scriptedListener{errs: append([]error(nil), errs...)}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.acceptCalls++
+	if len(l.errs) == 0 {
+		return nil, net.ErrClosed
+	}
+	err := l.errs[0]
+	l.errs = l.errs[1:]
+	return nil, err
+}
+
+func (l *scriptedListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	return nil
+}
+
+func (l *scriptedListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "injected", Net: "unix"}
+}
+
+func (l *scriptedListener) AcceptCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.acceptCalls
+}
+
+func (l *scriptedListener) Closed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
 
 func TestFormatKeysUsesSingleFieldEntries(t *testing.T) {
 	key := &agent.Key{

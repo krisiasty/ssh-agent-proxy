@@ -58,9 +58,11 @@ main()
 ```
 
 If configuration or proxy startup fails in **foreground** mode, the process exits
-non-zero. In **service** mode, it logs the error and idles until stopped — avoiding
-a tight restart loop from the service manager. If no groups are enabled, the server
-also idles without opening an unnecessary upstream connection.
+non-zero. In **service** mode, startup failures are logged and the process idles until
+stopped, avoiding a tight restart loop. A terminal listener failure after startup is
+returned instead, causing a non-zero exit so the service manager can restart the full
+proxy. If no groups are enabled, the server also idles without opening an unnecessary
+upstream connection.
 
 ## Proxy Server
 
@@ -185,6 +187,11 @@ On SIGINT or SIGTERM:
 5. In-flight `ServeAgent` calls on client connections detect the closed
    client socket (closed by the client or by deferred `client.Close()`)
 6. Per-socket locks are released and the process exits
+
+An unexpected temporary `Accept` failure is logged and retried with exponential
+backoff from 5 ms to a maximum of one second. A terminal failure is reported to
+`Server.Run`, which closes every listener and returns `ErrListenerFailure`. Managed
+service execution propagates that error so launchd or systemd restarts the process.
 
 ## Logging
 
