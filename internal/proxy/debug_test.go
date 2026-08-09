@@ -98,7 +98,7 @@ func TestConfigKeyResolutionIsLogged(t *testing.T) {
 	if !ok {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
 	}
-	allowed := addAgentKey(t, keyring, "allowed")
+	addAgentKey(t, keyring, "allowed")
 	addAgentKey(t, keyring, "hidden")
 	commentMatcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
@@ -127,30 +127,11 @@ func TestConfigKeyResolutionIsLogged(t *testing.T) {
 		summary["resolved_keys"] != float64(1) {
 		t.Errorf("resolution summary = %v, want 2 configured, 2 upstream, 1 resolved", summary)
 	}
-	resolvedEntries, ok := summary["resolutions"].([]any)
-	if !ok || len(resolvedEntries) != 2 {
-		t.Fatalf("selector resolutions = %v, want 2 entries", summary["resolutions"])
+	if _, ok := summary["fingerprints"]; ok {
+		t.Errorf("resolution summary contains fingerprints: %v", summary)
 	}
-	first, ok := resolvedEntries[0].(map[string]any)
-	if !ok {
-		t.Fatalf("first selector resolution = %T, want object", resolvedEntries[0])
-	}
-	if first["config_index"] != float64(1) ||
-		first["selector_type"] != "comment" || first["selector_value"] != "allowed" ||
-		first["matches"] != float64(1) {
-		t.Errorf("first resolution log = %v, want matching comment selector", first)
-	}
-	fingerprints, ok := first["fingerprints"].([]any)
-	if !ok || len(fingerprints) != 1 || fingerprints[0] != ssh.FingerprintSHA256(allowed) {
-		t.Errorf("resolved fingerprints = %v, want %s", first["fingerprints"], ssh.FingerprintSHA256(allowed))
-	}
-	second, ok := resolvedEntries[1].(map[string]any)
-	if !ok {
-		t.Fatalf("second selector resolution = %T, want object", resolvedEntries[1])
-	}
-	if second["config_index"] != float64(2) || second["selector_type"] != "sha256" ||
-		second["selector_value"] != "SHA256:not-loaded" || second["matches"] != float64(0) {
-		t.Errorf("second resolution log = %v, want unmatched SHA256 selector", second)
+	if _, ok := summary["resolutions"]; ok {
+		t.Errorf("resolution summary contains selector details: %v", summary)
 	}
 }
 

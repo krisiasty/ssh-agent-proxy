@@ -193,8 +193,8 @@ On SIGINT or SIGTERM:
 - `debug: true` in config enables `LevelDebug`; default is `LevelInfo`.
 - Debug logs include one completion record for every upstream connection and
   agent-protocol call, with attempts, durations, safe request metadata, and
-  results. Each configuration-key refresh produces one structured record
-  describing how its selectors resolved to current SHA256 fingerprints.
+  results. Each configuration-key refresh produces one compact record with its
+  configured, upstream, and resolved key counts.
 - Version is logged at startup with structured fields: `version`, `commit`,
   `built`.
 - The legacy `log` package output (used by `agent.ServeAgent` for errors) is

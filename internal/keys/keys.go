@@ -30,9 +30,6 @@ type Matcher struct {
 	value string // normalized comparison value
 }
 
-// Value returns the normalized comparison value used by the matcher.
-func (m Matcher) Value() string { return m.value }
-
 // NewMatcher validates and normalizes a match criterion.
 func NewMatcher(typ, value string) (Matcher, error) {
 	if value == "" {

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -22,14 +21,6 @@ type authorizationRefresh struct {
 	trigger string
 	visible []*agent.Key
 	err     error
-}
-
-type selectorResolution struct {
-	ConfigIndex   int            `json:"config_index"`
-	SelectorType  keys.MatchType `json:"selector_type"`
-	SelectorValue string         `json:"selector_value"`
-	Matches       int            `json:"matches"`
-	Fingerprints  []string       `json:"fingerprints"`
 }
 
 // groupAuthorization owns the current authorization view for one group. All
@@ -138,36 +129,10 @@ func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authori
 }
 
 func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigger string) {
-	if !a.log.Enabled(context.Background(), slog.LevelDebug) {
-		return
-	}
-	resolutions := make([]selectorResolution, 0, len(a.matchers))
-	for i, matcher := range a.matchers {
-		matchedFingerprints := make([]string, 0)
-		for _, key := range upstream {
-			if matcher.Matches(key) {
-				matchedFingerprints = append(matchedFingerprints, ssh.FingerprintSHA256(key))
-			}
-		}
-		resolutions = append(resolutions, selectorResolution{
-			ConfigIndex:   i + 1,
-			SelectorType:  matcher.Type,
-			SelectorValue: matcher.Value(),
-			Matches:       len(matchedFingerprints),
-			Fingerprints:  matchedFingerprints,
-		})
-	}
-
-	resolvedFingerprints := make([]string, 0, len(visible))
-	for _, key := range visible {
-		resolvedFingerprints = append(resolvedFingerprints, ssh.FingerprintSHA256(key))
-	}
 	a.log.Debug("config keys resolved",
 		"group", a.group,
 		"trigger", trigger,
 		"configured_keys", len(a.matchers),
 		"upstream_keys", len(upstream),
-		"resolved_keys", len(visible),
-		"fingerprints", resolvedFingerprints,
-		"resolutions", resolutions)
+		"resolved_keys", len(visible))
 }
