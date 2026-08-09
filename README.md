@@ -75,6 +75,9 @@ ssh-agent-proxy -install
 - **macOS:** a **LaunchAgent** (`~/Library/LaunchAgents/io.github.krisiasty.ssh-agent-proxy.plist`);
   logs go to `~/Library/Logs/ssh-agent-proxy.log`.
 
+Runtime logs use JSON Lines: every line is a complete JSON object with `time`, `level`,
+`msg`, and any event-specific structured fields.
+
 Then edit the config (see below) and restart:
 
 ```sh
