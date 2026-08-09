@@ -38,6 +38,7 @@ var dialer net.Dialer
 // Server exposes one filtered agent socket per configured group.
 type Server struct {
 	upstream          string
+	cacheTTL          time.Duration
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
 }
@@ -53,8 +54,8 @@ func (s *Server) nextConnID() string {
 }
 
 // NewServer returns a Server that forwards to the upstream agent socket.
-func NewServer(upstream string, log *slog.Logger) *Server {
-	return &Server{upstream: upstream, log: log, newUpstreamClient: newReconnectClient}
+func NewServer(upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
+	return &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, newUpstreamClient: newReconnectClient}
 }
 
 // Run binds every group socket and serves connections until ctx is cancelled,
@@ -105,6 +106,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 		}
 	}()
+	upstream := newCachedAgent(rc, s.cacheTTL, s.log)
 
 	// Create one shared authorization state per group. Keys are resolved lazily
 	// so a locked or empty upstream agent can become usable without a restart.
@@ -130,7 +132,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g, eg.authorization, rc)
+		go s.acceptLoop(ctx, ln, g, eg.authorization, upstream)
 	}
 
 	<-ctx.Done()

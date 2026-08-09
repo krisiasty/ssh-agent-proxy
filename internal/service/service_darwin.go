@@ -16,21 +16,23 @@ import (
 )
 
 type launchdManager struct {
-	cfgPath   string
-	plistPath string
-	logPath   string
+	cfgPath      string
+	cacheSeconds int
+	plistPath    string
+	logPath      string
 }
 
 // New returns the launchd (LaunchAgent) service manager.
-func New(cfgPath string) (Manager, error) {
+func New(cfgPath string, cacheSeconds int) (Manager, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
 	return &launchdManager{
-		cfgPath:   cfgPath,
-		plistPath: filepath.Join(home, "Library", "LaunchAgents", Label+".plist"),
-		logPath:   filepath.Join(home, "Library", "Logs", "ssh-agent-proxy.log"),
+		cfgPath:      cfgPath,
+		cacheSeconds: cacheSeconds,
+		plistPath:    filepath.Join(home, "Library", "LaunchAgents", Label+".plist"),
+		logPath:      filepath.Join(home, "Library", "Logs", "ssh-agent-proxy.log"),
 	}, nil
 }
 
@@ -67,6 +69,8 @@ func (m *launchdManager) Install() error {
 		<string>%s</string>
 		<string>-config</string>
 		<string>%s</string>
+		<string>--cache</string>
+		<string>%d</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -81,7 +85,7 @@ func (m *launchdManager) Install() error {
 	<string>%s</string>
 </dict>
 </plist>
-`, Label, exe, m.cfgPath, m.logPath, m.logPath)
+`, Label, exe, m.cfgPath, m.cacheSeconds, m.logPath, m.logPath)
 	if err := os.WriteFile(m.plistPath, []byte(plist), 0o600); err != nil {
 		return fmt.Errorf("writing plist: %w", err)
 	}

@@ -121,7 +121,8 @@ that implements `agent.ExtendedAgent`. One is then handed to `agent.ServeAgent`
 to handle the client-side SSH agent wire protocol.
 
 `filterAgent` is created **per client** and holds:
-- A reference to the shared `reconnectClient` (all clients share the same one)
+- A reference to the shared cached upstream agent (all clients and groups share
+  the same cache and `reconnectClient`)
 - A reference to the group's shared `groupAuthorization` state
 
 `groupAuthorization` owns the compiled matchers and publishes immutable
@@ -134,21 +135,22 @@ therefore see the same snapshot without locking on the normal signing path.
 a lock-free lookup. If the key is present, the request is forwarded without an
 extra upstream round trip.
 
-On a miss, one goroutine refreshes the group from upstream and rechecks the
-key. Concurrent misses join that in-flight refresh instead of issuing their own
-`List` calls. If the refreshed selectors still exclude the key,
-`SSH_AGENT_FAILURE` is returned.
+On a miss, one goroutine refreshes the group from the shared upstream identity
+cache and rechecks the key. Concurrent misses join the same refresh. If the
+refreshed selectors still exclude the key, `SSH_AGENT_FAILURE` is returned.
 
 No key list is required during server startup. A locked or empty upstream agent
 can therefore expose keys after it is unlocked without restarting the proxy.
 
 ### List Filtering
 
-`List()` queries the upstream fresh each time (via the shared pipeline) and
-filters the result through the group's matchers, atomically publishes the
-corresponding signing allow-set, and returns those keys in config order.
-Concurrent refreshes for the same group share one upstream request. A failed
-refresh does not replace the last successful snapshot.
+`List()` obtains the process-wide upstream identity snapshot and filters it
+through the group's matchers, atomically publishes the corresponding signing
+allow-set, and returns those keys in config order. The snapshot has a
+three-second default TTL, configurable from 0–60 seconds with `--cache`; zero
+disables caching. All clients and groups share one coalesced refresh. A failed
+refresh serves the last successful snapshot and is retried after the TTL,
+preventing a failing upstream from causing a retry storm.
 
 ### Mutating Operations
 

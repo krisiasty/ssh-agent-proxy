@@ -43,7 +43,7 @@ func TestServerRunWithoutEnabledGroupsDoesNotDialUpstream(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, slog.New(slog.DiscardHandler))
+	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
 
 	t.Run("no groups", func(t *testing.T) {
 		t.Parallel()
@@ -72,7 +72,7 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	t.Parallel()
 
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, slog.New(slog.DiscardHandler))
+	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
 	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
 
 	err := srv.Run(t.Context(), groups)
@@ -85,7 +85,7 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 }
 
 func TestServerRunDoesNotListUpstreamAtStartup(t *testing.T) {
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
 	if !ok {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
@@ -170,7 +170,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	path := filepath.Join(dir, "group.sock")
 	live := listenUnix(t, path)
 
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if ln != nil {
 		closeListener(t, ln)
@@ -196,7 +196,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 		t.Fatalf("creating stale socket: %v", err)
 	}
 
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if err != nil {
 		t.Fatalf("listen() error = %v, want nil", err)
@@ -210,7 +210,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 func TestListenerClosePreservesReplacementSocket(t *testing.T) {
 	dir := shortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 
 	owned, err := srv.listen(t.Context(), path)
 	if err != nil {
@@ -269,7 +269,7 @@ func TestSocketLockHelper(t *testing.T) {
 
 	switch want {
 	case "blocked":
-		srv := NewServer("unused", slog.New(slog.DiscardHandler))
+		srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 		upstreamCalled := false
 		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
 			upstreamCalled = true

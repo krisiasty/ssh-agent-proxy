@@ -247,10 +247,12 @@ type blockingListAgent struct {
 
 type toggleListAgent struct {
 	agent.ExtendedAgent
-	fail atomic.Bool
+	fail      atomic.Bool
+	listCalls atomic.Int64
 }
 
 func (a *toggleListAgent) List() ([]*agent.Key, error) {
+	a.listCalls.Add(1)
 	if a.fail.Load() {
 		return nil, errors.New("test agent is locked")
 	}

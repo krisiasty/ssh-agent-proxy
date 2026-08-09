@@ -5,11 +5,18 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/app"
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 	"github.com/krisiasty/ssh-agent-proxy/internal/proxy"
 	"github.com/krisiasty/ssh-agent-proxy/internal/service"
+)
+
+const (
+	defaultCacheSeconds = 3
+	minCacheSeconds     = 0
+	maxCacheSeconds     = 60
 )
 
 // Build metadata, injected via -ldflags by GoReleaser.
@@ -38,9 +45,13 @@ func run() error {
 		fList       = flag.Bool("list", false, "list upstream keys as ready-to-paste config entries")
 		fForeground = flag.Bool("foreground", false, "run in the foreground, logging to stdout")
 		fConfig     = flag.String("config", "", "path to config file (default: <user config dir>/ssh-agent-proxy/config.yaml)")
+		fCache      = flag.Int("cache", defaultCacheSeconds, "cache upstream identities for 0-60 seconds (0 disables caching)")
 		fVersion    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+	if err := validateCacheSeconds(*fCache); err != nil {
+		return err
+	}
 
 	if *fVersion {
 		fmt.Printf("ssh-agent-proxy %s (commit %s, built %s)\n", version, commit, date)
@@ -89,10 +100,17 @@ func run() error {
 				fmt.Printf("created default config: %s\nedit it, then restart\n", cfgPath)
 			}
 		}
-		return app.Run(cfgPath, *fForeground, app.Version{Version: version, Commit: commit, Date: date})
+		return app.Run(cfgPath, *fForeground, time.Duration(*fCache)*time.Second, app.Version{Version: version, Commit: commit, Date: date})
 	default:
-		return manageService(cfgPath, chosen)
+		return manageService(cfgPath, chosen, *fCache)
 	}
+}
+
+func validateCacheSeconds(seconds int) error {
+	if seconds < minCacheSeconds || seconds > maxCacheSeconds {
+		return fmt.Errorf("--cache must be between %d and %d seconds", minCacheSeconds, maxCacheSeconds)
+	}
+	return nil
 }
 
 func listKeys(cfgPath string) error {
@@ -103,8 +121,8 @@ func listKeys(cfgPath string) error {
 	return proxy.ListUpstream(cfg.Upstream, os.Stdout)
 }
 
-func manageService(cfgPath, action string) error {
-	mgr, err := service.New(cfgPath)
+func manageService(cfgPath, action string, cacheSeconds int) error {
+	mgr, err := service.New(cfgPath, cacheSeconds)
 	if err != nil {
 		return err
 	}
