@@ -100,7 +100,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		return err
 	}
 	defer func() {
-		if err := rc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Warn("closing upstream connection", "err", err)
 			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 		}
@@ -116,7 +116,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	for _, g := range enabledGroups {
 		egs = append(egs, enrichedGroup{
 			g:             g,
-			authorization: newGroupAuthorization(g.Matchers()),
+			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
 	}
 

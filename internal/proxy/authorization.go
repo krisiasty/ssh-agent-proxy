@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -17,6 +19,7 @@ type authorizationSnapshot struct {
 
 type authorizationRefresh struct {
 	done    chan struct{}
+	trigger string
 	visible []*agent.Key
 	err     error
 }
@@ -25,6 +28,8 @@ type authorizationRefresh struct {
 // client connections for that group share it. Concurrent refreshes are
 // coalesced so a burst of clients produces one upstream List request.
 type groupAuthorization struct {
+	group    string
+	log      *slog.Logger
 	matchers []keys.Matcher
 	snapshot atomic.Pointer[authorizationSnapshot]
 
@@ -32,8 +37,12 @@ type groupAuthorization struct {
 	inFlight *authorizationRefresh
 }
 
-func newGroupAuthorization(matchers []keys.Matcher) *groupAuthorization {
-	return &groupAuthorization{matchers: append([]keys.Matcher(nil), matchers...)}
+func newGroupAuthorization(group string, matchers []keys.Matcher, log *slog.Logger) *groupAuthorization {
+	return &groupAuthorization{
+		group:    group,
+		log:      log,
+		matchers: append([]keys.Matcher(nil), matchers...),
+	}
 }
 
 func (a *groupAuthorization) allows(key ssh.PublicKey) bool {
@@ -44,7 +53,7 @@ func (a *groupAuthorization) allows(key ssh.PublicKey) bool {
 // list refreshes the group from upstream and returns the exact filtered view
 // used to publish the new signing allow-set.
 func (a *groupAuthorization) list(up agent.ExtendedAgent) ([]*agent.Key, error) {
-	refresh, owner := a.joinRefresh()
+	refresh, owner := a.joinRefresh("client-list")
 	if owner {
 		a.runRefresh(up, refresh)
 	}
@@ -67,7 +76,7 @@ func (a *groupAuthorization) authorize(up agent.ExtendedAgent, key ssh.PublicKey
 		a.mu.Unlock()
 		return true, nil
 	}
-	refresh, owner := a.joinRefreshLocked()
+	refresh, owner := a.joinRefreshLocked("sign-miss")
 	a.mu.Unlock()
 
 	if owner {
@@ -80,29 +89,40 @@ func (a *groupAuthorization) authorize(up agent.ExtendedAgent, key ssh.PublicKey
 	return a.allows(key), nil
 }
 
-func (a *groupAuthorization) joinRefresh() (*authorizationRefresh, bool) {
+func (a *groupAuthorization) joinRefresh(trigger string) (*authorizationRefresh, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.joinRefreshLocked()
+	return a.joinRefreshLocked(trigger)
 }
 
-func (a *groupAuthorization) joinRefreshLocked() (*authorizationRefresh, bool) {
+func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRefresh, bool) {
 	if a.inFlight != nil {
 		return a.inFlight, false
 	}
-	refresh := &authorizationRefresh{done: make(chan struct{})}
+	refresh := &authorizationRefresh{done: make(chan struct{}), trigger: trigger}
 	a.inFlight = refresh
 	return refresh, true
 }
 
 func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authorizationRefresh) {
+	a.log.Debug("config key resolution started",
+		"group", a.group,
+		"trigger", refresh.trigger,
+		"configured_keys", len(a.matchers))
 	all, err := up.List()
 	var visible []*agent.Key
 	if err == nil {
 		visible = keys.Filter(all, a.matchers)
+		a.logResolution(all, visible, refresh.trigger)
 		a.snapshot.Store(&authorizationSnapshot{
 			allowSet: keys.NewAllowSet(visible),
 		})
+	} else {
+		a.log.Debug("config key resolution failed",
+			"group", a.group,
+			"trigger", refresh.trigger,
+			"configured_keys", len(a.matchers),
+			"err", err)
 	}
 
 	a.mu.Lock()
@@ -111,4 +131,38 @@ func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authori
 	a.inFlight = nil
 	close(refresh.done)
 	a.mu.Unlock()
+}
+
+func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigger string) {
+	if !a.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	for i, matcher := range a.matchers {
+		matchedFingerprints := make([]string, 0)
+		for _, key := range upstream {
+			if matcher.Matches(key) {
+				matchedFingerprints = append(matchedFingerprints, ssh.FingerprintSHA256(key))
+			}
+		}
+		a.log.Debug("config key resolved",
+			"group", a.group,
+			"trigger", trigger,
+			"config_index", i+1,
+			"selector_type", matcher.Type,
+			"selector_value", matcher.Value(),
+			"matches", len(matchedFingerprints),
+			"fingerprints", matchedFingerprints)
+	}
+
+	resolvedFingerprints := make([]string, 0, len(visible))
+	for _, key := range visible {
+		resolvedFingerprints = append(resolvedFingerprints, ssh.FingerprintSHA256(key))
+	}
+	a.log.Debug("config keys resolved",
+		"group", a.group,
+		"trigger", trigger,
+		"configured_keys", len(a.matchers),
+		"upstream_keys", len(upstream),
+		"resolved_keys", len(visible),
+		"fingerprints", resolvedFingerprints)
 }

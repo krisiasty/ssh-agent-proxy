@@ -191,6 +191,9 @@ On SIGINT or SIGTERM:
 - As a managed service, stdout is captured by the platform (systemd journal
   on Linux, launchd log file on macOS).
 - `debug: true` in config enables `LevelDebug`; default is `LevelInfo`.
+- Debug logs include every upstream connection and agent-protocol call with
+  attempts, durations, safe request metadata, and results. They also record how
+  every configured key selector resolves to current SHA256 fingerprints.
 - Version is logged at startup with structured fields: `version`, `commit`,
   `built`.
 - The legacy `log` package output (used by `agent.ServeAgent` for errors) is

@@ -43,7 +43,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 
 	fa := &filterAgent{
 		up:            up,
-		authorization: newGroupAuthorization([]keys.Matcher{m}),
+		authorization: newGroupAuthorization("test", []keys.Matcher{m}, slog.New(slog.DiscardHandler)),
 		group:         "test",
 		log:           slog.New(slog.DiscardHandler),
 	}
@@ -115,7 +115,7 @@ func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
 	}
 	fa := &filterAgent{
 		up:            up,
-		authorization: newGroupAuthorization([]keys.Matcher{matcher}),
+		authorization: newGroupAuthorization("dynamic", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
 		group:         "dynamic",
 		log:           slog.New(slog.DiscardHandler),
 	}
@@ -163,7 +163,7 @@ func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
 	}
 	fa := &filterAgent{
 		up:            up,
-		authorization: newGroupAuthorization([]keys.Matcher{matcher}),
+		authorization: newGroupAuthorization("concurrent", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
 		group:         "concurrent",
 		log:           slog.New(slog.DiscardHandler),
 	}
@@ -216,7 +216,7 @@ func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
 	}
 	fa := &filterAgent{
 		up:            up,
-		authorization: newGroupAuthorization([]keys.Matcher{matcher}),
+		authorization: newGroupAuthorization("recover", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
 		group:         "recover",
 		log:           slog.New(slog.DiscardHandler),
 	}
