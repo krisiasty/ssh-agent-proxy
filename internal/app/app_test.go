@@ -4,13 +4,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/proxy"
 )
+
+func TestShouldReturnProxyError(t *testing.T) {
+	listenerErr := fmt.Errorf("runtime failure: %w", proxy.ErrListenerFailure)
+	if !shouldReturnProxyError(t.Context(), false, listenerErr) {
+		t.Error("listener failure should be returned so the service supervisor can restart")
+	}
+	if shouldReturnProxyError(t.Context(), false, errors.New("startup failure")) {
+		t.Error("managed-service startup failure should idle")
+	}
+	if !shouldReturnProxyError(t.Context(), true, errors.New("foreground failure")) {
+		t.Error("foreground failure should be returned")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if !shouldReturnProxyError(ctx, false, errors.New("shutdown failure")) {
+		t.Error("failure during context cancellation should be returned")
+	}
+}
 
 func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.yaml")

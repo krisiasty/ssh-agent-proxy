@@ -31,9 +31,17 @@ const (
 	// socketProbeTimeout bounds the live-owner check before a stale socket is
 	// removed. A timeout is ambiguous and therefore treated as a live owner.
 	socketProbeTimeout = time.Second
+	// acceptRetryInitial and acceptRetryMax bound retries for temporary listener
+	// failures such as process or system file-descriptor exhaustion.
+	acceptRetryInitial = 5 * time.Millisecond
+	acceptRetryMax     = time.Second
 )
 
 var dialer net.Dialer
+
+// ErrListenerFailure identifies a terminal group listener failure. Managed
+// service runtimes should exit so their supervisor can restart the process.
+var ErrListenerFailure = errors.New("terminal listener failure")
 
 // Server exposes one filtered agent socket per configured group.
 type Server struct {
@@ -41,6 +49,7 @@ type Server struct {
 	cacheTTL          time.Duration
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
+	listen            func(context.Context, string) (net.Listener, error)
 }
 
 // nextConnID returns a random 8-character hex string for log correlation.
@@ -55,7 +64,9 @@ func (s *Server) nextConnID() string {
 
 // NewServer returns a Server that forwards to the upstream agent socket.
 func NewServer(upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
-	return &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, newUpstreamClient: newReconnectClient}
+	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, newUpstreamClient: newReconnectClient}
+	s.listen = s.listenUnix
+	return s
 }
 
 // Run binds every group socket and serves connections until ctx is cancelled,
@@ -123,6 +134,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}
 
 	var listeners []net.Listener
+	acceptFailures := make(chan error, len(egs))
 	for _, eg := range egs {
 		g := eg.g
 		ln, err := s.listen(ctx, g.Socket)
@@ -132,12 +144,20 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g, eg.authorization, upstream)
+		go func() {
+			if err := s.acceptLoop(ctx, ln, g, eg.authorization, upstream); err != nil {
+				acceptFailures <- err
+			}
+		}()
 	}
 
-	<-ctx.Done()
-	s.log.Info("shutting down")
-	return s.closeListeners(listeners)
+	select {
+	case <-ctx.Done():
+		s.log.Info("shutting down")
+		return s.closeListeners(listeners)
+	case err := <-acceptFailures:
+		return errors.Join(err, s.closeListeners(listeners))
+	}
 }
 
 func (s *Server) closeListeners(listeners []net.Listener) error {
@@ -153,7 +173,7 @@ func (s *Server) closeListeners(listeners []net.Listener) error {
 
 // listen creates the group's parent dir, verifies an existing socket is stale,
 // binds the path, and restricts it to the owner (0600).
-func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) {
+func (s *Server) listenUnix(ctx context.Context, path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("creating socket directory: %w", err)
 	}
@@ -252,16 +272,62 @@ func removeStaleSocket(ctx context.Context, path string, original os.FileInfo) e
 	return nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
+type temporaryAcceptError interface {
+	Temporary() bool
+}
+
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) error {
+	var retryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				s.log.Warn("accepting client connection", "group", g.Name, "socket", g.Socket, "err", err)
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				//nolint:nilerr // Listener closure is the successful shutdown signal.
+				return nil
 			}
-			return // listener closed during shutdown
+
+			var temporary temporaryAcceptError
+			if errors.As(err, &temporary) && temporary.Temporary() {
+				if retryDelay == 0 {
+					retryDelay = acceptRetryInitial
+				} else {
+					retryDelay = min(retryDelay*2, acceptRetryMax)
+				}
+				s.log.Warn("temporary listener accept failure; retrying",
+					"group", g.Name,
+					"socket", g.Socket,
+					"retry_in", retryDelay.String(),
+					"err", err)
+				if !waitForAcceptRetry(ctx, retryDelay) {
+					return nil
+				}
+				continue
+			}
+
+			s.log.Error("listener accept failure",
+				"group", g.Name,
+				"socket", g.Socket,
+				"err", err)
+			return fmt.Errorf("%w: group %q socket %q: %w", ErrListenerFailure, g.Name, g.Socket, err)
 		}
+		retryDelay = 0
 		go s.serveConn(ctx, conn, g, authorization, upClient)
+	}
+}
+
+func waitForAcceptRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

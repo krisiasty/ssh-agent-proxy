@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -73,7 +74,7 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 
 	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
 	if err := srv.Run(ctx, cfg.Groups); err != nil {
-		if foreground || ctx.Err() != nil {
+		if shouldReturnProxyError(ctx, foreground, err) {
 			return err
 		}
 		log.Error("proxy startup error", "err", err)
@@ -81,4 +82,8 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 		<-ctx.Done()
 	}
 	return nil
+}
+
+func shouldReturnProxyError(ctx context.Context, foreground bool, err error) bool {
+	return foreground || ctx.Err() != nil || errors.Is(err, proxy.ErrListenerFailure)
 }
