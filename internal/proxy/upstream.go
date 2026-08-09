@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,50 @@ import (
 type upstreamConn struct {
 	client agent.ExtendedAgent
 	conn   net.Conn
+}
+
+// failureTrackingConn records I/O failures without changing the error returned
+// by the SSH agent client. Agent-level failure replies are ordinary successful
+// reads, which lets reconnectClient distinguish them from a broken transport.
+type failureTrackingConn struct {
+	net.Conn
+	failed atomic.Bool
+}
+
+func (c *failureTrackingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		c.failed.Store(true)
+	}
+	return n, err
+}
+
+func (c *failureTrackingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		c.failed.Store(true)
+	}
+	return n, err
+}
+
+func (c *failureTrackingConn) transportFailed() bool {
+	return c.failed.Load()
+}
+
+type transportFailureReporter interface {
+	transportFailed() bool
+}
+
+// x/crypto/ssh/agent does not expose a typed transport error. It consistently
+// wraps failures from the underlying connection with this prefix, while agent
+// failure replies use operation-specific errors. Requiring both that prefix
+// and a recorded I/O error avoids blaming one concurrent semantic failure for
+// a transport error observed by another request on the shared connection.
+const agentClientErrorPrefix = "agent: client error:"
+
+func (c *upstreamConn) transportFailed(err error) bool {
+	reporter, ok := c.conn.(transportFailureReporter)
+	return err != nil && ok && reporter.transportFailed() && strings.HasPrefix(err.Error(), agentClientErrorPrefix)
 }
 
 type upstreamCall struct {
@@ -88,8 +133,9 @@ func newReconnectClient(parentCtx context.Context, upstream string, log *slog.Lo
 			call.finish(err)
 			return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
 		}
+		trackedConn := &failureTrackingConn{Conn: conn}
 		call.finish(nil)
-		return agent.NewClient(conn), conn, nil
+		return agent.NewClient(trackedConn), trackedConn, nil
 	}
 	rc := &reconnectClient{
 		upstream: upstream,
@@ -116,21 +162,24 @@ func (r *reconnectClient) logContext() context.Context {
 	return context.Background()
 }
 
-// reconnect replaces the upstream connection if it is broken.
+// reconnect replaces failed if it is still the current upstream connection.
 //
-// Only one goroutine performs the actual dial (guarded by mu). The new
-// connection is dialed **before** swapping, so r.current is never nil and
-// concurrent readers always get a valid pointer. If the dial fails, the old
-// connection is kept intact.
-func (r *reconnectClient) reconnect() {
+// The identity check prevents callers that failed concurrently on the same old
+// connection from replacing and closing a replacement installed by another
+// caller. The return value reports whether a usable replacement is available.
+func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.current.Load() != failed {
+		return true
+	}
 
 	// Dial the replacement **before** touching the live pointer.
 	client, conn, err := r.dial()
 	if err != nil {
 		r.log.Warn("upstream reconnect failed, proxy may not work", "err", err)
-		return // keep old connection alive
+		return false // keep old connection intact
 	}
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
@@ -138,6 +187,7 @@ func (r *reconnectClient) reconnect() {
 	call := beginUpstreamCall(r.logContext(), r.log, "close", "connection", "replaced")
 	err = old.conn.Close()
 	call.finish(err)
+	return true
 }
 
 // Close closes the current upstream connection.
@@ -156,56 +206,59 @@ func (r *reconnectClient) Close(ctx context.Context) error {
 }
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {
-	ks, err := r.listAttempt(1)
-	if err != nil {
-		r.reconnect()
-		return r.listAttempt(2)
+	current := r.current.Load()
+	ks, err := r.listAttempt(current, 1)
+	if err == nil || !current.transportFailed(err) {
+		return ks, err
 	}
-	return ks, nil
+	if !r.reconnect(current) {
+		return nil, err
+	}
+	return r.listAttempt(r.current.Load(), 2)
 }
 
-func (r *reconnectClient) listAttempt(attempt int) ([]*agent.Key, error) {
+func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*agent.Key, error) {
 	call := beginUpstreamCall(r.logContext(), r.log, "list", "attempt", attempt)
-	ks, err := r.get().List()
+	ks, err := current.client.List()
 	call.finish(err, "keys", len(ks))
 	return ks, err
 }
 
 func (r *reconnectClient) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
-	sig, err := r.signAttempt(key, data, 1)
-	if err != nil {
-		r.reconnect()
-		return r.signAttempt(key, data, 2)
+	current := r.current.Load()
+	sig, err := r.signAttempt(current, key, data)
+	if current.transportFailed(err) {
+		r.reconnect(current)
 	}
-	return sig, nil
+	return sig, err
 }
 
-func (r *reconnectClient) signAttempt(key ssh.PublicKey, data []byte, attempt int) (*ssh.Signature, error) {
+func (r *reconnectClient) signAttempt(current *upstreamConn, key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	call := beginUpstreamCall(r.logContext(), r.log, "sign",
-		"attempt", attempt,
+		"attempt", 1,
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"payload_bytes", len(data))
-	sig, err := r.get().Sign(key, data)
+	sig, err := current.client.Sign(key, data)
 	call.finish(err)
 	return sig, err
 }
 
 func (r *reconnectClient) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	sig, err := r.signWithFlagsAttempt(key, data, flags, 1)
-	if err != nil {
-		r.reconnect()
-		return r.signWithFlagsAttempt(key, data, flags, 2)
+	current := r.current.Load()
+	sig, err := r.signWithFlagsAttempt(current, key, data, flags)
+	if current.transportFailed(err) {
+		r.reconnect(current)
 	}
-	return sig, nil
+	return sig, err
 }
 
-func (r *reconnectClient) signWithFlagsAttempt(key ssh.PublicKey, data []byte, flags agent.SignatureFlags, attempt int) (*ssh.Signature, error) {
+func (r *reconnectClient) signWithFlagsAttempt(current *upstreamConn, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	call := beginUpstreamCall(r.logContext(), r.log, "sign-with-flags",
-		"attempt", attempt,
+		"attempt", 1,
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"flags", flags,
 		"payload_bytes", len(data))
-	sig, err := r.get().SignWithFlags(key, data, flags)
+	sig, err := current.client.SignWithFlags(key, data, flags)
 	call.finish(err)
 	return sig, err
 }
