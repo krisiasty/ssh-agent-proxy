@@ -4,7 +4,6 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -12,29 +11,21 @@ import (
 // errReadOnly is returned for every mutating request; the proxy is read-only.
 var errReadOnly = errors.New("ssh-agent-proxy: read-only agent, request refused")
 
+var errKeyNotInGroup = errors.New("ssh-agent-proxy: key not in group")
+
 // filterAgent is an agent.ExtendedAgent that exposes only the keys of a single
 // group and forwards list/sign to the upstream agent. It is created per client
 // connection and bound to one upstream connection.
 type filterAgent struct {
-	up       agent.ExtendedAgent
-	matchers []keys.Matcher
-	allowSet keys.AllowSet
-	group    string
-	log      *slog.Logger
-}
-
-// allowed returns the upstream keys visible to this group, in config order.
-func (f *filterAgent) allowed() ([]*agent.Key, error) {
-	all, err := f.up.List()
-	if err != nil {
-		return nil, err
-	}
-	return keys.Filter(all, f.matchers), nil
+	up            agent.ExtendedAgent
+	authorization *groupAuthorization
+	group         string
+	log           *slog.Logger
 }
 
 // List returns only the keys assigned to this group.
 func (f *filterAgent) List() ([]*agent.Key, error) {
-	ks, err := f.allowed()
+	ks, err := f.authorization.list(f.up)
 	if err != nil {
 		f.log.Warn("upstream list failed", "group", f.group, "err", err)
 		return nil, err
@@ -43,18 +34,17 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 	return ks, nil
 }
 
-// isAllowed reports whether key is one of this group's keys, using the
-// precomputed allow set so it never needs to call the upstream agent.
-func (f *filterAgent) isAllowed(key ssh.PublicKey) bool {
-	return f.allowSet.Allowed(key)
-}
-
 // SignWithFlags signs with key only if it belongs to this group.
 func (f *filterAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	if !f.isAllowed(key) {
+	allowed, err := f.authorization.authorize(f.up, key)
+	if err != nil {
+		f.log.Warn("upstream list failed during sign authorization", "group", f.group, "err", err)
+		return nil, err
+	}
+	if !allowed {
 		f.log.Warn("sign refused: key not in group",
 			"group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
-		return nil, errors.New("ssh-agent-proxy: key not in group")
+		return nil, errKeyNotInGroup
 	}
 	f.log.Debug("sign", "group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
 	return f.up.SignWithFlags(key, data, flags)

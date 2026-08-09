@@ -204,6 +204,10 @@ Fix the config or upstream agent and restart the service. In `-foreground` mode 
 returns the error and exits instead. With no enabled groups, it idles without connecting
 to the upstream agent because it has no sockets to serve.
 
+Group keys are resolved lazily rather than during startup. If an upstream agent accepts
+connections while locked or initially has no keys, the proxy can start serving and will
+pick up matching keys after the agent is unlocked or populated.
+
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup
 fails without removing that socket. A socket is replaced only when a connection probe

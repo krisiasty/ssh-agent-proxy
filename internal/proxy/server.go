@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
-	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
 	"github.com/krisiasty/ssh-agent-proxy/internal/peercreds"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -107,22 +106,18 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 	}()
 
-	// Precompute allow sets from the initial upstream key list.
-	upstreamKeys, err := rc.List()
-	if err != nil {
-		return fmt.Errorf("listing upstream keys: %w", err)
-	}
-	s.log.Debug("upstream keys listed at startup", "keys", len(upstreamKeys))
-
-	// Enrich each group with its precomputed allow set.
+	// Create one shared authorization state per group. Keys are resolved lazily
+	// so a locked or empty upstream agent can become usable without a restart.
 	type enrichedGroup struct {
-		g        config.Group
-		allowSet keys.AllowSet
+		g             config.Group
+		authorization *groupAuthorization
 	}
 	egs := make([]enrichedGroup, 0, len(enabledGroups))
 	for _, g := range enabledGroups {
-		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
-		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
+		egs = append(egs, enrichedGroup{
+			g:             g,
+			authorization: newGroupAuthorization(g.Matchers()),
+		})
 	}
 
 	var listeners []net.Listener
@@ -135,7 +130,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
-		go s.acceptLoop(ctx, ln, g, eg.allowSet, rc)
+		go s.acceptLoop(ctx, ln, g, eg.authorization, rc)
 	}
 
 	<-ctx.Done()
@@ -255,7 +250,7 @@ func removeStaleSocket(ctx context.Context, path string, original os.FileInfo) e
 	return nil
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -264,13 +259,13 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group
 			}
 			return // listener closed during shutdown
 		}
-		go s.serveConn(ctx, conn, g, allowSet, upClient)
+		go s.serveConn(ctx, conn, g, authorization, upClient)
 	}
 }
 
 // serveConn handles one client with a filtered view over the shared upstream
 // connection. No per-client dial is needed.
-func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
+func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
 	id := s.nextConnID()
 	log := s.log.With("conn", id, "group", g.Name)
 	defer func() {
@@ -297,11 +292,10 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group,
 	log.Info("client connected")
 
 	fa := &filterAgent{
-		up:       upClient,
-		matchers: g.Matchers(),
-		allowSet: allowSet,
-		group:    g.Name,
-		log:      log,
+		up:            upClient,
+		authorization: authorization,
+		group:         g.Name,
+		log:           log,
 	}
 	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
 		log.Debug("client connection ended", "err", err)
