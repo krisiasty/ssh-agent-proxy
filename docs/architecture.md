@@ -49,6 +49,7 @@ main()
            ├─ config.Load(path)
            │  ├─ parse YAML
            │  ├─ validate upstream/socket paths are absolute
+           │  ├─ reject normalized or symlink-equivalent socket conflicts
            │  └─ compile matchers from key entries
            ├─ logging.Setup(debug)
            │  └─ redirect legacy log package → slog logger
@@ -62,6 +63,22 @@ a tight restart loop from the service manager. If no groups are enabled, the ser
 also idles without opening an unnecessary upstream connection.
 
 ## Proxy Server
+
+### Socket Ownership
+
+Before connecting to the upstream agent, `Server.Run` acquires nonblocking file locks
+for all enabled group sockets in sorted path order. Holding every lock for the server's
+lifetime prevents two proxy instances from racing to own the same endpoint. Lock files
+remain on disk so later processes always lock the same inode.
+
+When a socket path already exists, startup connects to it before considering removal.
+A successful connection, timeout, or ambiguous error is treated as a live owner and
+leaves the path untouched. Only a refused connection proves the socket stale. The
+socket inode is checked again before removal to detect replacement during the probe.
+
+Each bound listener records its socket inode and disables the standard library's
+unconditional unlink-on-close behavior. Shutdown removes the path only if it still
+identifies that inode, preserving any listener that replaced it in the meantime.
 
 ### Shared Upstream Connection
 
@@ -154,11 +171,12 @@ Client F ─┘                                        │      (atomic.Pointer)
 On SIGINT or SIGTERM:
 1. `app.Run` cancels the context
 2. `Server.Run` wakes from `<-ctx.Done()`
-3. All group listeners are closed (which also unlinks socket files)
+3. All group listeners are closed; each socket path is unlinked only if it still
+   belongs to that listener
 4. All `acceptLoop` goroutines exit their `ln.Accept`
 5. In-flight `ServeAgent` calls on client connections detect the closed
    client socket (closed by the client or by deferred `client.Close()`)
-6. Process exits
+6. Per-socket locks are released and the process exits
 
 ## Logging
 

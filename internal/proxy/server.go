@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
@@ -25,8 +26,13 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
-// dialTimeout bounds how long connecting to the upstream agent may take.
-const dialTimeout = 10 * time.Second
+const (
+	// dialTimeout bounds how long connecting to the upstream agent may take.
+	dialTimeout = 10 * time.Second
+	// socketProbeTimeout bounds the live-owner check before a stale socket is
+	// removed. A timeout is ambiguous and therefore treated as a live owner.
+	socketProbeTimeout = time.Second
+)
 
 var dialer net.Dialer
 
@@ -68,6 +74,21 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		<-ctx.Done()
 		return nil
 	}
+
+	socketPaths := make([]string, 0, len(enabledGroups))
+	for _, g := range enabledGroups {
+		socketPaths = append(socketPaths, g.Socket)
+	}
+	locks, err := acquireSocketLocks(socketPaths)
+	if err != nil {
+		return fmt.Errorf("acquiring group socket locks: %w", err)
+	}
+	defer func() {
+		if err := closeSocketLocks(locks); err != nil {
+			s.log.Warn("releasing group socket locks", "err", err)
+			runErr = errors.Join(runErr, fmt.Errorf("releasing group socket locks: %w", err))
+		}
+	}()
 
 	// Open a single shared connection to the upstream agent. All proxy clients
 	// funnel through it — this avoids overwhelming agents (e.g. Bitwarden) that
@@ -133,36 +154,114 @@ func (s *Server) closeListeners(listeners []net.Listener) error {
 	return closeErr
 }
 
-// listen creates the group's parent dir, replaces any stale socket, binds it
-// and restricts it to the owner (0600).
+// listen creates the group's parent dir, verifies an existing socket is stale,
+// binds the path, and restricts it to the owner (0600).
 func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating socket directory: %w", err)
 	}
-	// Remove a stale socket left by a previous run or crash.
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("removing stale socket: %w", err)
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, errors.New("socket path exists and is not a Unix socket")
 		}
+		if err := removeStaleSocket(ctx, path, info); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspecting socket path: %w", err)
 	}
+
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("binding Unix socket: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	unixListener, ok := ln.(*net.UnixListener)
+	if !ok {
 		if closeErr := ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return nil, errors.Join(
+				fmt.Errorf("listener for %q is %T, want *net.UnixListener", path, ln),
+				fmt.Errorf("closing unexpected listener: %w", closeErr),
+			)
+		}
+		return nil, fmt.Errorf("listener for %q is %T, want *net.UnixListener", path, ln)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	identity, err := os.Lstat(path)
+	if err != nil {
+		if closeErr := unixListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return nil, errors.Join(
+				fmt.Errorf("inspecting newly bound socket: %w", err),
+				fmt.Errorf("closing listener after inspection failure: %w", closeErr),
+			)
+		}
+		return nil, fmt.Errorf("inspecting newly bound socket: %w", err)
+	}
+	owned := &ownedUnixListener{UnixListener: unixListener, path: path, identity: identity}
+	if err := os.Chmod(path, 0o600); err != nil {
+		if closeErr := owned.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			return nil, errors.Join(err, fmt.Errorf("closing listener after chmod failure: %w", closeErr))
 		}
-		return nil, err
+		return nil, fmt.Errorf("restricting socket permissions: %w", err)
 	}
-	return ln, nil
+	return owned, nil
+}
+
+func removeStaleSocket(ctx context.Context, path string, original os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("probing existing socket: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, socketProbeTimeout)
+	defer cancel()
+
+	conn, err := dialer.DialContext(probeCtx, "unix", path)
+	if err == nil {
+		inUseErr := fmt.Errorf("%w: %q accepted a connection", ErrSocketInUse, path)
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return errors.Join(inUseErr, fmt.Errorf("closing socket probe connection: %w", closeErr))
+		}
+		return inUseErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("probing existing socket: %w", ctxErr)
+	}
+	if probeErr := probeCtx.Err(); probeErr != nil {
+		return errors.Join(
+			fmt.Errorf("%w: probe was inconclusive", ErrSocketInUse),
+			fmt.Errorf("socket probe: %w", probeErr),
+		)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(
+			fmt.Errorf("%w: probe failed without proving staleness", ErrSocketInUse),
+			fmt.Errorf("socket probe: %w", err),
+		)
+	}
+
+	current, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("rechecking stale socket: %w", err)
+	}
+	if !os.SameFile(original, current) {
+		return fmt.Errorf("%w: socket changed while it was being probed", ErrSocketInUse)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale socket: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				s.log.Warn("accepting client connection", "group", g.Name, "socket", g.Socket, "err", err)
+			}
 			return // listener closed during shutdown
 		}
 		go s.serveConn(ctx, conn, g, allowSet, upClient)
