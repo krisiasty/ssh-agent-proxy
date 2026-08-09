@@ -161,6 +161,43 @@ func TestClientListLogsEachReturnedIdentity(t *testing.T) {
 	}, map[string]any{"conn": "test-connection", "group": "work"}, []string{"uid", "pid", "process"})
 }
 
+func TestInfoLogsClientRequestSummariesOnly(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	keyring := newTestKeyring(t)
+	pub := addAgentKey(t, keyring, "allowed")
+	matcher, err := keys.NewMatcher("comment", "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered := &filterAgent{
+		up:            keyring,
+		authorization: newGroupAuthorization("work", []keys.Matcher{matcher}, log),
+		group:         "work",
+		log:           log.With("conn", "test-connection", "group", "work"),
+		identityLog:   log.With("conn", "test-connection", "group", "work"),
+	}
+
+	if _, err := filtered.List(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filtered.SignWithFlags(pub, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := decodeDebugLogs(t, output.Bytes())
+	if len(entries) != 2 {
+		t.Fatalf("info logs = %d, want list and sign summaries only: %v", len(entries), entries)
+	}
+	if entries[0]["level"] != "INFO" || entries[0]["msg"] != "list identities" || entries[0]["count"] != float64(1) {
+		t.Errorf("list summary = %v", entries[0])
+	}
+	if entries[1]["level"] != "INFO" || entries[1]["msg"] != "sign" ||
+		entries[1]["fingerprint"] != ssh.FingerprintSHA256(pub) {
+		t.Errorf("sign summary = %v", entries[1])
+	}
+}
+
 func TestFailedUpstreamCallIsLoggedOnce(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -177,6 +214,29 @@ func TestFailedUpstreamCallIsLoggedOnce(t *testing.T) {
 	}
 	if entry["keys"] != float64(0) {
 		t.Errorf("listed keys = %v, want 0", entry["keys"])
+	}
+}
+
+func TestUpstreamCallsStayAtDebugLevel(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		if err := clientConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing client connection: %v", err)
+		}
+		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing server connection: %v", err)
+		}
+	})
+	client := &reconnectClient{log: log}
+	client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
+
+	if _, err := client.List(); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() != 0 {
+		t.Errorf("upstream call emitted info logs: %s", output.String())
 	}
 }
 
