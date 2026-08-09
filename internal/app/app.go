@@ -67,7 +67,8 @@ func run(ctx context.Context, cfgPath string, foreground bool, version Version) 
 
 	log := logging.Setup(cfg.Debug)
 	log.Info("ssh-agent-proxy", "version", version.Version, "commit", version.Commit, "built", version.Date)
-	log.Info("starting", "upstream", cfg.Upstream, "groups", len(cfg.Groups), "config", cfgPath)
+	log.Info("configuration loaded", "config", cfgPath, "groups", len(cfg.Groups))
+	log.Info("starting", "upstream", cfg.Upstream)
 
 	srv := proxy.NewServer(cfg.Upstream, log)
 	if err := srv.Run(ctx, cfg.Groups); err != nil {
