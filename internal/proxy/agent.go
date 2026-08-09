@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"golang.org/x/crypto/ssh"
@@ -22,6 +23,7 @@ type filterAgent struct {
 	authorization *groupAuthorization
 	group         string
 	log           *slog.Logger
+	identityLog   *slog.Logger
 }
 
 // List returns only the keys assigned to this group.
@@ -32,9 +34,17 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 		return nil, err
 	}
 	f.log.Debug("list identities", "group", f.group, "count", len(ks))
-	if f.log.Enabled(context.Background(), slog.LevelDebug) {
-		for _, key := range ks {
-			f.log.Debug("list identity", "fingerprint", ssh.FingerprintSHA256(key))
+	identityLog := f.identityLog
+	if identityLog == nil {
+		identityLog = f.log
+	}
+	if identityLog.Enabled(context.Background(), slog.LevelDebug) {
+		for i, key := range ks {
+			identityLog.Debug(fmt.Sprintf("group identity %d/%d", i+1, len(ks)),
+				"fingerprint", ssh.FingerprintSHA256(key),
+				"comment", key.Comment,
+				"algorithm", key.Format,
+				"key_size", keyBits(key.Blob))
 		}
 	}
 	return ks, nil

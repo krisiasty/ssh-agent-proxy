@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/dsa"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -335,7 +336,8 @@ func waitForAcceptRetry(ctx context.Context, delay time.Duration) bool {
 // connection. No per-client dial is needed.
 func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
 	id := s.nextConnID()
-	log := s.log.With("conn", id, "group", g.Name)
+	identityLog := s.log.With("conn", id, "group", g.Name)
+	log := identityLog
 	defer func() {
 		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Debug("closing client connection", "err", err)
@@ -364,6 +366,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group,
 		authorization: authorization,
 		group:         g.Name,
 		log:           log,
+		identityLog:   identityLog,
 	}
 	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
 		log.Debug("client connection ended", "err", err)
@@ -423,11 +426,16 @@ func keyBits(blob []byte) int {
 	if err != nil {
 		return 0
 	}
+	if certificate, ok := pk.(*ssh.Certificate); ok {
+		pk = certificate.Key
+	}
 	cpk, ok := pk.(ssh.CryptoPublicKey)
 	if !ok {
 		return 0
 	}
 	switch key := cpk.CryptoPublicKey().(type) {
+	case *dsa.PublicKey:
+		return key.P.BitLen()
 	case *rsa.PublicKey:
 		return key.N.BitLen()
 	case *ecdsa.PublicKey:
