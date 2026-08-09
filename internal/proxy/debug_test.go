@@ -22,6 +22,7 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
 	}
 	pub := addAgentKey(t, keyring, "allowed")
+	otherPub := addAgentKey(t, keyring, "other")
 	clientConn, serverConn := net.Pipe()
 	t.Cleanup(func() {
 		if err := clientConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -38,26 +39,39 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 {
-		t.Fatalf("List() returned %d keys, want 1", len(listed))
+	if len(listed) != 2 {
+		t.Fatalf("List() returned %d keys, want 2", len(listed))
 	}
 	if _, err := rc.SignWithFlags(pub, []byte("payload"), 0); err != nil {
 		t.Fatal(err)
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
-	if len(entries) != 2 {
-		t.Fatalf("upstream call logs = %d, want 2: %v", len(entries), entries)
+	if len(entries) != 4 {
+		t.Fatalf("upstream logs = %d, want 4: %v", len(entries), entries)
 	}
 	listCall := findDebugLog(t, entries, "upstream call", "list")
 	if listCall["attempt"] != float64(1) {
 		t.Errorf("list attempt = %v, want 1", listCall["attempt"])
 	}
-	if listCall["keys"] != float64(1) {
-		t.Errorf("listed keys = %v, want 1", listCall["keys"])
+	if listCall["keys"] != float64(2) {
+		t.Errorf("listed keys = %v, want 2", listCall["keys"])
 	}
 	if _, ok := listCall["duration"].(string); !ok {
 		t.Errorf("list duration = %v, want string", listCall["duration"])
+	}
+	assertIdentityLogs(t, entries, "upstream identity", map[string]bool{
+		ssh.FingerprintSHA256(pub):      true,
+		ssh.FingerprintSHA256(otherPub): true,
+	}, "operation", "list", "attempt", float64(1))
+	listSummaryIndex := -1
+	for i, entry := range entries {
+		if entry["msg"] == "upstream call" && entry["operation"] == "list" {
+			listSummaryIndex = i
+		}
+		if entry["msg"] == "upstream identity" && (listSummaryIndex < 0 || i <= listSummaryIndex) {
+			t.Error("upstream identity was logged before the upstream list summary")
+		}
 	}
 
 	signCall := findDebugLog(t, entries, "upstream call", "sign-with-flags")
@@ -70,6 +84,66 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 	if _, ok := signCall["payload"]; ok {
 		t.Errorf("sign log contains payload contents: %v", signCall)
 	}
+}
+
+func TestClientListLogsEachReturnedIdentity(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	keyring := newTestKeyring(t)
+	first := addAgentKey(t, keyring, "first")
+	second := addAgentKey(t, keyring, "second")
+	firstMatcher, err := keys.NewMatcher("comment", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondMatcher, err := keys.NewMatcher("comment", "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered := &filterAgent{
+		up:            keyring,
+		authorization: newGroupAuthorization("work", []keys.Matcher{firstMatcher, secondMatcher}, log),
+		group:         "work",
+		log:           log.With("conn", "test-connection", "group", "work"),
+	}
+
+	listed, err := filtered.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("List() returned %d keys, want 2", len(listed))
+	}
+
+	entries := decodeDebugLogs(t, output.Bytes())
+	summaryIndex := -1
+	identityIndexes := make([]int, 0, 2)
+	for i, entry := range entries {
+		switch entry["msg"] {
+		case "list identities":
+			summaryIndex = i
+			if entry["count"] != float64(2) {
+				t.Errorf("identity count = %v, want 2", entry["count"])
+			}
+		case "list identity":
+			identityIndexes = append(identityIndexes, i)
+		}
+	}
+	if summaryIndex < 0 {
+		t.Fatal("list identities summary was not logged")
+	}
+	if len(identityIndexes) != 2 {
+		t.Fatalf("list identity logs = %d, want 2: %v", len(identityIndexes), entries)
+	}
+	for _, index := range identityIndexes {
+		if index <= summaryIndex {
+			t.Errorf("identity detail at index %d was logged before summary at index %d", index, summaryIndex)
+		}
+	}
+	assertIdentityLogs(t, entries, "list identity", map[string]bool{
+		ssh.FingerprintSHA256(first):  true,
+		ssh.FingerprintSHA256(second): true,
+	}, "conn", "test-connection", "group", "work")
 }
 
 func TestFailedUpstreamCallIsLoggedOnce(t *testing.T) {
@@ -161,4 +235,34 @@ func findDebugLog(t *testing.T, entries []map[string]any, message, operation str
 	}
 	t.Fatalf("debug log msg=%q operation=%q not found in %v", message, operation, entries)
 	return nil
+}
+
+func assertIdentityLogs(t *testing.T, entries []map[string]any, message string, want map[string]bool, attrs ...any) {
+	t.Helper()
+	got := make(map[string]bool)
+	for _, entry := range entries {
+		if entry["msg"] != message {
+			continue
+		}
+		fingerprint, ok := entry["fingerprint"].(string)
+		if !ok {
+			t.Errorf("%s fingerprint = %v, want string", message, entry["fingerprint"])
+			continue
+		}
+		got[fingerprint] = true
+		for i := 0; i < len(attrs); i += 2 {
+			name := attrs[i].(string)
+			if entry[name] != attrs[i+1] {
+				t.Errorf("%s %s = %v, want %v", message, name, entry[name], attrs[i+1])
+			}
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s fingerprints = %v, want %v", message, got, want)
+	}
+	for fingerprint := range want {
+		if !got[fingerprint] {
+			t.Errorf("%s missing fingerprint %s", message, fingerprint)
+		}
+	}
 }

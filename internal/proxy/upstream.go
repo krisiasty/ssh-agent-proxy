@@ -221,6 +221,14 @@ func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*ag
 	call := beginUpstreamCall(r.logContext(), r.log, "list", "attempt", attempt)
 	ks, err := current.client.List()
 	call.finish(err, "keys", len(ks))
+	if err == nil && r.log.Enabled(r.logContext(), slog.LevelDebug) {
+		for _, key := range ks {
+			r.log.Debug("upstream identity",
+				"operation", "list",
+				"attempt", attempt,
+				"fingerprint", ssh.FingerprintSHA256(key))
+		}
+	}
 	return ks, err
 }
 

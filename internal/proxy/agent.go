@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 
@@ -31,6 +32,11 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 		return nil, err
 	}
 	f.log.Debug("list identities", "group", f.group, "count", len(ks))
+	if f.log.Enabled(context.Background(), slog.LevelDebug) {
+		for _, key := range ks {
+			f.log.Debug("list identity", "fingerprint", ssh.FingerprintSHA256(key))
+		}
+	}
 	return ks, nil
 }
 
