@@ -121,28 +121,36 @@ that implements `agent.ExtendedAgent`. One is then handed to `agent.ServeAgent`
 to handle the client-side SSH agent wire protocol.
 
 `filterAgent` is created **per client** and holds:
-- A reference to the shared `reconnectClient` (all clients share the same one)
-- Compiled matchers (derived from config)
-- A **precomputed allowSet** (built once at startup from the initial upstream
-  key list — a `map[keyBlob]bool`)
+- A reference to the shared cached upstream agent (all clients and groups share
+  the same cache and `reconnectClient`)
+- A reference to the group's shared `groupAuthorization` state
+
+`groupAuthorization` owns the compiled matchers and publishes immutable
+authorization snapshots through an `atomic.Pointer`. All clients for a group
+therefore see the same snapshot without locking on the normal signing path.
 
 ### Key Filtering at Sign Time
 
-`Sign()` and `SignWithFlags()` check the **precomputed allowSet** (zero
-round-trip) before forwarding to upstream. This avoids adding pressure to
-an already-stressed upstream under burst load.
+`Sign()` and `SignWithFlags()` first check the current immutable allow-set with
+a lock-free lookup. If the key is present, the request is forwarded without an
+extra upstream round trip.
 
-If the key is in the allowSet, the request is forwarded to the shared
-upstream connection. If not, `SSH_AGENT_FAILURE` is returned immediately.
+On a miss, one goroutine refreshes the group from the shared upstream identity
+cache and rechecks the key. Concurrent misses join the same refresh. If the
+refreshed selectors still exclude the key, `SSH_AGENT_FAILURE` is returned.
 
-The allowSet is built at startup from a clean snapshot of upstream keys,
-before any client burst. It is stable for the lifetime of the process.
+No key list is required during server startup. A locked or empty upstream agent
+can therefore expose keys after it is unlocked without restarting the proxy.
 
 ### List Filtering
 
-`List()` queries the upstream fresh each time (via the shared pipeline) and
-filters the result through the group's matchers, returning keys in config
-order. This ensures the client sees the current upstream key state.
+`List()` obtains the process-wide upstream identity snapshot and filters it
+through the group's matchers, atomically publishes the corresponding signing
+allow-set, and returns those keys in config order. The snapshot has a
+three-second default TTL, configurable from 0–60 seconds with `--cache`; zero
+disables caching. All clients and groups share one coalesced refresh. A failed
+refresh serves the last successful snapshot and is retried after the TTL,
+preventing a failing upstream from causing a retry storm.
 
 ### Mutating Operations
 
@@ -162,7 +170,7 @@ Client E ─┼── → acceptLoop(group B) ─→ serveConn ──┼── �
 Client F ─┘                                        │      (atomic.Pointer)           socket
                                                     │
          Each serveConn creates a filterAgent       │
-         with its group's allowSet + matchers ──────┘
+         sharing its groupAuthorization state ──────┘
          All filterAgents share the same reconnectClient
 ```
 
@@ -185,6 +193,10 @@ On SIGINT or SIGTERM:
 - As a managed service, stdout is captured by the platform (systemd journal
   on Linux, launchd log file on macOS).
 - `debug: true` in config enables `LevelDebug`; default is `LevelInfo`.
+- Debug logs include one completion record for every upstream connection and
+  agent-protocol call, with attempts, durations, safe request metadata, and
+  results. Each configuration-key refresh produces one compact record with its
+  configured, upstream, and resolved key counts.
 - Version is logged at startup with structured fields: `version`, `commit`,
   `built`.
 - The legacy `log` package output (used by `agent.ServeAgent` for errors) is

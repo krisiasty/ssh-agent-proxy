@@ -23,6 +23,8 @@ agent, and any confirmation/biometric prompt it enforces still applies.
 - The proxy connects to your real ("upstream") agent.
 - For each configured group it listens on a Unix socket.
 - **List identities** returns only the group's keys, in the order you configured.
+- Upstream identities are shared across all groups and cached for three seconds by
+  default, limiting bursts to one upstream list refresh per cache interval.
 - **Sign requests** are honored only for keys in the group; any other key is refused.
 - The proxy is **read-only**: requests that would modify the agent (add/remove a key,
   lock/unlock, extensions) are always refused. Your upstream agent is never modified.
@@ -107,10 +109,13 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 | `-list`        | List upstream keys as ready-to-paste config entries, then exit.        |
 | `-foreground`  | Run in the foreground, logging to stdout (for testing / debugging).    |
 | `-config PATH` | Use an alternate config file path.                                     |
+| `--cache SECONDS` | Cache upstream identities for 0–60 seconds (default `3`; `0` disables caching). |
 | `-version`     | Print version and exit.                                                |
 
 The lifecycle flags are mutually exclusive. With no flag, the tool runs the proxy in
 the foreground of the current process — this is how the service manager runs it.
+When installing or reinstalling a managed service, the selected `--cache` value is
+saved in its service definition.
 
 ### Discovering your keys
 
@@ -164,6 +169,9 @@ Notes:
 - **`md5`** matches the MD5 fingerprint; the `MD5:` prefix is optional.
 - **`sha256`** matches the SHA256 hash; the `SHA256:` prefix is optional.
 - Each key entry must contain exactly one of `comment`, `md5`, or `sha256`.
+- With `debug: true`, logs show one completion record for every upstream call and
+  one compact count summary for each configuration-key refresh. Private keys,
+  signing payloads, and passphrases are never logged.
 - Keys appear in a group in the order their entries are listed.
 - A config entry that matches several upstream keys includes them all; one that matches
   no upstream key is skipped.
@@ -203,6 +211,13 @@ startup, the service logs the error and idles rather than exiting into a restart
 Fix the config or upstream agent and restart the service. In `-foreground` mode it
 returns the error and exits instead. With no enabled groups, it idles without connecting
 to the upstream agent because it has no sockets to serve.
+
+Group keys are resolved lazily rather than during startup. If an upstream agent accepts
+connections while locked or initially has no keys, the proxy can start serving and will
+pick up matching keys after the agent is unlocked or populated. Successful upstream key
+lists are cached process-wide for the configured `--cache` interval. Concurrent refreshes
+across every group share one request; if a refresh fails, the last successful list is
+served until the next interval.
 
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup

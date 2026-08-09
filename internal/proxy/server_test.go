@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 	"golang.org/x/crypto/ssh"
@@ -41,7 +43,7 @@ func TestServerRunWithoutEnabledGroupsDoesNotDialUpstream(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, slog.New(slog.DiscardHandler))
+	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
 
 	t.Run("no groups", func(t *testing.T) {
 		t.Parallel()
@@ -70,7 +72,7 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	t.Parallel()
 
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, slog.New(slog.DiscardHandler))
+	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
 	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
 
 	err := srv.Run(t.Context(), groups)
@@ -82,36 +84,84 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	}
 }
 
-func TestServerRunReturnsInitialListError(t *testing.T) {
-	t.Parallel()
-
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+func TestServerRunDoesNotListUpstreamAtStartup(t *testing.T) {
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
+	}
+	up := &countingListAgent{ExtendedAgent: keyring}
+	clientConn, serverConn := net.Pipe()
 	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
-		dial := func() (agent.ExtendedAgent, net.Conn, error) {
-			clientConn, serverConn := net.Pipe()
-			if err := serverConn.Close(); err != nil {
-				if closeErr := clientConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-					return nil, nil, errors.Join(err, fmt.Errorf("closing client end: %w", closeErr))
-				}
-				return nil, nil, fmt.Errorf("closing server end: %w", err)
-			}
-			return agent.NewClient(clientConn), clientConn, nil
-		}
-		client, conn, err := dial()
-		if err != nil {
-			return nil, err
-		}
-		rc := &reconnectClient{upstream: "unused", log: log, dial: dial}
-		rc.current.Store(&upstreamConn{client: client, conn: conn})
+		rc := &reconnectClient{upstream: "unused", log: log}
+		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
-	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
-	err := srv.Run(t.Context(), groups)
-	if err == nil {
-		t.Fatal("Run() error = nil, want initial list error")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Error("Server.Run() did not stop during cleanup")
+		}
+		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing upstream server connection: %v", err)
+		}
+	})
+
+	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	groups := []config.Group{{Name: "test", Socket: socket}}
+	go func() {
+		done <- srv.Run(ctx, groups)
+		close(stopped)
+	}()
+	waitForSocket(t, socket, done)
+	if got := up.listCalls.Load(); got != 0 {
+		t.Errorf("upstream List() calls during startup = %d, want 0", got)
 	}
-	if !strings.Contains(err.Error(), "listing upstream keys") {
-		t.Fatalf("Run() error = %q, want listing upstream keys context", err)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Server.Run() error = %v, want nil", err)
+	}
+	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closing upstream server connection: %v", err)
+	}
+}
+
+type countingListAgent struct {
+	agent.ExtendedAgent
+	listCalls atomic.Int64
+}
+
+func (a *countingListAgent) List() ([]*agent.Key, error) {
+	a.listCalls.Add(1)
+	return a.ExtendedAgent.List()
+}
+
+func waitForSocket(t *testing.T, path string, done <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+			return
+		} else if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("inspecting group socket: %v", err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Server.Run() returned before serving a socket: %v", err)
+		case <-deadline.C:
+			t.Fatal("timed out waiting for group socket")
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -120,7 +170,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	path := filepath.Join(dir, "group.sock")
 	live := listenUnix(t, path)
 
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if ln != nil {
 		closeListener(t, ln)
@@ -146,7 +196,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 		t.Fatalf("creating stale socket: %v", err)
 	}
 
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if err != nil {
 		t.Fatalf("listen() error = %v, want nil", err)
@@ -160,7 +210,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 func TestListenerClosePreservesReplacementSocket(t *testing.T) {
 	dir := shortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
-	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 
 	owned, err := srv.listen(t.Context(), path)
 	if err != nil {
@@ -219,7 +269,7 @@ func TestSocketLockHelper(t *testing.T) {
 
 	switch want {
 	case "blocked":
-		srv := NewServer("unused", slog.New(slog.DiscardHandler))
+		srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
 		upstreamCalled := false
 		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
 			upstreamCalled = true

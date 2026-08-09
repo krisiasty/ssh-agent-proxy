@@ -17,19 +17,21 @@ import (
 const unitName = "ssh-agent-proxy.service"
 
 type systemdManager struct {
-	cfgPath  string
-	unitPath string
+	cfgPath      string
+	cacheSeconds int
+	unitPath     string
 }
 
 // New returns the systemd (user) service manager.
-func New(cfgPath string) (Manager, error) {
+func New(cfgPath string, cacheSeconds int) (Manager, error) {
 	cfgDir, err := os.UserConfigDir()
 	if err != nil {
 		return nil, err
 	}
 	return &systemdManager{
-		cfgPath:  cfgPath,
-		unitPath: filepath.Join(cfgDir, "systemd", "user", unitName),
+		cfgPath:      cfgPath,
+		cacheSeconds: cacheSeconds,
+		unitPath:     filepath.Join(cfgDir, "systemd", "user", unitName),
 	}, nil
 }
 
@@ -58,13 +60,13 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=%s -config %s
+ExecStart=%s -config %s --cache %d
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-`, exe, m.cfgPath)
+`, exe, m.cfgPath, m.cacheSeconds)
 	if err := os.WriteFile(m.unitPath, []byte(unit), 0o600); err != nil {
 		return fmt.Errorf("writing unit file: %w", err)
 	}

@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
@@ -34,23 +36,16 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Build the allow set from the upstream key list (simulates config resolution).
-	allowedKeys, err := up.List()
-	if err != nil {
-		t.Fatal(err)
-	}
 	m, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowSet := keys.BuildAllowSet(allowedKeys, []keys.Matcher{m})
 
 	fa := &filterAgent{
-		up:       up,
-		matchers: []keys.Matcher{m},
-		allowSet: allowSet,
-		group:    "test",
-		log:      slog.New(slog.DiscardHandler),
+		up:            up,
+		authorization: newGroupAuthorization("test", []keys.Matcher{m}, slog.New(slog.DiscardHandler)),
+		group:         "test",
+		log:           slog.New(slog.DiscardHandler),
 	}
 
 	// List exposes only the allowed key.
@@ -106,5 +101,213 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	}
 	if len(all) != 2 {
 		t.Errorf("upstream now has %d keys, want 2 (proxy must not mutate)", len(all))
+	}
+}
+
+func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
+	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
+	}
+	matcher, err := keys.NewMatcher("comment", "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa := &filterAgent{
+		up:            up,
+		authorization: newGroupAuthorization("dynamic", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
+		group:         "dynamic",
+		log:           slog.New(slog.DiscardHandler),
+	}
+
+	assertListedKeys(t, fa)
+	first := addAgentKey(t, up, "allowed")
+	assertListedKeys(t, fa, first)
+	assertSigns(t, fa, first)
+
+	added := addAgentKey(t, up, "allowed")
+	assertListedKeys(t, fa, first, added)
+	assertSigns(t, fa, added)
+
+	if err := up.Remove(first); err != nil {
+		t.Fatalf("removing first key: %v", err)
+	}
+	assertListedKeys(t, fa, added)
+	assertRefusesKey(t, fa, first)
+
+	if err := up.Remove(added); err != nil {
+		t.Fatalf("removing added key: %v", err)
+	}
+	replacement := addAgentKey(t, up, "allowed")
+	hidden := addAgentKey(t, up, "hidden")
+	assertListedKeys(t, fa, replacement)
+	assertRefusesKey(t, fa, added)
+	assertSigns(t, fa, replacement)
+	assertRefusesKey(t, fa, hidden)
+}
+
+func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
+	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
+	}
+	pub := addAgentKey(t, keyring, "allowed")
+	up := &blockingListAgent{
+		ExtendedAgent: keyring,
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	matcher, err := keys.NewMatcher("comment", "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa := &filterAgent{
+		up:            up,
+		authorization: newGroupAuthorization("concurrent", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
+		group:         "concurrent",
+		log:           slog.New(slog.DiscardHandler),
+	}
+
+	const clients = 128
+	start := make(chan struct{})
+	errs := make(chan error, clients)
+	var ready sync.WaitGroup
+	ready.Add(clients)
+	for range clients {
+		go func() {
+			ready.Done()
+			<-start
+			client := &filterAgent{
+				up:            up,
+				authorization: fa.authorization,
+				group:         fa.group,
+				log:           fa.log,
+			}
+			_, err := client.Sign(pub, []byte("high-load request"))
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	<-up.started
+	close(up.release)
+
+	for range clients {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent Sign() failed: %v", err)
+		}
+	}
+	if got := up.listCalls.Load(); got != 1 {
+		t.Errorf("upstream List() calls = %d, want 1", got)
+	}
+}
+
+func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
+	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
+	}
+	pub := addAgentKey(t, keyring, "allowed")
+	up := &toggleListAgent{ExtendedAgent: keyring}
+	up.fail.Store(true)
+	matcher, err := keys.NewMatcher("comment", "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa := &filterAgent{
+		up:            up,
+		authorization: newGroupAuthorization("recover", []keys.Matcher{matcher}, slog.New(slog.DiscardHandler)),
+		group:         "recover",
+		log:           slog.New(slog.DiscardHandler),
+	}
+
+	if _, err := fa.List(); err == nil {
+		t.Fatal("List() error = nil while upstream is locked")
+	}
+	up.fail.Store(false)
+	assertListedKeys(t, fa, pub)
+	assertSigns(t, fa, pub)
+
+	// A failed later refresh must not clear the last successful immutable
+	// snapshot used by concurrent signing requests.
+	up.fail.Store(true)
+	if _, err := fa.List(); err == nil {
+		t.Fatal("List() error = nil after locking upstream again")
+	}
+	assertSigns(t, fa, pub)
+}
+
+type blockingListAgent struct {
+	agent.ExtendedAgent
+	listCalls atomic.Int64
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+}
+
+type toggleListAgent struct {
+	agent.ExtendedAgent
+	fail      atomic.Bool
+	listCalls atomic.Int64
+}
+
+func (a *toggleListAgent) List() ([]*agent.Key, error) {
+	a.listCalls.Add(1)
+	if a.fail.Load() {
+		return nil, errors.New("test agent is locked")
+	}
+	return a.ExtendedAgent.List()
+}
+
+func (a *blockingListAgent) List() ([]*agent.Key, error) {
+	a.listCalls.Add(1)
+	a.startOnce.Do(func() { close(a.started) })
+	<-a.release
+	return a.ExtendedAgent.List()
+}
+
+func addAgentKey(t *testing.T, up agent.ExtendedAgent, comment string) ssh.PublicKey {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := up.Add(agent.AddedKey{PrivateKey: privateKey, Comment: comment}); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := ssh.NewPublicKey(privateKey.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub
+}
+
+func assertListedKeys(t *testing.T, fa *filterAgent, want ...ssh.PublicKey) {
+	t.Helper()
+	listed, err := fa.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != len(want) {
+		t.Fatalf("List() returned %d keys, want %d", len(listed), len(want))
+	}
+	for i := range want {
+		if string(listed[i].Marshal()) != string(want[i].Marshal()) {
+			t.Errorf("List() key %d = %s, want %s", i, ssh.FingerprintSHA256(listed[i]), ssh.FingerprintSHA256(want[i]))
+		}
+	}
+}
+
+func assertSigns(t *testing.T, fa *filterAgent, key ssh.PublicKey) {
+	t.Helper()
+	if _, err := fa.Sign(key, []byte("sign me")); err != nil {
+		t.Errorf("Sign(%s) failed: %v", ssh.FingerprintSHA256(key), err)
+	}
+}
+
+func assertRefusesKey(t *testing.T, fa *filterAgent, key ssh.PublicKey) {
+	t.Helper()
+	if _, err := fa.Sign(key, []byte("sign me")); !errors.Is(err, errKeyNotInGroup) {
+		t.Errorf("Sign(%s) error = %v, want errKeyNotInGroup", ssh.FingerprintSHA256(key), err)
 	}
 }

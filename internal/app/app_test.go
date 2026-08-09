@@ -25,7 +25,7 @@ func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 		os.Stdout = stdout
 	})
 
-	runErr := Run(path, true, Version{Version: "test", Commit: "none", Date: "unknown"})
+	runErr := Run(path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	if err := write.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 func TestRunReturnsForegroundProxyStartupError(t *testing.T) {
 	path := writeRuntimeConfig(t, filepath.Join(t.TempDir(), "missing-agent.sock"))
 
-	err := run(t.Context(), path, true, Version{Version: "test", Commit: "none", Date: "unknown"})
+	err := run(t.Context(), path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	if err == nil {
 		t.Fatal("run() error = nil, want proxy startup error")
 	}
@@ -68,7 +68,7 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 		os.Stdout = stdout
 	})
 
-	runErr := run(t.Context(), path, true, Version{Version: "test", Commit: "none", Date: "unknown"})
+	runErr := run(t.Context(), path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	if err := write.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 		t.Errorf("config log unexpectedly contains upstream: %v", configLog)
 	}
 	upstreamLog := entries[2]
-	if upstreamLog["msg"] != "starting" || upstreamLog["upstream"] != upstream {
+	if upstreamLog["msg"] != "starting" || upstreamLog["upstream"] != upstream || upstreamLog["cache_seconds"] != float64(3) {
 		t.Errorf("upstream log = %v, want starting and upstream path", upstreamLog)
 	}
 	if _, ok := upstreamLog["config"]; ok {
@@ -118,7 +118,7 @@ func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, path, false, Version{Version: "test", Commit: "none", Date: "unknown"})
+		done <- run(ctx, path, false, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	}()
 
 	select {
