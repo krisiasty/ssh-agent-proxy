@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,12 +75,19 @@ WantedBy=default.target
 }
 
 func (m *systemdManager) Uninstall() error {
-	// Best-effort disable; ignore errors if not currently loaded.
-	_ = m.systemctl("disable", "--now", unitName)
-	if err := os.Remove(m.unitPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing unit file: %w", err)
+	var uninstallErr error
+	if m.installed() {
+		if err := m.systemctl("disable", "--now", unitName); err != nil {
+			uninstallErr = errors.Join(uninstallErr, err)
+		}
 	}
-	return m.systemctl("daemon-reload")
+	if err := os.Remove(m.unitPath); err != nil && !os.IsNotExist(err) {
+		uninstallErr = errors.Join(uninstallErr, fmt.Errorf("removing unit file: %w", err))
+	}
+	if err := m.systemctl("daemon-reload"); err != nil {
+		uninstallErr = errors.Join(uninstallErr, err)
+	}
+	return uninstallErr
 }
 
 func (m *systemdManager) Reinstall() error { return reinstall(m) }
@@ -96,31 +104,50 @@ func (m *systemdManager) Status() (Status, error) {
 	st := Status{}
 	if _, err := os.Stat(m.unitPath); err == nil {
 		st.Installed = true
+	} else if !os.IsNotExist(err) {
+		return st, fmt.Errorf("checking unit file: %w", err)
 	}
-	active := strings.TrimSpace(m.systemctlOut("is-active", unitName))
+	if !st.Installed {
+		return st, nil
+	}
+
+	activeOut, activeErr := m.systemctlOut("is-active", unitName)
+	active := strings.TrimSpace(activeOut)
+	if activeErr != nil && active != "inactive" && active != "failed" {
+		return st, activeErr
+	}
 	st.Running = active == "active"
-	if pid := strings.TrimSpace(m.systemctlOut("show", "-p", "MainPID", "--value", unitName)); pid != "" && pid != "0" {
-		st.PID = pid
+	if st.Running {
+		pidOut, err := m.systemctlOut("show", "-p", "MainPID", "--value", unitName)
+		if err != nil {
+			return st, err
+		}
+		if pid := strings.TrimSpace(pidOut); pid != "" && pid != "0" {
+			st.PID = pid
+		}
 	}
-	st.Program = m.execStartBinary()
+	program, err := m.execStartBinary()
+	if err != nil {
+		return st, err
+	}
+	st.Program = program
 	return st, nil
 }
 
 // execStartBinary reads the binary path from the unit file's ExecStart line.
-func (m *systemdManager) execStartBinary() string {
-	//nolint:gosec // G304: unitPath is derived from the user config dir, not untrusted input.
+func (m *systemdManager) execStartBinary() (string, error) {
 	data, err := os.ReadFile(m.unitPath)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("reading unit file: %w", err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if rest, ok := strings.CutPrefix(line, "ExecStart="); ok {
 			if fields := strings.Fields(rest); len(fields) > 0 {
-				return fields[0]
+				return fields[0], nil
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func (m *systemdManager) systemctl(args ...string) error {
@@ -136,11 +163,14 @@ func (m *systemdManager) systemctl(args ...string) error {
 	return nil
 }
 
-func (m *systemdManager) systemctlOut(args ...string) string {
+func (m *systemdManager) systemctlOut(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	//nolint:gosec // fixed command; args are program-controlled, not shell-interpreted.
 	cmd := exec.CommandContext(ctx, "systemctl", append([]string{"--user"}, args...)...)
-	out, _ := cmd.CombinedOutput()
-	return string(out)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("systemctl --user %s: %w", strings.Join(args, " "), err)
+	}
+	return string(out), nil
 }

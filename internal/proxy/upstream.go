@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -36,9 +37,12 @@ type reconnectClient struct {
 	mu sync.Mutex // guards reconnect: only one goroutine reconnects at a time
 }
 
-func newReconnectClient(upstream string, log *slog.Logger) *reconnectClient {
+func newReconnectClient(parentCtx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
 	dial := func() (agent.ExtendedAgent, net.Conn, error) {
-		conn, err := dialer.Dial("unix", upstream)
+		ctx, cancel := context.WithTimeout(parentCtx, dialTimeout)
+		defer cancel()
+
+		conn, err := dialer.DialContext(ctx, "unix", upstream)
 		if err != nil {
 			return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
 		}
@@ -51,10 +55,10 @@ func newReconnectClient(upstream string, log *slog.Logger) *reconnectClient {
 	}
 	client, conn, err := rc.dial()
 	if err != nil {
-		panic("reconnectClient: initial dial failed: " + err.Error())
+		return nil, fmt.Errorf("initial upstream connection: %w", err)
 	}
 	rc.current.Store(&upstreamConn{client: client, conn: conn})
-	return rc
+	return rc, nil
 }
 
 func (r *reconnectClient) get() agent.ExtendedAgent {
@@ -80,7 +84,21 @@ func (r *reconnectClient) reconnect() {
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
 	r.log.Warn("upstream reconnected")
-	_ = old.conn.Close()
+	if err := old.conn.Close(); err != nil {
+		r.log.Debug("closing replaced upstream connection", "err", err)
+	}
+}
+
+// Close closes the current upstream connection.
+func (r *reconnectClient) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	current := r.current.Load()
+	if current == nil {
+		return nil
+	}
+	return current.conn.Close()
 }
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {
@@ -110,10 +128,12 @@ func (r *reconnectClient) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	return sig, nil
 }
 
-func (r *reconnectClient) Add(key agent.AddedKey) error          { return r.get().Add(key) }
-func (r *reconnectClient) Remove(key ssh.PublicKey) error        { return r.get().Remove(key) }
-func (r *reconnectClient) RemoveAll() error                      { return r.get().RemoveAll() }
-func (r *reconnectClient) Lock(passphrase []byte) error          { return r.get().Lock(passphrase) }
-func (r *reconnectClient) Unlock(passphrase []byte) error        { return r.get().Unlock(passphrase) }
-func (r *reconnectClient) Signers() ([]ssh.Signer, error)        { return r.get().Signers() }
-func (r *reconnectClient) Extension(s string, b []byte) ([]byte, error) { return r.get().Extension(s, b) }
+func (r *reconnectClient) Add(key agent.AddedKey) error   { return r.get().Add(key) }
+func (r *reconnectClient) Remove(key ssh.PublicKey) error { return r.get().Remove(key) }
+func (r *reconnectClient) RemoveAll() error               { return r.get().RemoveAll() }
+func (r *reconnectClient) Lock(passphrase []byte) error   { return r.get().Lock(passphrase) }
+func (r *reconnectClient) Unlock(passphrase []byte) error { return r.get().Unlock(passphrase) }
+func (r *reconnectClient) Signers() ([]ssh.Signer, error) { return r.get().Signers() }
+func (r *reconnectClient) Extension(s string, b []byte) ([]byte, error) {
+	return r.get().Extension(s, b)
+}

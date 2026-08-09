@@ -56,9 +56,10 @@ main()
            └─ proxy.Server.Run(ctx, groups)
 ```
 
-If the config cannot be loaded in **foreground** mode, the process exits
-non-zero. In **service** mode, it logs the error and idles until stopped —
-avoiding a tight restart loop from the service manager.
+If configuration or proxy startup fails in **foreground** mode, the process exits
+non-zero. In **service** mode, it logs the error and idles until stopped — avoiding
+a tight restart loop from the service manager. If no groups are enabled, the server
+also idles without opening an unnecessary upstream connection.
 
 ## Proxy Server
 

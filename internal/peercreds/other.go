@@ -2,8 +2,11 @@
 
 package peercreds
 
-import "io"
+import (
+	"context"
+	"io"
+)
 
-func get(conn io.Reader) (Info, error) {
+func get(_ context.Context, conn io.Reader) (Info, error) {
 	return Info{}, io.EOF
 }

@@ -36,9 +36,9 @@ func (v Version) String() string {
 // Run loads the config and serves the group sockets until terminated by
 // SIGINT/SIGTERM.
 //
-// If the config cannot be loaded and foreground is false, Run logs the error
-// and idles until terminated instead of exiting, so the service manager does
-// not restart it in a tight loop. In foreground mode a config error is returned
+// If configuration or proxy startup fails and foreground is false, Run logs the
+// error and idles until terminated instead of exiting, so the service manager
+// does not restart it in a tight loop. In foreground mode the error is returned
 // to the caller (which exits non-zero).
 func Run(cfgPath string, foreground bool, version Version) error {
 	// Cap parallelism unless the operator set GOMAXPROCS explicitly.
@@ -48,7 +48,10 @@ func Run(cfgPath string, foreground bool, version Version) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	return run(ctx, cfgPath, foreground, version)
+}
 
+func run(ctx context.Context, cfgPath string, foreground bool, version Version) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		if foreground {
@@ -67,5 +70,13 @@ func Run(cfgPath string, foreground bool, version Version) error {
 	log.Info("starting", "upstream", cfg.Upstream, "groups", len(cfg.Groups), "config", cfgPath)
 
 	srv := proxy.NewServer(cfg.Upstream, log)
-	return srv.Run(ctx, cfg.Groups)
+	if err := srv.Run(ctx, cfg.Groups); err != nil {
+		if foreground || ctx.Err() != nil {
+			return err
+		}
+		log.Error("proxy startup error", "err", err)
+		log.Error("idling until stopped; fix the upstream agent and restart the service")
+		<-ctx.Done()
+	}
+	return nil
 }

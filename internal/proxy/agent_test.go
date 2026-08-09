@@ -14,8 +14,14 @@ import (
 
 func TestFilterAgentEnforcement(t *testing.T) {
 	// Build ed25519 keys directly so we keep the private key for keyring.Add.
-	_, privAllowed, _ := ed25519.GenerateKey(rand.Reader)
-	_, privHidden, _ := ed25519.GenerateKey(rand.Reader)
+	_, privAllowed, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, privHidden, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
 	if !ok {
@@ -33,7 +39,10 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, _ := keys.NewMatcher("comment", "allowed")
+	m, err := keys.NewMatcher("comment", "allowed")
+	if err != nil {
+		t.Fatal(err)
+	}
 	allowSet := keys.BuildAllowSet(allowedKeys, []keys.Matcher{m})
 
 	fa := &filterAgent{
@@ -53,8 +62,14 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatalf("List = %d keys, want 1 (allowed)", len(list))
 	}
 
-	allowedPub, _ := ssh.NewPublicKey(privAllowed.Public())
-	hiddenPub, _ := ssh.NewPublicKey(privHidden.Public())
+	allowedPub, err := ssh.NewPublicKey(privAllowed.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hiddenPub, err := ssh.NewPublicKey(privHidden.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
 	data := []byte("sign me")
 
 	// Signing with the allowed key succeeds.
@@ -85,7 +100,11 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	}
 
 	// Upstream is untouched: still holds both keys.
-	if all, _ := up.List(); len(all) != 2 {
+	all, err := up.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
 		t.Errorf("upstream now has %d keys, want 2 (proxy must not mutate)", len(all))
 	}
 }

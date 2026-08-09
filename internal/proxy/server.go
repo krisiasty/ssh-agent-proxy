@@ -32,27 +32,41 @@ var dialer net.Dialer
 
 // Server exposes one filtered agent socket per configured group.
 type Server struct {
-	upstream string
-	log      *slog.Logger
+	upstream          string
+	log               *slog.Logger
+	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
 }
 
 // nextConnID returns a random 8-character hex string for log correlation.
 func (s *Server) nextConnID() string {
 	b := make([]byte, 4)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		s.log.Warn("generating connection ID", "err", err)
+		return "unavailable"
+	}
 	return hex.EncodeToString(b)
 }
 
 // NewServer returns a Server that forwards to the upstream agent socket.
 func NewServer(upstream string, log *slog.Logger) *Server {
-	return &Server{upstream: upstream, log: log}
+	return &Server{upstream: upstream, log: log, newUpstreamClient: newReconnectClient}
 }
 
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
-func (s *Server) Run(ctx context.Context, groups []config.Group) error {
-	if len(groups) == 0 {
-		s.log.Info("no groups configured; exposing nothing", "upstream", s.upstream)
+func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) {
+	enabledGroups := make([]config.Group, 0, len(groups))
+	for _, g := range groups {
+		if !g.IsEnabled() {
+			s.log.Info("group disabled, skipping", "group", g.Name)
+			continue
+		}
+		enabledGroups = append(enabledGroups, g)
+	}
+	if len(enabledGroups) == 0 {
+		s.log.Info("no enabled groups; exposing nothing", "upstream", s.upstream)
+		<-ctx.Done()
+		return nil
 	}
 
 	// Open a single shared connection to the upstream agent. All proxy clients
@@ -61,7 +75,16 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
 	// The reconnecting wrapper will dial a fresh connection if the current one
 	// dies, so a single failure does not kill all clients.
-	rc := newReconnectClient(s.upstream, s.log)
+	rc, err := s.newUpstreamClient(ctx, s.upstream, s.log)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := rc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.log.Warn("closing upstream connection", "err", err)
+			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
+		}
+	}()
 
 	// Precompute allow sets from the initial upstream key list.
 	upstreamKeys, err := rc.List()
@@ -75,8 +98,8 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 		g        config.Group
 		allowSet keys.AllowSet
 	}
-	egs := make([]enrichedGroup, 0, len(groups))
-	for _, g := range groups {
+	egs := make([]enrichedGroup, 0, len(enabledGroups))
+	for _, g := range enabledGroups {
 		allowSet := keys.BuildAllowSet(upstreamKeys, g.Matchers())
 		egs = append(egs, enrichedGroup{g: g, allowSet: allowSet})
 	}
@@ -84,16 +107,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 	var listeners []net.Listener
 	for _, eg := range egs {
 		g := eg.g
-		if !g.IsEnabled() {
-			s.log.Info("group disabled, skipping", "group", g.Name)
-			continue
-		}
 		ln, err := s.listen(ctx, g.Socket)
 		if err != nil {
-			for _, l := range listeners {
-				_ = l.Close()
-			}
-			return fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
+			listenErr := fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
+			return errors.Join(listenErr, s.closeListeners(listeners))
 		}
 		listeners = append(listeners, ln)
 		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
@@ -102,10 +119,18 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) error {
 
 	<-ctx.Done()
 	s.log.Info("shutting down")
+	return s.closeListeners(listeners)
+}
+
+func (s *Server) closeListeners(listeners []net.Listener) error {
+	var closeErr error
 	for _, ln := range listeners {
-		_ = ln.Close() // UnixListener unlinks the socket file on close
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.log.Warn("closing group listener", "address", ln.Addr(), "err", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("closing listener %q: %w", ln.Addr(), err))
+		}
 	}
-	return nil
+	return closeErr
 }
 
 // listen creates the group's parent dir, replaces any stale socket, binds it
@@ -116,7 +141,9 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 	}
 	// Remove a stale socket left by a previous run or crash.
 	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("removing stale socket: %w", err)
+		}
 	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", path)
@@ -124,7 +151,9 @@ func (s *Server) listen(ctx context.Context, path string) (net.Listener, error) 
 		return nil, err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
-		_ = ln.Close()
+		if closeErr := ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return nil, errors.Join(err, fmt.Errorf("closing listener after chmod failure: %w", closeErr))
+		}
 		return nil, err
 	}
 	return ln, nil
@@ -142,15 +171,18 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group
 
 // serveConn handles one client with a filtered view over the shared upstream
 // connection. No per-client dial is needed.
-func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
-	defer func() { _ = client.Close() }()
-
+func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, allowSet keys.AllowSet, upClient agent.ExtendedAgent) {
 	id := s.nextConnID()
 	log := s.log.With("conn", id, "group", g.Name)
+	defer func() {
+		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Debug("closing client connection", "err", err)
+		}
+	}()
 
 	// Try to read peer credentials from the Unix socket.
 	// On Linux this gives PID+UID+process name; on macOS, PID+UID+process name.
-	peer, err := peercreds.Get(client)
+	peer, err := peercreds.Get(ctx, client)
 	if err != nil {
 		log.Info("failed to read peer credentials", "err", err)
 	}
@@ -180,7 +212,7 @@ func (s *Server) serveConn(_ context.Context, client net.Conn, g config.Group, a
 
 // ListUpstream connects to the upstream agent and writes each key as
 // ready-to-paste config entries.
-func ListUpstream(upstream string, w io.Writer) error {
+func ListUpstream(upstream string, w io.Writer) (retErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
@@ -188,7 +220,11 @@ func ListUpstream(upstream string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("connecting to upstream agent %q: %w", upstream, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("closing upstream agent connection: %w", err))
+		}
+	}()
 
 	ks, err := agent.NewClient(conn).List()
 	if err != nil {

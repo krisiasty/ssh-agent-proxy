@@ -164,10 +164,11 @@ stopped properly.
 
 ## Failure handling
 
-If the configuration file cannot be opened, cannot be parsed, or is missing required
-options, the tool **logs an error and does nothing** — it does **not** exit (to avoid
-being restarted in a loop by the service manager). The exception is **foreground
-mode**, where it exits with an error.
+If the configuration file cannot be opened or validated, or proxy startup fails because
+the upstream agent is unavailable, the tool **logs an error and does nothing** — it does
+**not** exit (to avoid being restarted in a loop by the service manager). The exception
+is **foreground mode**, where it exits with an error. With no enabled groups, no upstream
+connection is required.
 
 ## Build and release
 

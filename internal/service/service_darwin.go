@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -88,11 +89,16 @@ func (m *launchdManager) Install() error {
 }
 
 func (m *launchdManager) Uninstall() error {
-	_ = m.launchctl("unload", "-w", m.plistPath)
-	if err := os.Remove(m.plistPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing plist: %w", err)
+	var uninstallErr error
+	if m.installed() {
+		if err := m.launchctl("unload", "-w", m.plistPath); err != nil {
+			uninstallErr = errors.Join(uninstallErr, err)
+		}
 	}
-	return nil
+	if err := os.Remove(m.plistPath); err != nil && !os.IsNotExist(err) {
+		uninstallErr = errors.Join(uninstallErr, fmt.Errorf("removing plist: %w", err))
+	}
+	return uninstallErr
 }
 
 func (m *launchdManager) Reinstall() error { return reinstall(m) }
@@ -103,7 +109,15 @@ func (m *launchdManager) Start() error { return m.launchctl("start", Label) }
 func (m *launchdManager) Stop() error  { return m.launchctl("stop", Label) }
 
 func (m *launchdManager) Restart() error {
-	_ = m.Stop()
+	st, err := m.Status()
+	if err != nil {
+		return err
+	}
+	if st.Running {
+		if err := m.Stop(); err != nil {
+			return err
+		}
+	}
 	return m.Start()
 }
 

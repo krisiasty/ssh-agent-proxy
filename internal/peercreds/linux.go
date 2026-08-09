@@ -3,6 +3,9 @@
 package peercreds
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -12,7 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func get(conn io.Reader) (Info, error) {
+func get(_ context.Context, conn io.Reader) (info Info, retErr error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return Info{}, io.EOF
@@ -22,7 +25,11 @@ func get(conn io.Reader) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing peer socket descriptor: %w", err))
+		}
+	}()
 
 	fd := int(f.Fd())
 	cred, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
@@ -30,7 +37,7 @@ func get(conn io.Reader) (Info, error) {
 		return Info{}, err
 	}
 
-	info := Info{
+	info = Info{
 		PID: cred.Pid,
 		UID: cred.Uid,
 	}
