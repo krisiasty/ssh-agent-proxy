@@ -124,8 +124,14 @@ func (c *Config) resolve() error {
 	if err := requireAbsolute(c.Upstream, "upstream"); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	c.Upstream = filepath.Clean(c.Upstream)
+	upstreamPath, err := canonicalSocketPath(c.Upstream)
+	if err != nil {
+		return fmt.Errorf("config: resolving upstream path: %w", err)
+	}
 
 	seenNames := make(map[string]bool)
+	seenSockets := make(map[string]string)
 	for i := range c.Groups {
 		g := &c.Groups[i]
 		if strings.TrimSpace(g.Name) == "" {
@@ -142,6 +148,20 @@ func (c *Config) resolve() error {
 		if err := requireAbsolute(g.Socket, fmt.Sprintf("group %q: socket", g.Name)); err != nil {
 			return fmt.Errorf("config: %w", err)
 		}
+		g.Socket = filepath.Clean(g.Socket)
+		if g.IsEnabled() {
+			socketPath, err := canonicalSocketPath(g.Socket)
+			if err != nil {
+				return fmt.Errorf("config: group %q: resolving socket path: %w", g.Name, err)
+			}
+			if socketPath == upstreamPath {
+				return fmt.Errorf("config: group %q: socket conflicts with upstream path %q", g.Name, c.Upstream)
+			}
+			if other, ok := seenSockets[socketPath]; ok {
+				return fmt.Errorf("config: groups %q and %q use the same socket path", other, g.Name)
+			}
+			seenSockets[socketPath] = g.Name
+		}
 
 		g.matchers = g.matchers[:0]
 		for j, ke := range g.Keys {
@@ -153,6 +173,34 @@ func (c *Config) resolve() error {
 		}
 	}
 	return nil
+}
+
+// canonicalSocketPath resolves every existing path prefix so conflicts through
+// symlinked directories are detected even when the socket itself does not yet
+// exist. Missing suffixes are appended to the resolved prefix unchanged.
+func canonicalSocketPath(path string) (string, error) {
+	cleaned := filepath.Clean(path)
+	current := cleaned
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return cleaned, nil
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func (ke KeyEntry) matcher() (keys.Matcher, error) {

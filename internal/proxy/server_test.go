@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -110,5 +112,196 @@ func TestServerRunReturnsInitialListError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listing upstream keys") {
 		t.Fatalf("Run() error = %q, want listing upstream keys context", err)
+	}
+}
+
+func TestListenRefusesLiveSocket(t *testing.T) {
+	dir := shortSocketDir(t)
+	path := filepath.Join(dir, "group.sock")
+	live := listenUnix(t, path)
+
+	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	ln, err := srv.listen(t.Context(), path)
+	if ln != nil {
+		closeListener(t, ln)
+		t.Fatal("listen() returned a listener for an already-live socket")
+	}
+	if !errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("listen() error = %v, want ErrSocketInUse", err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("live socket was removed: %v", err)
+	}
+
+	closeListener(t, live)
+	removeSocket(t, path)
+}
+
+func TestListenReplacesOnlyStaleSocket(t *testing.T) {
+	dir := shortSocketDir(t)
+	path := filepath.Join(dir, "group.sock")
+	stale := listenUnix(t, path)
+	closeListener(t, stale)
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("creating stale socket: %v", err)
+	}
+
+	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+	ln, err := srv.listen(t.Context(), path)
+	if err != nil {
+		t.Fatalf("listen() error = %v, want nil", err)
+	}
+	closeListener(t, ln)
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("owned socket remains after close: %v", err)
+	}
+}
+
+func TestListenerClosePreservesReplacementSocket(t *testing.T) {
+	dir := shortSocketDir(t)
+	path := filepath.Join(dir, "group.sock")
+	srv := NewServer("unused", slog.New(slog.DiscardHandler))
+
+	owned, err := srv.listen(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		closeListener(t, owned)
+		t.Fatalf("removing original socket path: %v", err)
+	}
+	replacement := listenUnix(t, path)
+
+	closeListener(t, owned)
+	conn, err := dialer.DialContext(t.Context(), "unix", path)
+	if err != nil {
+		closeListener(t, replacement)
+		removeSocket(t, path)
+		t.Fatalf("replacement socket was removed or stopped: %v", err)
+	}
+	if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("closing replacement probe: %v", err)
+	}
+	closeListener(t, replacement)
+	removeSocket(t, path)
+}
+
+func TestSecondServerProcessCannotTakeOverSocket(t *testing.T) {
+	dir := shortSocketDir(t)
+	path := filepath.Join(dir, "group.sock")
+	lock, err := acquireSocketLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockHeld := true
+	t.Cleanup(func() {
+		if lockHeld {
+			if err := lock.Close(); err != nil {
+				t.Errorf("closing parent socket lock during cleanup: %v", err)
+			}
+		}
+	})
+
+	runSocketLockHelper(t, path, "blocked")
+	if err := lock.Close(); err != nil {
+		t.Fatalf("closing parent socket lock: %v", err)
+	}
+	lockHeld = false
+	runSocketLockHelper(t, path, "available")
+}
+
+func TestSocketLockHelper(t *testing.T) {
+	path := os.Getenv("SSH_AGENT_PROXY_TEST_LOCK_PATH")
+	want := os.Getenv("SSH_AGENT_PROXY_TEST_LOCK_EXPECT")
+	if path == "" || want == "" {
+		t.Skip("subprocess helper")
+	}
+
+	switch want {
+	case "blocked":
+		srv := NewServer("unused", slog.New(slog.DiscardHandler))
+		upstreamCalled := false
+		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
+			upstreamCalled = true
+			return nil, errors.New("upstream constructor must not run while socket is locked")
+		}
+		err := srv.Run(t.Context(), []config.Group{{Name: "test", Socket: path}})
+		if !errors.Is(err, ErrSocketInUse) {
+			t.Fatalf("second Server.Run() error = %v, want ErrSocketInUse", err)
+		}
+		if upstreamCalled {
+			t.Fatal("second Server.Run() contacted upstream before acquiring its socket lock")
+		}
+	case "available":
+		lock, err := acquireSocketLock(path)
+		if err != nil {
+			t.Fatalf("acquireSocketLock() error = %v, want nil", err)
+		}
+		if lock == nil {
+			t.Fatal("acquireSocketLock() lock = nil, want a lock")
+		}
+		if closeErr := lock.Close(); closeErr != nil {
+			t.Fatalf("closing acquired lock: %v", closeErr)
+		}
+	default:
+		t.Fatalf("unknown helper expectation %q", want)
+	}
+}
+
+func runSocketLockHelper(t *testing.T, path, expectation string) {
+	t.Helper()
+	//nolint:gosec // G204: the executable is the current test binary and every argument is fixed.
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestSocketLockHelper$")
+	cmd.Env = append(os.Environ(),
+		"SSH_AGENT_PROXY_TEST_LOCK_PATH="+path,
+		"SSH_AGENT_PROXY_TEST_LOCK_EXPECT="+expectation,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("socket lock subprocess failed: %v\n%s", err, output)
+	}
+}
+
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
+	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("removing socket test directory: %v", err)
+		}
+	})
+	return dir
+}
+
+func listenUnix(t *testing.T, path string) net.Listener {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unixListener, ok := ln.(*net.UnixListener)
+	if !ok {
+		closeListener(t, ln)
+		t.Fatalf("net.Listen() returned %T, want *net.UnixListener", ln)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	return unixListener
+}
+
+func closeListener(t *testing.T, ln net.Listener) {
+	t.Helper()
+	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Errorf("closing listener: %v", err)
+	}
+}
+
+func removeSocket(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Errorf("removing socket: %v", err)
 	}
 }

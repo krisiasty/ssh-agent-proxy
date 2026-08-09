@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
@@ -72,21 +74,24 @@ groups:
 
 func TestLoadErrors(t *testing.T) {
 	cases := map[string]string{
-		"missing upstream":     "groups: []\n",
-		"missing name":         "upstream: /a\ngroups:\n  - socket: /s\n",
-		"duplicate name":       "upstream: /a\ngroups:\n  - {name: g, socket: /s1}\n  - {name: g, socket: /s2}\n",
-		"group no socket":      "upstream: /a\ngroups:\n  - name: g\n",
-		"relative upstream":    "upstream: ./agent.sock\ngroups: []\n",
-		"relative group socket": "upstream: /a\ngroups:\n  - {name: g, socket: ./s.sock}\n",
-		"tilde upstream":       "upstream: ~/.ssh/agent.sock\ngroups: []\n",
-		"envvar upstream":      "upstream: ${SSH_AUTH_SOCK}\ngroups: []\n",
-		"old key form":         "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: comment, value: x}\n",
-		"unknown key form":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {fingerprint: x}\n",
-		"missing key form":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {}\n",
-		"multiple key forms":   "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: x, md5: y}\n",
-		"empty key value":      "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: \"\"}\n",
-		"unknown field":        "upstream: /a\nnope: 1\n",
-		"not yaml":             "upstream: [unterminated\n",
+		"missing upstream":       "groups: []\n",
+		"missing name":           "upstream: /a\ngroups:\n  - socket: /s\n",
+		"duplicate name":         "upstream: /a\ngroups:\n  - {name: g, socket: /s1}\n  - {name: g, socket: /s2}\n",
+		"duplicate socket":       "upstream: /a\ngroups:\n  - {name: g1, socket: /same}\n  - {name: g2, socket: /same}\n",
+		"normalized socket":      "upstream: /a\ngroups:\n  - {name: g1, socket: /tmp/dir/../same}\n  - {name: g2, socket: /tmp/same}\n",
+		"socket equals upstream": "upstream: /tmp/dir/../agent\ngroups:\n  - {name: g, socket: /tmp/agent}\n",
+		"group no socket":        "upstream: /a\ngroups:\n  - name: g\n",
+		"relative upstream":      "upstream: ./agent.sock\ngroups: []\n",
+		"relative group socket":  "upstream: /a\ngroups:\n  - {name: g, socket: ./s.sock}\n",
+		"tilde upstream":         "upstream: ~/.ssh/agent.sock\ngroups: []\n",
+		"envvar upstream":        "upstream: ${SSH_AUTH_SOCK}\ngroups: []\n",
+		"old key form":           "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {type: comment, value: x}\n",
+		"unknown key form":       "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {fingerprint: x}\n",
+		"missing key form":       "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {}\n",
+		"multiple key forms":     "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: x, md5: y}\n",
+		"empty key value":        "upstream: /a\ngroups:\n  - name: g\n    socket: /s\n    keys:\n      - {comment: \"\"}\n",
+		"unknown field":          "upstream: /a\nnope: 1\n",
+		"not yaml":               "upstream: [unterminated\n",
 	}
 	for name, body := range cases {
 		p := writeConfig(t, body)
@@ -94,6 +99,49 @@ func TestLoadErrors(t *testing.T) {
 			t.Errorf("%s: expected error, got nil", name)
 		}
 	}
+}
+
+func TestLoadAllowsDisabledSocketConflicts(t *testing.T) {
+	p := writeConfig(t, `
+upstream: /agent.sock
+groups:
+  - {name: enabled, socket: /group.sock}
+  - {name: disabled-duplicate, enabled: false, socket: /group.sock}
+  - {name: disabled-upstream, enabled: false, socket: /agent.sock}
+`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+}
+
+func TestLoadRejectsSymlinkEquivalentSocketPaths(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	aliasDir := filepath.Join(root, "alias")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("group conflicts with upstream", func(t *testing.T) {
+		body := fmt.Sprintf("upstream: %q\ngroups:\n  - {name: group, socket: %q}\n",
+			filepath.Join(realDir, "agent.sock"), filepath.Join(aliasDir, "agent.sock"))
+		_, err := Load(writeConfig(t, body))
+		if err == nil || !strings.Contains(err.Error(), "conflicts with upstream") {
+			t.Fatalf("Load() error = %v, want upstream conflict", err)
+		}
+	})
+
+	t.Run("groups conflict with each other", func(t *testing.T) {
+		body := fmt.Sprintf("upstream: /unrelated.sock\ngroups:\n  - {name: first, socket: %q}\n  - {name: second, socket: %q}\n",
+			filepath.Join(realDir, "group.sock"), filepath.Join(aliasDir, "group.sock"))
+		_, err := Load(writeConfig(t, body))
+		if err == nil || !strings.Contains(err.Error(), "use the same socket path") {
+			t.Fatalf("Load() error = %v, want duplicate group socket", err)
+		}
+	})
 }
 
 func TestLoadMissingFile(t *testing.T) {

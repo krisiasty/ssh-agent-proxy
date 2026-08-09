@@ -152,6 +152,9 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 Notes:
 
 - Each group needs a **unique `name`**; it appears in log messages.
+- Enabled groups must use distinct socket paths, including paths that become
+  equivalent after cleaning or resolving existing symlinked directories. An enabled
+  group socket also cannot resolve to the upstream agent socket.
 - A group with **`enabled: false`** is not exposed (its socket is not created). Omitting
   `enabled` means the group is enabled.
 - **`comment`** matches the key comment exactly (case-sensitive).
@@ -197,6 +200,12 @@ startup, the service logs the error and idles rather than exiting into a restart
 Fix the config or upstream agent and restart the service. In `-foreground` mode it
 returns the error and exits instead. With no enabled groups, it idles without connecting
 to the upstream agent because it has no sockets to serve.
+
+At startup, each enabled group socket is protected by a nonblocking file lock. If
+another proxy instance owns a lock or an existing socket accepts connections, startup
+fails without removing that socket. A socket is replaced only when a connection probe
+proves that the endpoint is stale. The adjacent `.lock` files are intentionally retained
+between runs so every instance locks the same file inode.
 
 ## Platform support
 
