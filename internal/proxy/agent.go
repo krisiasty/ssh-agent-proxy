@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"golang.org/x/crypto/ssh"
@@ -21,6 +23,7 @@ type filterAgent struct {
 	authorization *groupAuthorization
 	group         string
 	log           *slog.Logger
+	identityLog   *slog.Logger
 }
 
 // List returns only the keys assigned to this group.
@@ -30,7 +33,20 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 		f.log.Warn("upstream list failed", "group", f.group, "err", err)
 		return nil, err
 	}
-	f.log.Debug("list identities", "group", f.group, "count", len(ks))
+	f.log.Info("list identities", "count", len(ks))
+	identityLog := f.identityLog
+	if identityLog == nil {
+		identityLog = f.log
+	}
+	if identityLog.Enabled(context.Background(), slog.LevelDebug) {
+		for i, key := range ks {
+			identityLog.Debug(fmt.Sprintf("group identity %d/%d", i+1, len(ks)),
+				"fingerprint", ssh.FingerprintSHA256(key),
+				"comment", key.Comment,
+				"algorithm", key.Format,
+				"key_size", keyBits(key.Blob))
+		}
+	}
 	return ks, nil
 }
 
@@ -46,7 +62,7 @@ func (f *filterAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.
 			"group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
 		return nil, errKeyNotInGroup
 	}
-	f.log.Debug("sign", "group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
+	f.log.Info("sign", "fingerprint", ssh.FingerprintSHA256(key))
 	return f.up.SignWithFlags(key, data, flags)
 }
 

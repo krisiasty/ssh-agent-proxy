@@ -221,6 +221,15 @@ func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*ag
 	call := beginUpstreamCall(r.logContext(), r.log, "list", "attempt", attempt)
 	ks, err := current.client.List()
 	call.finish(err, "keys", len(ks))
+	if err == nil && r.log.Enabled(r.logContext(), slog.LevelDebug) {
+		for i, key := range ks {
+			r.log.Debug(fmt.Sprintf("identity %d/%d", i+1, len(ks)),
+				"fingerprint", ssh.FingerprintSHA256(key),
+				"comment", key.Comment,
+				"algorithm", key.Format,
+				"key_size", keyBits(key.Blob))
+		}
+	}
 	return ks, err
 }
 
