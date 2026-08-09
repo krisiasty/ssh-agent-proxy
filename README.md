@@ -321,4 +321,4 @@ Requires Go 1.26+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
