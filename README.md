@@ -164,9 +164,9 @@ Notes:
 - **`md5`** matches the MD5 fingerprint; the `MD5:` prefix is optional.
 - **`sha256`** matches the SHA256 hash; the `SHA256:` prefix is optional.
 - Each key entry must contain exactly one of `comment`, `md5`, or `sha256`.
-- With `debug: true`, logs show every upstream call and how each configured key
-  selector resolves to current SHA256 fingerprints. Private keys, signing payloads,
-  and passphrases are never logged.
+- With `debug: true`, logs show one completion record for every upstream call and
+  one structured record for each configuration-key refresh. Private keys, signing
+  payloads, and passphrases are never logged.
 - Keys appear in a group in the order their entries are listed.
 - A config entry that matches several upstream keys includes them all; one that matches
   no upstream key is skipped.

@@ -24,6 +24,14 @@ type authorizationRefresh struct {
 	err     error
 }
 
+type selectorResolution struct {
+	ConfigIndex   int            `json:"config_index"`
+	SelectorType  keys.MatchType `json:"selector_type"`
+	SelectorValue string         `json:"selector_value"`
+	Matches       int            `json:"matches"`
+	Fingerprints  []string       `json:"fingerprints"`
+}
+
 // groupAuthorization owns the current authorization view for one group. All
 // client connections for that group share it. Concurrent refreshes are
 // coalesced so a burst of clients produces one upstream List request.
@@ -105,10 +113,6 @@ func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRe
 }
 
 func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authorizationRefresh) {
-	a.log.Debug("config key resolution started",
-		"group", a.group,
-		"trigger", refresh.trigger,
-		"configured_keys", len(a.matchers))
 	all, err := up.List()
 	var visible []*agent.Key
 	if err == nil {
@@ -137,6 +141,7 @@ func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigg
 	if !a.log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
+	resolutions := make([]selectorResolution, 0, len(a.matchers))
 	for i, matcher := range a.matchers {
 		matchedFingerprints := make([]string, 0)
 		for _, key := range upstream {
@@ -144,14 +149,13 @@ func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigg
 				matchedFingerprints = append(matchedFingerprints, ssh.FingerprintSHA256(key))
 			}
 		}
-		a.log.Debug("config key resolved",
-			"group", a.group,
-			"trigger", trigger,
-			"config_index", i+1,
-			"selector_type", matcher.Type,
-			"selector_value", matcher.Value(),
-			"matches", len(matchedFingerprints),
-			"fingerprints", matchedFingerprints)
+		resolutions = append(resolutions, selectorResolution{
+			ConfigIndex:   i + 1,
+			SelectorType:  matcher.Type,
+			SelectorValue: matcher.Value(),
+			Matches:       len(matchedFingerprints),
+			Fingerprints:  matchedFingerprints,
+		})
 	}
 
 	resolvedFingerprints := make([]string, 0, len(visible))
@@ -164,5 +168,6 @@ func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigg
 		"configured_keys", len(a.matchers),
 		"upstream_keys", len(upstream),
 		"resolved_keys", len(visible),
-		"fingerprints", resolvedFingerprints)
+		"fingerprints", resolvedFingerprints,
+		"resolutions", resolutions)
 }

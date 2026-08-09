@@ -34,7 +34,6 @@ func beginUpstreamCall(ctx context.Context, log *slog.Logger, operation string, 
 	callAttrs := make([]any, 0, len(attrs)+2)
 	callAttrs = append(callAttrs, "operation", operation)
 	callAttrs = append(callAttrs, attrs...)
-	log.Debug("upstream call started", callAttrs...)
 	return upstreamCall{
 		log:     log,
 		started: time.Now(),
@@ -54,7 +53,7 @@ func (c upstreamCall) finish(err error, attrs ...any) {
 	if err != nil {
 		resultAttrs = append(resultAttrs, "err", err)
 	}
-	c.log.Debug("upstream call finished", resultAttrs...)
+	c.log.Debug("upstream call", resultAttrs...)
 }
 
 // reconnectClient wraps a shared upstream agent client and reconnects
