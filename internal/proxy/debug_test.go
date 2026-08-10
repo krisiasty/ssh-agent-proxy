@@ -269,8 +269,15 @@ func TestConfigKeyResolutionIsLogged(t *testing.T) {
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
-	if len(entries) != 1 {
-		t.Fatalf("config key resolution logs = %d, want 1: %v", len(entries), entries)
+	if len(entries) != 2 {
+		t.Fatalf("config key resolution logs = %d, want warning and summary: %v", len(entries), entries)
+	}
+	warning := findDebugLog(t, entries, "configured key selector matched no upstream key", "")
+	if warning["group"] != "work" || warning["config_index"] != float64(2) || warning["selector_type"] != "sha256" {
+		t.Errorf("unmatched selector warning = %v", warning)
+	}
+	if _, ok := warning["selector_value"]; ok {
+		t.Errorf("unmatched selector warning contains selector value: %v", warning)
 	}
 	summary := findDebugLog(t, entries, "config keys resolved", "")
 	if summary["trigger"] != "client-list" || summary["configured_keys"] != float64(2) || summary["upstream_keys"] != float64(2) ||
@@ -282,6 +289,44 @@ func TestConfigKeyResolutionIsLogged(t *testing.T) {
 	}
 	if _, ok := summary["resolutions"]; ok {
 		t.Errorf("resolution summary contains selector details: %v", summary)
+	}
+}
+
+func TestUnmatchedSelectorWarningIsLoggedOnTransitions(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	keyring := newTestKeyring(t)
+	matcher, err := keys.NewMatcher("comment", "dynamic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := newGroupAuthorization("work", []keys.Matcher{matcher}, log)
+
+	if _, err := authorization.list(keyring); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorization.list(keyring); err != nil {
+		t.Fatal(err)
+	}
+	key := addAgentKey(t, keyring, "dynamic")
+	if _, err := authorization.list(keyring); err != nil {
+		t.Fatal(err)
+	}
+	if err := keyring.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorization.list(keyring); err != nil {
+		t.Fatal(err)
+	}
+
+	warnings := 0
+	for _, entry := range decodeDebugLogs(t, output.Bytes()) {
+		if entry["msg"] == "configured key selector matched no upstream key" {
+			warnings++
+		}
+	}
+	if warnings != 2 {
+		t.Errorf("unmatched selector warnings = %d, want initial warning and warning after disappearance", warnings)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,12 +242,16 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	}
 }
 
-func TestServerRunDoesNotListUpstreamAtStartup(t *testing.T) {
-	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer("unused", 0, log)
 	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
 	if !ok {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
 	}
+	first := addAgentKey(t, keyring, "shared")
+	addAgentKey(t, keyring, "shared")
 	up := &countingListAgent{ExtendedAgent: keyring}
 	clientConn, serverConn := net.Pipe()
 	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
@@ -271,14 +276,31 @@ func TestServerRunDoesNotListUpstreamAtStartup(t *testing.T) {
 	})
 
 	socket := filepath.Join(shortSocketDir(t), "group.sock")
-	groups := []config.Group{{Name: "test", Socket: socket}}
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfgData := fmt.Sprintf(`upstream: /tmp/upstream.sock
+groups:
+  - name: test
+    socket: %s
+    keys:
+      - comment: shared
+      - sha256: %s
+      - comment: missing
+      - md5: MD5:00:00
+`, strconv.Quote(socket), strconv.Quote(ssh.FingerprintSHA256(first)))
+	if err := os.WriteFile(cfgPath, []byte(cfgData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
-		done <- srv.Run(ctx, groups)
+		done <- srv.Run(ctx, cfg.Groups)
 		close(stopped)
 	}()
 	waitForSocket(t, socket, done)
-	if got := up.listCalls.Load(); got != 0 {
-		t.Errorf("upstream List() calls during startup = %d, want 0", got)
+	if got := up.listCalls.Load(); got != 1 {
+		t.Errorf("upstream List() calls during startup = %d, want 1", got)
 	}
 
 	cancel()
@@ -287,6 +309,120 @@ func TestServerRunDoesNotListUpstreamAtStartup(t *testing.T) {
 	}
 	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closing upstream server connection: %v", err)
+	}
+
+	entries := decodeDebugLogs(t, output.Bytes())
+	serving := findDebugLog(t, entries, "serving group", "")
+	if serving["group"] != "test" || serving["keys"] != float64(2) {
+		t.Errorf("serving group log = %v, want 2 distinct matched keys", serving)
+	}
+	resolution := findDebugLog(t, entries, "config keys resolved", "")
+	if resolution["trigger"] != "startup" || resolution["configured_keys"] != float64(4) ||
+		resolution["upstream_keys"] != float64(2) || resolution["resolved_keys"] != float64(2) {
+		t.Errorf("startup resolution log = %v", resolution)
+	}
+
+	warnings := make(map[float64]string)
+	for _, entry := range entries {
+		if entry["msg"] != "configured key selector matched no upstream key" {
+			continue
+		}
+		if entry["group"] != "test" {
+			t.Errorf("unmatched selector warning group = %v, want test", entry["group"])
+		}
+		if _, ok := entry["selector_value"]; ok {
+			t.Errorf("unmatched selector warning leaks selector value: %v", entry)
+		}
+		index, indexOK := entry["config_index"].(float64)
+		selectorType, typeOK := entry["selector_type"].(string)
+		if !indexOK || !typeOK {
+			t.Errorf("unmatched selector warning has invalid attributes: %v", entry)
+			continue
+		}
+		warnings[index] = selectorType
+	}
+	wantWarnings := map[float64]string{3: "comment", 4: "md5"}
+	if !reflect.DeepEqual(warnings, wantWarnings) {
+		t.Errorf("unmatched selector warnings = %v, want %v", warnings, wantWarnings)
+	}
+}
+
+func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer("unused", 0, log)
+	keyring := newTestKeyring(t)
+	up := &toggleListAgent{ExtendedAgent: keyring}
+	up.fail.Store(true)
+	clientConn, serverConn := net.Pipe()
+	srv.newUpstreamClient = func(_ context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
+		rc := &reconnectClient{upstream: "unused", log: logger}
+		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
+		return rc, nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Error("Server.Run() did not stop during cleanup")
+		}
+		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing upstream server connection: %v", err)
+		}
+	})
+	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	go func() {
+		done <- srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}})
+		close(stopped)
+	}()
+	waitForSocket(t, socket, done)
+	if got := up.listCalls.Load(); got != 1 {
+		t.Errorf("upstream List() calls during failed startup resolution = %d, want 1", got)
+	}
+
+	up.fail.Store(false)
+	var clientDialer net.Dialer
+	conn, err := clientDialer.DialContext(t.Context(), "unix", socket)
+	if err != nil {
+		cancel()
+		t.Fatalf("dialing group socket: %v", err)
+	}
+	listed, listErr := agent.NewClient(conn).List()
+	if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		t.Errorf("closing group client: %v", closeErr)
+	}
+	if listErr != nil {
+		cancel()
+		t.Fatalf("client List() after upstream recovery: %v", listErr)
+	}
+	if len(listed) != 0 {
+		t.Errorf("client List() keys = %d, want empty group", len(listed))
+	}
+	if got := up.listCalls.Load(); got != 2 {
+		t.Errorf("upstream List() calls after client retry = %d, want 2", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Server.Run() error = %v, want nil", err)
+	}
+	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closing upstream server connection: %v", err)
+	}
+
+	entries := decodeDebugLogs(t, output.Bytes())
+	warning := findDebugLog(t, entries, "initial config key resolution failed; deferring until client request", "")
+	if _, ok := warning["err"].(string); !ok {
+		t.Errorf("startup resolution warning = %v, want error", warning)
+	}
+	serving := findDebugLog(t, entries, "serving group", "")
+	if _, ok := serving["keys"]; ok {
+		t.Errorf("serving group log reports a key count after failed resolution: %v", serving)
 	}
 }
 

@@ -74,21 +74,30 @@ func (m Matcher) Matches(k *agent.Key) bool {
 // matcher (config order); within a single matcher, matches keep upstream order.
 // A key matched by more than one matcher appears once, at its earliest position.
 func Filter(upstream []*agent.Key, matchers []Matcher) []*agent.Key {
+	filtered, _ := Resolve(upstream, matchers)
+	return filtered
+}
+
+// Resolve filters upstream keys and reports how many keys each matcher
+// selected before deduplication. Match counts correspond to matchers by index.
+func Resolve(upstream []*agent.Key, matchers []Matcher) ([]*agent.Key, []int) {
 	var out []*agent.Key
+	matchCounts := make([]int, len(matchers))
 	seen := make(map[string]bool)
-	for _, m := range matchers {
+	for i, m := range matchers {
 		for _, k := range upstream {
-			id := string(k.Marshal())
-			if seen[id] {
+			if !m.Matches(k) {
 				continue
 			}
-			if m.Matches(k) {
+			matchCounts[i]++
+			id := string(k.Marshal())
+			if !seen[id] {
 				out = append(out, k)
 				seen[id] = true
 			}
 		}
 	}
-	return out
+	return out, matchCounts
 }
 
 // AllowSet is an immutable set of key blobs that are allowed for a group.

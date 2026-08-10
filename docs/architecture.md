@@ -141,14 +141,20 @@ On a miss, one goroutine refreshes the group from the shared upstream identity
 cache and rechecks the key. Concurrent misses join the same refresh. If the
 refreshed selectors still exclude the key, `SSH_AGENT_FAILURE` is returned.
 
-No key list is required during server startup. A locked or empty upstream agent
-can therefore expose keys after it is unlocked without restarting the proxy.
+Server startup performs one shared upstream list and uses it to seed every
+group's immutable authorization snapshot. The resulting `serving group` log
+reports the number of distinct matched keys, and unmatched selectors produce
+value-free warnings. If listing fails because the agent is locked or otherwise
+unavailable, socket startup continues without a snapshot; the first successful
+client-time refresh publishes it, so unlocking does not require a restart.
 
 ### List Filtering
 
 `List()` obtains the process-wide upstream identity snapshot and filters it
 through the group's matchers, atomically publishes the corresponding signing
-allow-set, and returns those keys in config order. The snapshot has a
+allow-set, and returns those keys in config order. Matching records per-selector
+counts before deduplicating keys, preserving config order and upstream order
+within each selector. The snapshot has a
 three-second default TTL, configurable from 0–60 seconds with `--cache`; zero
 disables caching. All clients and groups share one coalesced refresh. A failed
 refresh serves the last successful snapshot and is retried after the TTL,

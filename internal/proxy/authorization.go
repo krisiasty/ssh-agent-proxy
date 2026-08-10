@@ -32,8 +32,9 @@ type groupAuthorization struct {
 	matchers []keys.Matcher
 	snapshot atomic.Pointer[authorizationSnapshot]
 
-	mu       sync.Mutex
-	inFlight *authorizationRefresh
+	mu        sync.Mutex
+	inFlight  *authorizationRefresh
+	unmatched []bool
 }
 
 func newGroupAuthorization(group string, matchers []keys.Matcher, log *slog.Logger) *groupAuthorization {
@@ -107,11 +108,7 @@ func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authori
 	all, err := up.List()
 	var visible []*agent.Key
 	if err == nil {
-		visible = keys.Filter(all, a.matchers)
-		a.logResolution(all, visible, refresh.trigger)
-		a.snapshot.Store(&authorizationSnapshot{
-			allowSet: keys.NewAllowSet(visible),
-		})
+		visible = a.resolve(all, refresh.trigger)
 	} else {
 		a.log.Debug("config key resolution failed",
 			"group", a.group,
@@ -128,11 +125,47 @@ func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authori
 	a.mu.Unlock()
 }
 
-func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, trigger string) {
+func (a *groupAuthorization) resolve(upstream []*agent.Key, trigger string) []*agent.Key {
+	visible, matchCounts := keys.Resolve(upstream, a.matchers)
+	a.snapshot.Store(&authorizationSnapshot{
+		allowSet: keys.NewAllowSet(visible),
+	})
+	a.logResolution(upstream, visible, matchCounts, trigger)
+	return visible
+}
+
+func (a *groupAuthorization) logResolution(upstream, visible []*agent.Key, matchCounts []int, trigger string) {
+	for _, index := range a.newlyUnmatched(matchCounts) {
+		a.log.Warn("configured key selector matched no upstream key",
+			"group", a.group,
+			"config_index", index+1,
+			"selector_type", a.matchers[index].Type)
+	}
 	a.log.Debug("config keys resolved",
 		"group", a.group,
 		"trigger", trigger,
 		"configured_keys", len(a.matchers),
 		"upstream_keys", len(upstream),
 		"resolved_keys", len(visible))
+}
+
+// newlyUnmatched returns selectors that became unmatched in this resolution.
+// State is guarded by the refresh mutex so repeated client lists do not flood
+// logs, while a selector that recovers and later disappears is warned again.
+func (a *groupAuthorization) newlyUnmatched(matchCounts []int) []int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.unmatched) != len(matchCounts) {
+		a.unmatched = make([]bool, len(matchCounts))
+	}
+	var newly []int
+	for i, count := range matchCounts {
+		missing := count == 0
+		if missing && !a.unmatched[i] {
+			newly = append(newly, i)
+		}
+		a.unmatched[i] = missing
+	}
+	return newly
 }
