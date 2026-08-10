@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // AppName is the config subdirectory / service name used throughout the tool.
