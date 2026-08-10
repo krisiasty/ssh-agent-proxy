@@ -54,19 +54,7 @@ func (m *systemdManager) Install() error {
 	if err := os.MkdirAll(filepath.Dir(m.unitPath), 0o700); err != nil {
 		return err
 	}
-	unit := fmt.Sprintf(`[Unit]
-Description=SSH Agent Proxy (filtering proxy for ssh-agent)
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=%s -config %s --cache %d
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-`, exe, m.cfgPath, m.cacheSeconds)
+	unit := renderSystemdUnit(exe, m.cfgPath, m.cacheSeconds)
 	if err := os.WriteFile(m.unitPath, []byte(unit), 0o600); err != nil {
 		return fmt.Errorf("writing unit file: %w", err)
 	}
@@ -142,14 +130,7 @@ func (m *systemdManager) execStartBinary() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reading unit file: %w", err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if rest, ok := strings.CutPrefix(line, "ExecStart="); ok {
-			if fields := strings.Fields(rest); len(fields) > 0 {
-				return fields[0], nil
-			}
-		}
-	}
-	return "", nil
+	return parseSystemdExecStartBinary(string(data))
 }
 
 func (m *systemdManager) systemctl(args ...string) error {
