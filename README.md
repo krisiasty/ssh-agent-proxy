@@ -349,7 +349,7 @@ go build -o ssh-agent-proxy .
 ```
 
 Requires Go 1.26+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
-`gopkg.in/yaml.v3` (config).
+`go.yaml.in/yaml/v3` (config).
 
 ## License
 

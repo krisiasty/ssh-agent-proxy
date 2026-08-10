@@ -10,7 +10,7 @@ only sees and can only use the keys assigned to that group.
 
 - Written in **Go 1.26.5**.
 - May use the standard library plus **`golang.org/x/crypto/ssh/agent`** for the SSH
-  agent wire protocol and **`gopkg.in/yaml.v3`** for config parsing. No other external
+  agent wire protocol and **`go.yaml.in/yaml/v3`** for config parsing. No other external
   dependencies.
 - Initially targets **Linux** and **macOS** (Intel and Apple Silicon). A **Windows**
   version may follow later if feasible.
