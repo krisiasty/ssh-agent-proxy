@@ -169,10 +169,10 @@ For example:
 
 With debug logging enabled, the proxy samples its Go runtime every second and reports
 once group startup completes, then periodically every ten minutes. `telemetry current`
-contains a fresh sample, and `telemetry interval` contains activity since the previous
-report. A `telemetry max` record is emitted only when at least one sampled value exceeded
-the current value, and contains only those peaks. This avoids repeating an entire
-unchanged record while keeping each JSONL line reasonably short. After reporting, the
+contains a fresh sample, `telemetry max` contains the highest sampled values during the
+interval, and `telemetry interval` contains activity since the previous report. All
+three records and all their defined fields are emitted every time, including unchanged
+and zero values, providing a stable schema for log processing. After reporting, the
 interval maximum and counter baselines reset.
 
 The current and maximum records contain:
@@ -184,7 +184,7 @@ The current and maximum records contain:
 | `os_threads` | OS threads created by the Go runtime |
 | `heap_alloc_bytes` | Bytes allocated to heap objects |
 | `heap_inuse_bytes` | Bytes in in-use heap spans |
-| `heap_live_bytes` | Reachable heap bytes marked by the most recent garbage collection; omitted until the first GC completes |
+| `heap_live_bytes` | Reachable heap bytes marked by the most recent garbage collection; zero until the first GC completes |
 | `heap_goal_bytes` | Target heap size for the end of the current garbage-collection cycle |
 | `stack_inuse_bytes` | Bytes in stack spans |
 | `runtime_reserved_bytes` | Bytes reserved by the Go runtime |
@@ -200,7 +200,7 @@ The interval record contains:
 
 ```jsonl
 {"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry current","uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041}
-{"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry max","goroutines":17,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"stack_inuse_bytes":524288,"heap_objects":19349}
+{"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry max","uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}
 {"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry interval","heap_allocated_bytes":171064,"heap_allocated_objects":594,"gc_cycles":1}
 ```
 
