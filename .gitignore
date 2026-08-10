@@ -24,12 +24,21 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# Local configuration and credentials
 .env
+.env.*
+!.env.example
+config.yaml
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.DS_Store
+.idea/
+.vscode/
+*.swp
 
 # GoReleaser output
 /dist/

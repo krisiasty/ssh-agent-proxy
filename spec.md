@@ -1,5 +1,10 @@
 # ssh-agent-proxy
 
+> This is the original design specification. For current user-facing behavior, see
+> [README.md](README.md); for the implemented internals, see
+> [docs/architecture.md](docs/architecture.md). Planned items are intentionally retained
+> here and may not describe the current release.
+
 ## Overview
 
 `ssh-agent-proxy` is a filtering proxy in front of an existing SSH agent (OpenSSH's

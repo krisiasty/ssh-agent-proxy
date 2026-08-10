@@ -37,6 +37,7 @@ jobs:
 
       - name: License gate
         run: |
+          ./hack/check-notices.sh
           go install github.com/google/go-licenses@v1.6.0
           go-licenses check . --disallowed_types=forbidden,restricted,unknown
 

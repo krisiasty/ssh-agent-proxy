@@ -1,6 +1,8 @@
 # ssh-agent-proxy
 
 [![CI](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/release.yml)
+[![License](https://img.shields.io/github/license/krisiasty/ssh-agent-proxy)](LICENSE)
 
 `ssh-agent-proxy` is a filtering proxy that sits in front of an existing SSH agent —
 especially the agent built into a password manager such as **Bitwarden, KeePassXC,
@@ -392,8 +394,13 @@ Requires Go 1.26+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
 ## Development and releases
 
 Pull requests and pushes to `main` run formatting, vet, race-enabled tests, a
-transitive dependency license gate, and cgo-free cross-builds for Linux and macOS on
-amd64 and arm64.
+vulnerability scan, workflow validation, a transitive dependency license gate, and
+cgo-free cross-builds for Linux and macOS on amd64 and arm64. The same checks run
+weekly to detect newly disclosed dependency vulnerabilities.
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+workflow and pull request expectations. Please report security vulnerabilities through
+the private process in [SECURITY.md](SECURITY.md), never through a public issue.
 
 Releases are cut by pushing a `v*` tag. The release workflow repeats the quality gates,
 then uses GoReleaser to publish platform archives and checksums to GitHub. It also
@@ -410,4 +417,7 @@ goreleaser release --snapshot --clean --skip=publish
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE). Licenses and notices for statically linked
+dependencies are collected in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+Participation in this project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
