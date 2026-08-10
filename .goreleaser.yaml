@@ -1,0 +1,98 @@
+# GoReleaser configuration for ssh-agent-proxy.
+# https://goreleaser.com
+version: 2
+
+project_name: ssh-agent-proxy
+
+builds:
+  - id: darwin
+    main: .
+    binary: ssh-agent-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+  - id: linux
+    main: .
+    binary: ssh-agent-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: darwin
+    ids:
+      - darwin
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - THIRD_PARTY_NOTICES
+  - id: linux
+    ids:
+      - linux
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - THIRD_PARTY_NOTICES
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+homebrew_casks:
+  - name: ssh-agent-proxy
+    ids:
+      - darwin
+    repository:
+      owner: krisiasty
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/krisiasty/ssh-agent-proxy"
+    description: "Filtering proxy for ssh-agent: expose per-group filtered views of your keys"
+    license: "Apache-2.0"
+    binaries:
+      - ssh-agent-proxy
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
+    caveats: |
+      Configure ssh-agent-proxy, then install the LaunchAgent with:
+        ssh-agent-proxy -install
+      Config lives at ~/Library/Application Support/ssh-agent-proxy/config.yaml
+
+release:
+  draft: false

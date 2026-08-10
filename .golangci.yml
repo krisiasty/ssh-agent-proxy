@@ -1,0 +1,55 @@
+version: "2"
+
+linters:
+  enable:
+    # Correctness
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - bodyclose      # HTTP response bodies closed, should an HTTP client ever return
+    - nilerr         # returning nil after a non-nil error
+    - errorlint      # %w vs %v, errors.Is/As over comparison
+    - durationcheck  # suspicious duration arithmetic; the scheduler does plenty
+    - contextcheck   # context propagated rather than dropped
+    - noctx          # no HTTP requests without a context
+    - makezero       # append to a make()'d slice with a non-zero length
+    - errchkjson     # unchecked json.Marshal errors
+    - asasalint      # []any passed to a variadic ...any
+    - forcetypeassert
+
+    # Security
+    - gosec
+
+    # Correctness of intent
+    - unparam        # unused or always-identical function parameters
+    - predeclared    # shadowing builtins such as min/max/new
+    - recvcheck      # mixed pointer and value receivers
+    - nilnil         # returning (nil, nil)
+    - fatcontext     # context repeatedly wrapped inside a loop
+
+    # Style and consistency
+    - sloglint       # slog is the only logger here; keep its use uniform
+    - nolintlint     # nolint directives must be specific and explained
+    - perfsprint     # fmt.Errorf/Sprintf where a cheaper form exists
+    - godot          # comments end in a period
+    - gocritic
+    - revive
+
+    # Tests
+    - usetesting     # prefer t.Setenv/t.TempDir/t.Context
+    - thelper        # helpers call t.Helper()
+    - tparallel      # consistent t.Parallel usage
+
+    # Modernisation
+    - copyloopvar
+    - intrange
+
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+    sloglint:
+      no-mixed-args: true

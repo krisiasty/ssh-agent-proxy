@@ -1,0 +1,27 @@
+name: Enhancement request
+description: Suggest an improvement or new capability
+title: "enhancement: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or use case should be addressed?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like and any alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility considerations
+      description: Could this affect key visibility, signing authorization, socket ownership, configuration, or existing clients?
+    validations:
+      required: true

@@ -1,0 +1,84 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. For security vulnerabilities, stop here and use the private reporting link instead.
+        Sanitize logs and configuration: remove usernames, paths, key comments, fingerprints, and other identifying information.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ssh-agent-proxy -version`.
+      placeholder: v0.6.0
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Homebrew
+        - GitHub release archive
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: macOS 15.7.7, arm64
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: Upstream SSH agent
+      placeholder: Bitwarden Desktop
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Configure...
+        2. Run...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste relevant JSONL logs. Do not include secrets or identifying key metadata.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I reproduced this with the latest release.
+          required: true
+        - label: I removed credentials and identifying information from this report.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
