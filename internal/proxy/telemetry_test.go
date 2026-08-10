@@ -32,23 +32,23 @@ func TestProxyTelemetryLogsAndResetsInterval(t *testing.T) {
 
 	telemetry.logReport()
 	events := decodeTelemetryEvents(t, &output)
-	assertProxyTelemetryEvent(t, events[0], "proxy telemetry clients", map[string]any{
+	assertProxyTelemetryEvent(t, events[0], "telemetry clients", map[string]any{
 		"active_clients": float64(1), "max_active_clients": float64(2),
 		"connections": float64(2), "connection_errors": float64(1),
 		"list_requests": float64(4), "list_errors": float64(1),
 		"sign_requests": float64(3), "sign_errors": float64(2),
 	})
-	assertProxyTelemetryEvent(t, events[1], "proxy telemetry upstream", map[string]any{
+	assertProxyTelemetryEvent(t, events[1], "telemetry upstream", map[string]any{
 		"calls": float64(2), "errors": float64(1), "reconnects": float64(1),
 	})
-	assertProxyTelemetryEvent(t, events[2], "proxy telemetry cache", map[string]any{
+	assertProxyTelemetryEvent(t, events[2], "telemetry cache", map[string]any{
 		"hits": float64(5), "misses": float64(2), "refreshes": float64(1), "waits": float64(1),
 	})
 
 	output.Reset()
 	telemetry.logReport()
 	events = decodeTelemetryEvents(t, &output)
-	assertProxyTelemetryEvent(t, events[0], "proxy telemetry clients", map[string]any{
+	assertProxyTelemetryEvent(t, events[0], "telemetry clients", map[string]any{
 		"active_clients": float64(1), "max_active_clients": float64(1),
 		"connections": float64(0), "connection_errors": float64(0),
 		"list_requests": float64(0), "list_errors": float64(0),

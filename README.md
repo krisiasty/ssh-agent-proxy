@@ -211,18 +211,18 @@ telemetry:
 
 | Record | Fields |
 | --- | --- |
-| `proxy telemetry clients` | Active and maximum concurrent clients, new connections and connection errors, plus list/sign requests and errors |
-| `proxy telemetry upstream` | Upstream calls, errors, and successful reconnects |
-| `proxy telemetry cache` | Identity-cache hits, misses, actual refreshes, and requests that waited for an in-flight refresh |
+| `telemetry clients` | Active and maximum concurrent clients, new connections and connection errors, plus list/sign requests and errors |
+| `telemetry upstream` | Upstream calls, errors, and successful reconnects |
+| `telemetry cache` | Identity-cache hits, misses, actual refreshes, and requests that waited for an in-flight refresh |
 
 The active-client values are gauges. All other values count activity since the previous
 report and reset after being logged. A cache miss counts each request that first finds an
 expired cache; concurrent misses share one refresh and increment `waits` while blocked.
 
 ```jsonl
-{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"proxy telemetry clients","active_clients":0,"max_active_clients":30,"connections":60,"connection_errors":0,"list_requests":30,"list_errors":0,"sign_requests":30,"sign_errors":0}
-{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"proxy telemetry upstream","calls":31,"errors":0,"reconnects":0}
-{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"proxy telemetry cache","hits":29,"misses":1,"refreshes":1,"waits":0}
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry clients","active_clients":0,"max_active_clients":30,"connections":60,"connection_errors":0,"list_requests":30,"list_errors":0,"sign_requests":30,"sign_errors":0}
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry upstream","calls":31,"errors":0,"reconnects":0}
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry cache","hits":29,"misses":1,"refreshes":1,"waits":0}
 ```
 
 ### Debug logging

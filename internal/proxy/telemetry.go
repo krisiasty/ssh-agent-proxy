@@ -86,7 +86,7 @@ func (t *proxyTelemetry) logReport() {
 		return
 	}
 	activeClients, maxActiveClients := t.clientSnapshot()
-	t.log.Debug("proxy telemetry clients",
+	t.log.Debug("telemetry clients",
 		"active_clients", activeClients,
 		"max_active_clients", maxActiveClients,
 		"connections", t.clientConnections.Swap(0),
@@ -95,11 +95,11 @@ func (t *proxyTelemetry) logReport() {
 		"list_errors", t.listErrors.Swap(0),
 		"sign_requests", t.signRequests.Swap(0),
 		"sign_errors", t.signErrors.Swap(0))
-	t.log.Debug("proxy telemetry upstream",
+	t.log.Debug("telemetry upstream",
 		"calls", t.upstreamCalls.Swap(0),
 		"errors", t.upstreamErrors.Swap(0),
 		"reconnects", t.upstreamReconnects.Swap(0))
-	t.log.Debug("proxy telemetry cache",
+	t.log.Debug("telemetry cache",
 		"hits", t.cacheHits.Swap(0),
 		"misses", t.cacheMisses.Swap(0),
 		"refreshes", t.cacheRefreshes.Swap(0),
