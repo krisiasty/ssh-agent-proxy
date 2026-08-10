@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
@@ -58,35 +59,15 @@ func (m *launchdManager) Install() error {
 	if err := os.MkdirAll(filepath.Dir(m.logPath), 0o700); err != nil {
 		return err
 	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>%s</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>%s</string>
-		<string>-config</string>
-		<string>%s</string>
-		<string>--cache</string>
-		<string>%d</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
-	<key>StandardOutPath</key>
-	<string>%s</string>
-	<key>StandardErrorPath</key>
-	<string>%s</string>
-</dict>
-</plist>
-`, Label, exe, m.cfgPath, m.cacheSeconds, m.logPath, m.logPath)
-	if err := os.WriteFile(m.plistPath, []byte(plist), 0o600); err != nil {
+	plist, err := renderLaunchdPlist(
+		Label,
+		[]string{exe, "-config", m.cfgPath, "--cache", strconv.Itoa(m.cacheSeconds)},
+		m.logPath,
+	)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(m.plistPath, plist, 0o600); err != nil {
 		return fmt.Errorf("writing plist: %w", err)
 	}
 	return m.launchctl("load", "-w", m.plistPath)
@@ -125,11 +106,7 @@ func (m *launchdManager) Restart() error {
 	return m.Start()
 }
 
-var (
-	reLaunchdPID     = regexp.MustCompile(`"PID"\s*=\s*(\d+);`)
-	reLaunchdProgram = regexp.MustCompile(`"Program"\s*=\s*"([^"]*)";`)
-	reLaunchdArg0    = regexp.MustCompile(`"ProgramArguments"\s*=\s*\(\s*"([^"]*)"`)
-)
+var reLaunchdPID = regexp.MustCompile(`"PID"\s*=\s*(\d+);`)
 
 func (m *launchdManager) Status() (Status, error) {
 	st := Status{}
@@ -145,11 +122,11 @@ func (m *launchdManager) Status() (Status, error) {
 			st.Running = true
 			st.PID = mt[1]
 		}
-		if mt := reLaunchdProgram.FindStringSubmatch(s); mt != nil {
-			st.Program = mt[1]
-		} else if mt := reLaunchdArg0.FindStringSubmatch(s); mt != nil {
-			st.Program = mt[1]
+		program, parseErr := parseLaunchdProgram(s)
+		if parseErr != nil {
+			return st, parseErr
 		}
+		st.Program = program
 	}
 	return st, nil
 }
