@@ -14,7 +14,8 @@ import (
 func TestCachedAgentCachesListUntilTTLExpires(t *testing.T) {
 	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
 	now := time.Unix(1_000, 0)
-	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler))
+	telemetry := &proxyTelemetry{}
+	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), telemetry)
 	cached.now = func() time.Time { return now }
 
 	if _, err := cached.List(); err != nil {
@@ -34,11 +35,15 @@ func TestCachedAgentCachesListUntilTTLExpires(t *testing.T) {
 	if got := upstream.listCalls.Load(); got != 2 {
 		t.Fatalf("upstream List() calls after expiry = %d, want 2", got)
 	}
+	if hits, misses, refreshes := telemetry.cacheHits.Load(), telemetry.cacheMisses.Load(), telemetry.cacheRefreshes.Load(); hits != 1 || misses != 2 || refreshes != 2 {
+		t.Fatalf("cache telemetry = hits:%d misses:%d refreshes:%d", hits, misses, refreshes)
+	}
 }
 
 func TestCachedAgentZeroTTLDisablesCaching(t *testing.T) {
 	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
-	cached := newCachedAgent(upstream, 0, slog.New(slog.DiscardHandler))
+	telemetry := &proxyTelemetry{}
+	cached := newCachedAgent(upstream, 0, slog.New(slog.DiscardHandler), telemetry)
 
 	for range 2 {
 		if _, err := cached.List(); err != nil {
@@ -48,11 +53,14 @@ func TestCachedAgentZeroTTLDisablesCaching(t *testing.T) {
 	if got := upstream.listCalls.Load(); got != 2 {
 		t.Fatalf("upstream List() calls = %d, want 2", got)
 	}
+	if hits, misses, refreshes := telemetry.cacheHits.Load(), telemetry.cacheMisses.Load(), telemetry.cacheRefreshes.Load(); hits != 0 || misses != 2 || refreshes != 2 {
+		t.Fatalf("cache telemetry = hits:%d misses:%d refreshes:%d", hits, misses, refreshes)
+	}
 }
 
 func TestCachedAgentSharesSnapshotAcrossGroups(t *testing.T) {
 	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
-	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler))
+	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 	log := slog.New(slog.DiscardHandler)
 	first := newGroupAuthorization("first", nil, log)
 	second := newGroupAuthorization("second", nil, log)
@@ -74,7 +82,7 @@ func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
 		started:       make(chan struct{}),
 		release:       make(chan struct{}),
 	}
-	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler))
+	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 
 	const clients = 128
 	start := make(chan struct{})
@@ -107,7 +115,7 @@ func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
 func TestCachedAgentServesStaleSnapshotAfterRefreshFailure(t *testing.T) {
 	upstream := &toggleListAgent{ExtendedAgent: newTestKeyring(t)}
 	now := time.Unix(1_000, 0)
-	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler))
+	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 	cached.now = func() time.Time { return now }
 
 	if _, err := cached.List(); err != nil {
@@ -129,7 +137,7 @@ func TestCachedAgentServesStaleSnapshotAfterRefreshFailure(t *testing.T) {
 func TestCachedAgentCachesInitialFailure(t *testing.T) {
 	wantErr := errors.New("upstream locked")
 	upstream := &failingListAgent{ExtendedAgent: newTestKeyring(t), err: wantErr}
-	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler))
+	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 
 	for range 2 {
 		if _, err := cached.List(); !errors.Is(err, wantErr) {

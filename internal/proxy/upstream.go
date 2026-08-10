@@ -66,28 +66,35 @@ func (c *upstreamConn) transportFailed(err error) bool {
 }
 
 type upstreamCall struct {
-	log     *slog.Logger
-	started time.Time
-	attrs   []any
-	enabled bool
+	log       *slog.Logger
+	telemetry *proxyTelemetry
+	started   time.Time
+	attrs     []any
+	enabled   bool
 }
 
 func beginUpstreamCall(ctx context.Context, log *slog.Logger, operation string, attrs ...any) upstreamCall {
+	return beginTrackedUpstreamCall(ctx, log, nil, operation, attrs...)
+}
+
+func beginTrackedUpstreamCall(ctx context.Context, log *slog.Logger, telemetry *proxyTelemetry, operation string, attrs ...any) upstreamCall {
 	if !log.Enabled(ctx, slog.LevelDebug) {
-		return upstreamCall{}
+		return upstreamCall{telemetry: telemetry}
 	}
 	callAttrs := make([]any, 0, len(attrs)+2)
 	callAttrs = append(callAttrs, "operation", operation)
 	callAttrs = append(callAttrs, attrs...)
 	return upstreamCall{
-		log:     log,
-		started: time.Now(),
-		attrs:   callAttrs,
-		enabled: true,
+		log:       log,
+		telemetry: telemetry,
+		started:   time.Now(),
+		attrs:     callAttrs,
+		enabled:   true,
 	}
 }
 
 func (c upstreamCall) finish(err error, attrs ...any) {
+	c.telemetry.upstreamCall(err)
 	if !c.enabled {
 		return
 	}
@@ -110,10 +117,11 @@ func (c upstreamCall) finish(err error, attrs ...any) {
 // eliminate the nil-window panic that existed in the previous Swap(nil) →
 // dial → Store sequence.
 type reconnectClient struct {
-	upstream string
-	log      *slog.Logger
-	ctx      context.Context
-	current  atomic.Pointer[upstreamConn]
+	upstream  string
+	log       *slog.Logger
+	ctx       context.Context
+	current   atomic.Pointer[upstreamConn]
+	telemetry *proxyTelemetry
 
 	dial func() (agent.ExtendedAgent, net.Conn, error)
 
@@ -121,12 +129,16 @@ type reconnectClient struct {
 }
 
 func newReconnectClient(parentCtx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
+	return newReconnectClientWithTelemetry(parentCtx, upstream, log, nil)
+}
+
+func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
 	var connectionAttempt atomic.Uint64
 	dial := func() (agent.ExtendedAgent, net.Conn, error) {
 		attempt := connectionAttempt.Add(1)
 		ctx, cancel := context.WithTimeout(parentCtx, dialTimeout)
 		defer cancel()
-		call := beginUpstreamCall(ctx, log, "connect", "attempt", attempt, "upstream", upstream)
+		call := beginTrackedUpstreamCall(ctx, log, telemetry, "connect", "attempt", attempt, "upstream", upstream)
 
 		conn, err := dialer.DialContext(ctx, "unix", upstream)
 		if err != nil {
@@ -138,10 +150,11 @@ func newReconnectClient(parentCtx context.Context, upstream string, log *slog.Lo
 		return agent.NewClient(trackedConn), trackedConn, nil
 	}
 	rc := &reconnectClient{
-		upstream: upstream,
-		log:      log,
-		ctx:      parentCtx,
-		dial:     dial,
+		upstream:  upstream,
+		log:       log,
+		ctx:       parentCtx,
+		telemetry: telemetry,
+		dial:      dial,
 	}
 	client, conn, err := rc.dial()
 	if err != nil {
@@ -183,8 +196,11 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	}
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
+	if r.telemetry != nil {
+		r.telemetry.upstreamReconnects.Add(1)
+	}
 	r.log.Warn("upstream reconnected")
-	call := beginUpstreamCall(r.logContext(), r.log, "close", "connection", "replaced")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "close", "connection", "replaced")
 	err = old.conn.Close()
 	call.finish(err)
 	return true
@@ -199,7 +215,7 @@ func (r *reconnectClient) Close(ctx context.Context) error {
 	if current == nil {
 		return nil
 	}
-	call := beginUpstreamCall(ctx, r.log, "close", "connection", "current")
+	call := beginTrackedUpstreamCall(ctx, r.log, r.telemetry, "close", "connection", "current")
 	err := current.conn.Close()
 	call.finish(err)
 	return err
@@ -218,7 +234,7 @@ func (r *reconnectClient) List() ([]*agent.Key, error) {
 }
 
 func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*agent.Key, error) {
-	call := beginUpstreamCall(r.logContext(), r.log, "list", "attempt", attempt)
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "list", "attempt", attempt)
 	ks, err := current.client.List()
 	call.finish(err, "keys", len(ks))
 	if err == nil && r.log.Enabled(r.logContext(), slog.LevelDebug) {
@@ -243,7 +259,7 @@ func (r *reconnectClient) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, 
 }
 
 func (r *reconnectClient) signAttempt(current *upstreamConn, key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
-	call := beginUpstreamCall(r.logContext(), r.log, "sign",
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "sign",
 		"attempt", 1,
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"payload_bytes", len(data))
@@ -262,7 +278,7 @@ func (r *reconnectClient) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 }
 
 func (r *reconnectClient) signWithFlagsAttempt(current *upstreamConn, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	call := beginUpstreamCall(r.logContext(), r.log, "sign-with-flags",
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "sign-with-flags",
 		"attempt", 1,
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"flags", flags,
@@ -273,49 +289,49 @@ func (r *reconnectClient) signWithFlagsAttempt(current *upstreamConn, key ssh.Pu
 }
 
 func (r *reconnectClient) Add(key agent.AddedKey) error {
-	call := beginUpstreamCall(r.logContext(), r.log, "add")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "add")
 	err := r.get().Add(key)
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Remove(key ssh.PublicKey) error {
-	call := beginUpstreamCall(r.logContext(), r.log, "remove", "fingerprint", ssh.FingerprintSHA256(key))
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "remove", "fingerprint", ssh.FingerprintSHA256(key))
 	err := r.get().Remove(key)
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) RemoveAll() error {
-	call := beginUpstreamCall(r.logContext(), r.log, "remove-all")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "remove-all")
 	err := r.get().RemoveAll()
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Lock(passphrase []byte) error {
-	call := beginUpstreamCall(r.logContext(), r.log, "lock")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "lock")
 	err := r.get().Lock(passphrase)
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Unlock(passphrase []byte) error {
-	call := beginUpstreamCall(r.logContext(), r.log, "unlock")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "unlock")
 	err := r.get().Unlock(passphrase)
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Signers() ([]ssh.Signer, error) {
-	call := beginUpstreamCall(r.logContext(), r.log, "signers")
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "signers")
 	signers, err := r.get().Signers()
 	call.finish(err, "signers", len(signers))
 	return signers, err
 }
 
 func (r *reconnectClient) Extension(s string, b []byte) ([]byte, error) {
-	call := beginUpstreamCall(r.logContext(), r.log, "extension", "extension", s, "payload_bytes", len(b))
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "extension", "extension", s, "payload_bytes", len(b))
 	result, err := r.get().Extension(s, b)
 	call.finish(err, "result_bytes", len(result))
 	return result, err

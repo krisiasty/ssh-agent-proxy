@@ -34,7 +34,8 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 			t.Errorf("closing server connection: %v", err)
 		}
 	})
-	rc := &reconnectClient{log: log}
+	telemetry := &proxyTelemetry{}
+	rc := &reconnectClient{log: log, telemetry: telemetry}
 	rc.current.Store(&upstreamConn{client: keyring, conn: clientConn})
 
 	listed, err := rc.List()
@@ -46,6 +47,9 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 	}
 	if _, err := rc.SignWithFlags(pub, []byte("payload"), 0); err != nil {
 		t.Fatal(err)
+	}
+	if calls, failures := telemetry.upstreamCalls.Load(), telemetry.upstreamErrors.Load(); calls != 2 || failures != 0 {
+		t.Errorf("upstream telemetry = calls:%d errors:%d", calls, failures)
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
@@ -202,8 +206,12 @@ func TestInfoLogsClientRequestSummariesOnly(t *testing.T) {
 func TestFailedUpstreamCallIsLoggedOnce(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	call := beginUpstreamCall(t.Context(), log, "list", "attempt", 1)
+	telemetry := &proxyTelemetry{}
+	call := beginTrackedUpstreamCall(t.Context(), log, telemetry, "list", "attempt", 1)
 	call.finish(errors.New("upstream locked"), "keys", 0)
+	if calls, failures := telemetry.upstreamCalls.Load(), telemetry.upstreamErrors.Load(); calls != 1 || failures != 1 {
+		t.Errorf("upstream telemetry = calls:%d errors:%d", calls, failures)
+	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
 	if len(entries) != 1 {

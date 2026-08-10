@@ -39,6 +39,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 				heapAllocBytes:       100,
 				heapInuseBytes:       220,
 				heapLiveBytes:        80,
+				heapLiveValid:        true,
 				heapGoalBytes:        400,
 				stackInuseBytes:      50,
 				runtimeReservedBytes: 500,
@@ -57,6 +58,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 				heapAllocBytes:       140,
 				heapInuseBytes:       200,
 				heapLiveBytes:        90,
+				heapLiveValid:        true,
 				heapGoalBytes:        380,
 				stackInuseBytes:      70,
 				runtimeReservedBytes: 480,
@@ -93,6 +95,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		heapAllocBytes:       140,
 		heapInuseBytes:       200,
 		heapLiveBytes:        90,
+		heapLiveValid:        true,
 		heapGoalBytes:        380,
 		stackInuseBytes:      70,
 		runtimeReservedBytes: 480,
@@ -107,6 +110,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		heapAllocBytes:       140,
 		heapInuseBytes:       220,
 		heapLiveBytes:        90,
+		heapLiveValid:        true,
 		heapGoalBytes:        400,
 		stackInuseBytes:      70,
 		runtimeReservedBytes: 500,
@@ -129,7 +133,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 
 func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 	var output bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	startedAt := time.Unix(1_700_000_000, 0)
 	telemetry := &runtimeTelemetry{
 		logger:    logger,
@@ -139,7 +143,7 @@ func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 			return runtimeSample{
 				values: runtimeValues{
 					goroutines: 7, osThreads: 3, heapAllocBytes: 100, heapInuseBytes: 150,
-					heapLiveBytes: 90, heapGoalBytes: 400,
+					heapLiveBytes: 90, heapLiveValid: true, heapGoalBytes: 400,
 					stackInuseBytes: 20, runtimeReservedBytes: 300, heapObjects: 11,
 				},
 				counters: runtimeCounters{
@@ -149,7 +153,7 @@ func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 		},
 		maximum: runtimeValues{
 			goroutines: 9, osThreads: 4, heapAllocBytes: 120, heapInuseBytes: 180,
-			heapLiveBytes: 95, heapGoalBytes: 420,
+			heapLiveBytes: 95, heapLiveValid: true, heapGoalBytes: 420,
 			stackInuseBytes: 25, runtimeReservedBytes: 350, heapObjects: 13,
 		},
 		intervalAt: runtimeCounters{
@@ -166,7 +170,7 @@ func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 		if err := decoder.Decode(&events[i]); err != nil {
 			t.Fatalf("decode telemetry log %d: %v", i+1, err)
 		}
-		if events[i]["level"] != "INFO" {
+		if events[i]["level"] != "DEBUG" {
 			t.Fatalf("event %d = %v", i+1, events[i])
 		}
 	}
@@ -183,8 +187,7 @@ func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 		"heap_objects": float64(11),
 	}
 	wantMaximum := map[string]any{
-		"uptime_seconds": float64(10),
-		"goroutines":     float64(9), "os_threads": float64(4),
+		"goroutines": float64(9), "os_threads": float64(4),
 		"heap_alloc_bytes": float64(120), "heap_inuse_bytes": float64(180),
 		"heap_live_bytes": float64(95), "heap_goal_bytes": float64(420),
 		"stack_inuse_bytes": float64(25), "runtime_reserved_bytes": float64(350),
@@ -197,6 +200,50 @@ func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 	assertTelemetryEvent(t, events[0], "telemetry current", wantCurrent)
 	assertTelemetryEvent(t, events[1], "telemetry max", wantMaximum)
 	assertTelemetryEvent(t, events[2], "telemetry interval", wantInterval)
+}
+
+func TestRuntimeTelemetryIsHiddenAtInfoLevel(t *testing.T) {
+	var output bytes.Buffer
+	telemetry := newRuntimeTelemetry(slog.New(slog.NewJSONHandler(&output, nil)))
+	telemetry.logReport()
+	if output.Len() != 0 {
+		t.Fatalf("telemetry emitted at info level: %s", output.String())
+	}
+}
+
+func TestRuntimeTelemetryOmitsUnchangedMaximumAndUnavailableLiveHeap(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	startedAt := time.Unix(1_700_000_000, 0)
+	sample := runtimeSample{
+		values:   runtimeValues{goroutines: 7, osThreads: 3, heapAllocBytes: 100, heapGoalBytes: 400},
+		counters: runtimeCounters{heapAllocatedBytes: 1_000, heapAllocatedObjects: 200},
+	}
+	telemetry := &runtimeTelemetry{
+		logger: logger, startedAt: startedAt,
+		now:  func() time.Time { return startedAt.Add(time.Second) },
+		read: func() runtimeSample { return sample },
+	}
+	telemetry.sample()
+	telemetry.logReport()
+
+	decoder := json.NewDecoder(&output)
+	for _, message := range []string{"telemetry current", "telemetry interval"} {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatalf("decode %s: %v", message, err)
+		}
+		if event["msg"] != message {
+			t.Fatalf("event = %v, want %s", event, message)
+		}
+		if _, ok := event["heap_live_bytes"]; ok {
+			t.Errorf("%s contains unavailable live heap: %v", message, event)
+		}
+	}
+	var extra map[string]any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("unexpected trailing telemetry data: event=%v err=%v", extra, err)
+	}
 }
 
 func TestRuntimeCounterDeltaDoesNotUnderflow(t *testing.T) {
@@ -272,7 +319,7 @@ func TestTelemetrySamplingAndReportingAreConcurrentSafe(t *testing.T) {
 			return runtimeSample{
 				values: runtimeValues{
 					goroutines: n, osThreads: n, heapAllocBytes: n, heapInuseBytes: n,
-					heapLiveBytes: n, heapGoalBytes: n,
+					heapLiveBytes: n, heapLiveValid: true, heapGoalBytes: n,
 					stackInuseBytes: n, runtimeReservedBytes: n, heapObjects: n,
 				},
 				counters: runtimeCounters{
@@ -324,7 +371,7 @@ func TestRuntimeTelemetryStopsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		telemetry.run(ctx)
+		telemetry.run(ctx, telemetry.logReport)
 		close(done)
 	}()
 

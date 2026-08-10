@@ -12,9 +12,10 @@ import (
 // Only List is cached; all other agent operations are forwarded unchanged.
 type cachedAgent struct {
 	agent.ExtendedAgent
-	ttl time.Duration
-	log *slog.Logger
-	now func() time.Time
+	ttl       time.Duration
+	log       *slog.Logger
+	now       func() time.Time
+	telemetry *proxyTelemetry
 
 	mu          sync.Mutex
 	keys        []*agent.Key
@@ -26,37 +27,58 @@ type cachedAgent struct {
 
 var _ agent.ExtendedAgent = (*cachedAgent)(nil)
 
-func newCachedAgent(upstream agent.ExtendedAgent, ttl time.Duration, log *slog.Logger) *cachedAgent {
+func newCachedAgent(upstream agent.ExtendedAgent, ttl time.Duration, log *slog.Logger, telemetry *proxyTelemetry) *cachedAgent {
 	return &cachedAgent{
 		ExtendedAgent: upstream,
 		ttl:           ttl,
 		log:           log,
 		now:           time.Now,
+		telemetry:     telemetry,
 	}
 }
 
 func (a *cachedAgent) List() ([]*agent.Key, error) {
 	if a.ttl <= 0 {
+		if a.telemetry != nil {
+			a.telemetry.cacheMisses.Add(1)
+			a.telemetry.cacheRefreshes.Add(1)
+		}
 		return a.ExtendedAgent.List()
 	}
 
+	missed := false
 	for {
 		a.mu.Lock()
 		if a.now().Before(a.expiresAt) {
 			keys := cloneAgentKeys(a.keys)
 			err := a.cachedErr
 			a.mu.Unlock()
+			if !missed && a.telemetry != nil {
+				a.telemetry.cacheHits.Add(1)
+			}
 			return keys, err
+		}
+		if !missed {
+			missed = true
+			if a.telemetry != nil {
+				a.telemetry.cacheMisses.Add(1)
+			}
 		}
 		if a.inFlight != nil {
 			done := a.inFlight
 			a.mu.Unlock()
+			if a.telemetry != nil {
+				a.telemetry.cacheWaits.Add(1)
+			}
 			<-done
 			continue
 		}
 		a.inFlight = make(chan struct{})
 		done := a.inFlight
 		a.mu.Unlock()
+		if a.telemetry != nil {
+			a.telemetry.cacheRefreshes.Add(1)
+		}
 
 		keys, err := a.ExtendedAgent.List()
 

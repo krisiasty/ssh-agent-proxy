@@ -69,16 +69,24 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 	}
 
 	log := logging.Setup(cfg.Debug)
-	telemetryCtx, stopTelemetry := context.WithCancel(ctx)
-	telemetry := newRuntimeTelemetry(log)
-	var telemetryWG sync.WaitGroup
-	telemetryWG.Go(func() {
-		telemetry.run(telemetryCtx)
-	})
-	defer func() {
-		stopTelemetry()
-		telemetryWG.Wait()
-	}()
+	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
+	if cfg.Debug {
+		telemetryCtx, stopTelemetry := context.WithCancel(ctx)
+		telemetry := newRuntimeTelemetry(log)
+		logTelemetry := func() {
+			telemetry.logReport()
+			srv.LogTelemetry()
+		}
+		var telemetryWG sync.WaitGroup
+		telemetryWG.Go(func() {
+			telemetry.run(telemetryCtx, logTelemetry)
+		})
+		defer func() {
+			stopTelemetry()
+			telemetryWG.Wait()
+		}()
+		srv.SetReadyCallback(logTelemetry)
+	}
 
 	log.Info("ssh-agent-proxy", "version", version.Version, "commit", version.Commit, "built", version.Date)
 	log.Info("configuration loaded", "config", cfgPath, "groups", len(cfg.Groups))
@@ -88,8 +96,6 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 		"telemetry_sample", telemetrySampleInterval.String(),
 		"telemetry_report", telemetryReportInterval.String())
 
-	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
-	srv.SetReadyCallback(telemetry.logReport)
 	if err := srv.Run(ctx, cfg.Groups); err != nil {
 		if shouldReturnProxyError(ctx, foreground, err) {
 			return err
