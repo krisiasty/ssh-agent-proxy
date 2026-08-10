@@ -53,14 +53,15 @@ This is the tool's core guarantee and must hold for every group socket:
 
 ### Schema
 
-- **`upstream`** (required): path to the upstream SSH agent socket. Environment
-  variables are expanded (e.g. `${SSH_AUTH_SOCK}`).
+- **`upstream`** (required): absolute path to the upstream SSH agent socket.
+  Environment variables and `~` are not expanded.
 - **`debug`** (optional, default `false`): enable verbose logging.
 - **`groups`** (optional): a list of groups. Each group has:
   - **`name`** (required): a unique name for the group, used in log messages.
   - **`enabled`** (optional, default `true`): set `false` to skip the group entirely
     (its socket is not created).
-  - **`socket`** (required): path to the socket this group is exposed on.
+  - **`socket`** (required): absolute path to the socket this group is exposed on.
+    Environment variables and `~` are not expanded.
   - **`keys`** (optional): an ordered list of key entries. Each entry contains exactly
     one of `comment`, `md5`, or `sha256`. Comment matches are exact and case-sensitive.
     MD5 and SHA256 values are accepted with or without their standard prefixes.
@@ -69,28 +70,31 @@ The **only required option is `upstream`**. No groups are required, but any grou
 that is defined must include `socket`, and its `keys` list (if present) must contain
 valid entries.
 
+Socket paths must be provided literally as absolute paths. Values such as
+`${SSH_AUTH_SOCK}` and `~/.ssh/agent.sock` are rejected rather than expanded.
+
 ### Sample configuration
 
 ```yaml
-upstream: ${SSH_AUTH_SOCK}
+upstream: /absolute/path/to/upstream-agent.sock
 debug: false
 
 groups:
   - name: work
     enabled: true
-    socket: ~/.ssh/agent-work.sock
+    socket: /absolute/path/to/agent-work.sock
     keys:
       - comment: "laptop@work"
       - sha256: "SHA256:abc123..."
   - name: personal
     enabled: false
-    socket: ~/.ssh/agent-personal.sock
+    socket: /absolute/path/to/agent-personal.sock
     keys:
       - md5: "MD5:aa:bb:cc:dd:..."
 ```
 
 Clients select a group by pointing `SSH_AUTH_SOCK` at that group's socket, e.g.
-`export SSH_AUTH_SOCK=~/.ssh/agent-work.sock`.
+`export SSH_AUTH_SOCK=/absolute/path/to/agent-work.sock`.
 
 ## Runtime behavior
 
