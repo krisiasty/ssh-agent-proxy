@@ -68,11 +68,12 @@ type runtimeTelemetry struct {
 }
 
 func newRuntimeTelemetry(logger *slog.Logger) *runtimeTelemetry {
+	reader := newRuntimeMetricsReader()
 	t := &runtimeTelemetry{
 		logger:    logger,
 		startedAt: time.Now(),
 		now:       time.Now,
-		read:      readRuntimeValues,
+		read:      reader.read,
 	}
 	t.sample()
 	return t
@@ -132,26 +133,52 @@ func (t *runtimeTelemetry) logReport() {
 	)
 }
 
-func readRuntimeValues() runtimeValues {
-	samples := [...]runtimemetrics.Sample{
-		{Name: "/sched/goroutines:goroutines"},
-		{Name: "/sched/threads/total:threads"},
-		{Name: "/memory/classes/heap/objects:bytes"},
-		{Name: "/memory/classes/heap/unused:bytes"},
-		{Name: "/memory/classes/heap/stacks:bytes"},
-		{Name: "/memory/classes/total:bytes"},
-		{Name: "/gc/heap/objects:objects"},
-	}
-	runtimemetrics.Read(samples[:])
+const (
+	runtimeMetricGoroutines = iota
+	runtimeMetricOSThreads
+	runtimeMetricHeapObjectsBytes
+	runtimeMetricHeapUnusedBytes
+	runtimeMetricStackInuseBytes
+	runtimeMetricReservedBytes
+	runtimeMetricHeapObjects
+	runtimeMetricCount
+)
 
-	heapAlloc := samples[2].Value.Uint64()
+// runtimeMetricsReader owns and reuses its sample buffer. runtime/metrics.Read
+// recommends reuse for efficiency; allocating this array for every one-second
+// sample otherwise creates a steady allocation baseline in the metrics being
+// observed. The mutex keeps reuse safe if reads are invoked concurrently.
+type runtimeMetricsReader struct {
+	mu      sync.Mutex
+	samples [runtimeMetricCount]runtimemetrics.Sample
+}
+
+func newRuntimeMetricsReader() *runtimeMetricsReader {
+	return &runtimeMetricsReader{samples: [...]runtimemetrics.Sample{
+		runtimeMetricGoroutines:       {Name: "/sched/goroutines:goroutines"},
+		runtimeMetricOSThreads:        {Name: "/sched/threads/total:threads"},
+		runtimeMetricHeapObjectsBytes: {Name: "/memory/classes/heap/objects:bytes"},
+		runtimeMetricHeapUnusedBytes:  {Name: "/memory/classes/heap/unused:bytes"},
+		runtimeMetricStackInuseBytes:  {Name: "/memory/classes/heap/stacks:bytes"},
+		runtimeMetricReservedBytes:    {Name: "/memory/classes/total:bytes"},
+		runtimeMetricHeapObjects:      {Name: "/gc/heap/objects:objects"},
+	}}
+}
+
+func (r *runtimeMetricsReader) read() runtimeValues {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	runtimemetrics.Read(r.samples[:])
+
+	heapAlloc := r.samples[runtimeMetricHeapObjectsBytes].Value.Uint64()
 	return runtimeValues{
-		goroutines:           samples[0].Value.Uint64(),
-		osThreads:            samples[1].Value.Uint64(),
+		goroutines:           r.samples[runtimeMetricGoroutines].Value.Uint64(),
+		osThreads:            r.samples[runtimeMetricOSThreads].Value.Uint64(),
 		heapAllocBytes:       heapAlloc,
-		heapInuseBytes:       heapAlloc + samples[3].Value.Uint64(),
-		stackInuseBytes:      samples[4].Value.Uint64(),
-		runtimeReservedBytes: samples[5].Value.Uint64(),
-		heapObjects:          samples[6].Value.Uint64(),
+		heapInuseBytes:       heapAlloc + r.samples[runtimeMetricHeapUnusedBytes].Value.Uint64(),
+		stackInuseBytes:      r.samples[runtimeMetricStackInuseBytes].Value.Uint64(),
+		runtimeReservedBytes: r.samples[runtimeMetricReservedBytes].Value.Uint64(),
+		heapObjects:          r.samples[runtimeMetricHeapObjects].Value.Uint64(),
 	}
 }

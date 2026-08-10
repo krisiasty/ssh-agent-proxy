@@ -51,6 +51,7 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
+	onReady           func()
 }
 
 // nextConnID returns a random 8-character hex string for log correlation.
@@ -70,6 +71,13 @@ func NewServer(upstream string, cacheTTL time.Duration, log *slog.Logger) *Serve
 	return s
 }
 
+// SetReadyCallback configures a function called synchronously after all
+// enabled group sockets are serving, or after Run determines that no groups
+// are enabled. It must be called before Run.
+func (s *Server) SetReadyCallback(callback func()) {
+	s.onReady = callback
+}
+
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
 func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) {
@@ -83,6 +91,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}
 	if len(enabledGroups) == 0 {
 		s.log.Info("no enabled groups; exposing nothing", "upstream", s.upstream)
+		if s.onReady != nil {
+			s.onReady()
+		}
 		<-ctx.Done()
 		return nil
 	}
@@ -166,6 +177,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 				acceptFailures <- err
 			}
 		}()
+	}
+	if s.onReady != nil {
+		s.onReady()
 	}
 
 	select {

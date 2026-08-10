@@ -157,8 +157,8 @@ func TestRuntimeTelemetryLogContainsCurrentAndMaximumGroups(t *testing.T) {
 	assertTelemetryGroup(t, "max", maximum, wantMaximum)
 }
 
-func TestReadRuntimeValues(t *testing.T) {
-	values := readRuntimeValues()
+func TestRuntimeMetricsReaderReadsValues(t *testing.T) {
+	values := newRuntimeMetricsReader().read()
 	if values.goroutines == 0 {
 		t.Error("goroutine count is zero")
 	}
@@ -174,6 +174,35 @@ func TestReadRuntimeValues(t *testing.T) {
 	if values.runtimeReservedBytes < values.heapInuseBytes+values.stackInuseBytes {
 		t.Errorf("runtime reserved bytes are inconsistent: %+v", values)
 	}
+}
+
+func TestRuntimeMetricsReaderReusesSampleBuffer(t *testing.T) {
+	reader := newRuntimeMetricsReader()
+	reader.read() // Initialize runtime metrics before measuring the steady state.
+
+	allocations := testing.AllocsPerRun(1000, func() {
+		_ = reader.read()
+	})
+	if allocations != 0 {
+		t.Fatalf("runtime metrics read allocations = %v, want 0", allocations)
+	}
+}
+
+func TestRuntimeMetricsReaderConcurrentSafe(t *testing.T) {
+	reader := newRuntimeMetricsReader()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100 {
+				values := reader.read()
+				if values.goroutines == 0 || values.osThreads == 0 {
+					t.Errorf("invalid concurrent runtime values: %+v", values)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
 }
 
 func TestTelemetrySamplingAndReportingAreConcurrentSafe(t *testing.T) {

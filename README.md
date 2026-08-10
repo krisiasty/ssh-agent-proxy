@@ -152,7 +152,7 @@ With the default `debug: false` configuration, the proxy logs:
 - successful client identity-list requests, including the group and number of returned
   identities;
 - successful client sign requests, including the group and public-key fingerprint;
-- runtime telemetry every ten minutes;
+- runtime telemetry once group startup completes and every ten minutes;
 - shutdown, refused operations, reconnects, and any warnings or errors.
 
 For example:
@@ -168,10 +168,11 @@ For example:
 
 ### Runtime telemetry
 
-The proxy samples its Go runtime every second and emits one `runtime telemetry` info
-event every ten minutes. The `current` group contains a fresh sample taken at report
-time; `max` contains the highest value observed for each field during that interval.
-After the event is emitted, the interval maximum resets to the current values.
+The proxy samples its Go runtime every second and emits a `runtime telemetry` info
+event once group startup completes, then periodically every ten minutes. The `current`
+group contains a fresh sample taken at report time; `max` contains the highest value
+observed for each field during that interval. After the event is emitted, the interval
+maximum resets to the current values.
 
 Both groups contain:
 

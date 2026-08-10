@@ -89,6 +89,7 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 		"telemetry_report", telemetryReportInterval.String())
 
 	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
+	srv.SetReadyCallback(telemetry.logReport)
 	if err := srv.Run(ctx, cfg.Groups); err != nil {
 		if shouldReturnProxyError(ctx, foreground, err) {
 			return err
