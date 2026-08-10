@@ -382,7 +382,7 @@ groups:
 }
 
 func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer("unused", 0, log)
 	keyring := newTestKeyring(t)
@@ -458,6 +458,25 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	if _, ok := serving["keys"]; ok {
 		t.Errorf("serving group log reports a key count after failed resolution: %v", serving)
 	}
+}
+
+// lockedBuffer allows tests to inspect logs while asynchronous connection
+// handlers may still be finishing their final log writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return bytes.Clone(b.buf.Bytes())
 }
 
 type countingListAgent struct {
