@@ -24,12 +24,19 @@ type filterAgent struct {
 	group         string
 	log           *slog.Logger
 	identityLog   *slog.Logger
+	telemetry     *proxyTelemetry
 }
 
 // List returns only the keys assigned to this group.
 func (f *filterAgent) List() ([]*agent.Key, error) {
+	if f.telemetry != nil {
+		f.telemetry.listRequests.Add(1)
+	}
 	ks, err := f.authorization.list(f.up)
 	if err != nil {
+		if f.telemetry != nil {
+			f.telemetry.listErrors.Add(1)
+		}
 		f.log.Warn("upstream list failed", "group", f.group, "err", err)
 		return nil, err
 	}
@@ -52,18 +59,31 @@ func (f *filterAgent) List() ([]*agent.Key, error) {
 
 // SignWithFlags signs with key only if it belongs to this group.
 func (f *filterAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	if f.telemetry != nil {
+		f.telemetry.signRequests.Add(1)
+	}
 	allowed, err := f.authorization.authorize(f.up, key)
 	if err != nil {
+		if f.telemetry != nil {
+			f.telemetry.signErrors.Add(1)
+		}
 		f.log.Warn("upstream list failed during sign authorization", "group", f.group, "err", err)
 		return nil, err
 	}
 	if !allowed {
+		if f.telemetry != nil {
+			f.telemetry.signErrors.Add(1)
+		}
 		f.log.Warn("sign refused: key not in group",
 			"group", f.group, "fingerprint", ssh.FingerprintSHA256(key))
 		return nil, errKeyNotInGroup
 	}
 	f.log.Info("sign", "fingerprint", ssh.FingerprintSHA256(key))
-	return f.up.SignWithFlags(key, data, flags)
+	sig, err := f.up.SignWithFlags(key, data, flags)
+	if err != nil && f.telemetry != nil {
+		f.telemetry.signErrors.Add(1)
+	}
+	return sig, err
 }
 
 // Sign signs with key only if it belongs to this group.

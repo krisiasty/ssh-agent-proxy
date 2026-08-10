@@ -152,7 +152,6 @@ With the default `debug: false` configuration, the proxy logs:
 - successful client identity-list requests, including the group and number of returned
   identities;
 - successful client sign requests, including the group and public-key fingerprint;
-- runtime telemetry every ten minutes;
 - shutdown, refused operations, reconnects, and any warnings or errors.
 
 For example:
@@ -168,12 +167,15 @@ For example:
 
 ### Runtime telemetry
 
-The proxy samples its Go runtime every second and emits one `runtime telemetry` info
-event every ten minutes. The `current` group contains a fresh sample taken at report
-time; `max` contains the highest value observed for each field during that interval.
-After the event is emitted, the interval maximum resets to the current values.
+With debug logging enabled, the proxy samples its Go runtime every second and reports
+once group startup completes, then periodically every ten minutes. `telemetry current`
+contains a fresh sample, `telemetry max` contains the highest sampled values during the
+interval, and `telemetry interval` contains activity since the previous report. All
+three records and all their defined fields are emitted every time, including unchanged
+and zero values, providing a stable schema for log processing. After reporting, the
+interval maximum and counter baselines reset.
 
-Both groups contain:
+The current and maximum records contain:
 
 | Field | Description |
 | --- | --- |
@@ -182,12 +184,45 @@ Both groups contain:
 | `os_threads` | OS threads created by the Go runtime |
 | `heap_alloc_bytes` | Bytes allocated to heap objects |
 | `heap_inuse_bytes` | Bytes in in-use heap spans |
+| `heap_live_bytes` | Reachable heap bytes marked by the most recent garbage collection; zero until the first GC completes |
+| `heap_goal_bytes` | Target heap size for the end of the current garbage-collection cycle |
 | `stack_inuse_bytes` | Bytes in stack spans |
 | `runtime_reserved_bytes` | Bytes reserved by the Go runtime |
 | `heap_objects` | Live heap objects |
 
+The interval record contains:
+
+| Field | Description |
+| --- | --- |
+| `heap_allocated_bytes` | Heap bytes allocated during the interval |
+| `heap_allocated_objects` | Heap objects allocated during the interval |
+| `gc_cycles` | Completed garbage-collection cycles during the interval |
+
 ```jsonl
-{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"runtime telemetry","current":{"uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041},"max":{"uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}}
+{"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry current","uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041}
+{"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry max","uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}
+{"time":"2026-08-09T23:10:34.642Z","level":"DEBUG","msg":"telemetry interval","heap_allocated_bytes":171064,"heap_allocated_objects":594,"gc_cycles":1}
+```
+
+### Proxy telemetry
+
+Debug mode also emits three application-level interval records alongside runtime
+telemetry:
+
+| Record | Fields |
+| --- | --- |
+| `telemetry clients` | Active and maximum concurrent clients, new connections and connection errors, plus list/sign requests and errors |
+| `telemetry upstream` | Upstream calls, errors, and successful reconnects |
+| `telemetry cache` | Identity-cache hits, misses, actual refreshes, and requests that waited for an in-flight refresh |
+
+The active-client values are gauges. All other values count activity since the previous
+report and reset after being logged. A cache miss counts each request that first finds an
+expired cache; concurrent misses share one refresh and increment `waits` while blocked.
+
+```jsonl
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry clients","active_clients":0,"max_active_clients":30,"connections":60,"connection_errors":0,"list_requests":30,"list_errors":0,"sign_requests":30,"sign_errors":0}
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry upstream","calls":31,"errors":0,"reconnects":0}
+{"time":"2026-08-09T23:10:34.643Z","level":"DEBUG","msg":"telemetry cache","hits":29,"misses":1,"refreshes":1,"waits":0}
 ```
 
 ### Debug logging
@@ -195,6 +230,7 @@ Both groups contain:
 Set `debug: true` in the configuration and restart the proxy to include debug records.
 Debug mode adds:
 
+- runtime and proxy telemetry immediately after group startup and every ten minutes;
 - every upstream operation, with its attempt number, duration, result count, error, or
   other operation-specific metadata;
 - every identity returned by an upstream list, numbered as `identity n/m`, with its

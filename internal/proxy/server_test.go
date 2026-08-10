@@ -226,6 +226,24 @@ func TestServerRunWithoutEnabledGroupsDoesNotDialUpstream(t *testing.T) {
 	})
 }
 
+func TestServerRunSignalsReadyWithoutEnabledGroups(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	var readyCalls atomic.Int64
+	srv.SetReadyCallback(func() {
+		readyCalls.Add(1)
+	})
+
+	if err := srv.Run(ctx, nil); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if got := readyCalls.Load(); got != 1 {
+		t.Fatalf("ready callback calls = %d, want 1", got)
+	}
+}
+
 func TestServerRunReturnsInitialDialError(t *testing.T) {
 	t.Parallel()
 
@@ -246,6 +264,9 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer("unused", 0, log)
+	srv.SetReadyCallback(func() {
+		log.Info("server ready callback")
+	})
 	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
 	if !ok {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
@@ -320,6 +341,19 @@ groups:
 	if resolution["trigger"] != "startup" || resolution["configured_keys"] != float64(4) ||
 		resolution["upstream_keys"] != float64(2) || resolution["resolved_keys"] != float64(2) {
 		t.Errorf("startup resolution log = %v", resolution)
+	}
+	servingIndex, readyIndex, readyCalls := -1, -1, 0
+	for i, entry := range entries {
+		switch entry["msg"] {
+		case "serving group":
+			servingIndex = i
+		case "server ready callback":
+			readyIndex = i
+			readyCalls++
+		}
+	}
+	if readyCalls != 1 || readyIndex <= servingIndex {
+		t.Errorf("ready callback calls = %d at index %d, serving group index = %d", readyCalls, readyIndex, servingIndex)
 	}
 
 	warnings := make(map[float64]string)

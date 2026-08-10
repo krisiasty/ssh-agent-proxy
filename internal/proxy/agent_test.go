@@ -41,11 +41,13 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	telemetry := &proxyTelemetry{}
 	fa := &filterAgent{
 		up:            up,
 		authorization: newGroupAuthorization("test", []keys.Matcher{m}, slog.New(slog.DiscardHandler)),
 		group:         "test",
 		log:           slog.New(slog.DiscardHandler),
+		telemetry:     telemetry,
 	}
 
 	// List exposes only the allowed key.
@@ -101,6 +103,9 @@ func TestFilterAgentEnforcement(t *testing.T) {
 	}
 	if len(all) != 2 {
 		t.Errorf("upstream now has %d keys, want 2 (proxy must not mutate)", len(all))
+	}
+	if lists, signs, signErrors := telemetry.listRequests.Load(), telemetry.signRequests.Load(), telemetry.signErrors.Load(); lists != 1 || signs != 2 || signErrors != 1 {
+		t.Errorf("request telemetry = lists:%d signs:%d sign-errors:%d", lists, signs, signErrors)
 	}
 }
 

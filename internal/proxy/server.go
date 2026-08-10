@@ -51,6 +51,8 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
+	onReady           func()
+	telemetry         *proxyTelemetry
 }
 
 // nextConnID returns a random 8-character hex string for log correlation.
@@ -65,9 +67,24 @@ func (s *Server) nextConnID() string {
 
 // NewServer returns a Server that forwards to the upstream agent socket.
 func NewServer(upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
-	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, newUpstreamClient: newReconnectClient}
+	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, telemetry: newProxyTelemetry(log)}
+	s.newUpstreamClient = func(ctx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
+		return newReconnectClientWithTelemetry(ctx, upstream, log, s.telemetry)
+	}
 	s.listen = s.listenUnix
 	return s
+}
+
+// LogTelemetry emits and resets the current application telemetry interval.
+func (s *Server) LogTelemetry() {
+	s.telemetry.logReport()
+}
+
+// SetReadyCallback configures a function called synchronously after all
+// enabled group sockets are serving, or after Run determines that no groups
+// are enabled. It must be called before Run.
+func (s *Server) SetReadyCallback(callback func()) {
+	s.onReady = callback
 }
 
 // Run binds every group socket and serves connections until ctx is cancelled,
@@ -83,6 +100,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}
 	if len(enabledGroups) == 0 {
 		s.log.Info("no enabled groups; exposing nothing", "upstream", s.upstream)
+		if s.onReady != nil {
+			s.onReady()
+		}
 		<-ctx.Done()
 		return nil
 	}
@@ -112,13 +132,16 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	if err != nil {
 		return err
 	}
+	if rc.telemetry == nil {
+		rc.telemetry = s.telemetry
+	}
 	defer func() {
 		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Warn("closing upstream connection", "err", err)
 			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 		}
 	}()
-	upstream := newCachedAgent(rc, s.cacheTTL, s.log)
+	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
 	// Create one shared authorization state per group. A successful initial list
 	// seeds every group from the same upstream snapshot; later requests refresh
@@ -166,6 +189,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 				acceptFailures <- err
 			}
 		}()
+	}
+	if s.onReady != nil {
+		s.onReady()
 	}
 
 	select {
@@ -351,6 +377,9 @@ func waitForAcceptRetry(ctx context.Context, delay time.Duration) bool {
 // serveConn handles one client with a filtered view over the shared upstream
 // connection. No per-client dial is needed.
 func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
+	s.telemetry.clientConnected()
+	defer s.telemetry.clientDisconnected()
+
 	id := s.nextConnID()
 	identityLog := s.log.With("conn", id, "group", g.Name)
 	log := identityLog
@@ -383,8 +412,12 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group,
 		group:         g.Name,
 		log:           log,
 		identityLog:   identityLog,
+		telemetry:     s.telemetry,
 	}
 	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
+		if s.telemetry != nil {
+			s.telemetry.clientErrors.Add(1)
+		}
 		log.Debug("client connection ended", "err", err)
 	}
 	log.Info("client disconnected")
