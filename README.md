@@ -1,5 +1,7 @@
 # ssh-agent-proxy
 
+[![CI](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/krisiasty/ssh-agent-proxy/actions/workflows/ci.yml)
+
 `ssh-agent-proxy` is a filtering proxy that sits in front of an existing SSH agent —
 especially the agent built into a password manager such as **Bitwarden, KeePassXC,
 1Password, or Secretive**.
@@ -386,6 +388,25 @@ go build -o ssh-agent-proxy .
 
 Requires Go 1.26+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
 `go.yaml.in/yaml/v3` (config).
+
+## Development and releases
+
+Pull requests and pushes to `main` run formatting, vet, race-enabled tests, a
+transitive dependency license gate, and cgo-free cross-builds for Linux and macOS on
+amd64 and arm64.
+
+Releases are cut by pushing a `v*` tag. The release workflow repeats the quality gates,
+then uses GoReleaser to publish platform archives and checksums to GitHub. It also
+updates the `ssh-agent-proxy` cask in
+[`krisiasty/homebrew-tap`](https://github.com/krisiasty/homebrew-tap). The repository
+must define `HOMEBREW_TAP_GITHUB_TOKEN` as a fine-grained token with Contents write
+access to that tap.
+
+To validate release packaging locally without publishing:
+
+```sh
+goreleaser release --snapshot --clean --skip=publish
+```
 
 ## License
 

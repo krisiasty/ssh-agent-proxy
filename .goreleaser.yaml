@@ -2,19 +2,31 @@
 # https://goreleaser.com
 version: 2
 
-before:
-  hooks:
-    - go mod tidy
+project_name: ssh-agent-proxy
 
 builds:
-  - id: ssh-agent-proxy
+  - id: darwin
+    main: .
+    binary: ssh-agent-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+  - id: linux
     main: .
     binary: ssh-agent-proxy
     env:
       - CGO_ENABLED=0
     goos:
       - linux
-      - darwin
     goarch:
       - amd64
       - arm64
@@ -25,10 +37,21 @@ builds:
       - -X main.date={{ .Date }}
 
 archives:
-  - id: default
-    formats: [tar.gz]
-    name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+  - id: darwin
+    ids:
+      - darwin
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+  - id: linux
+    ids:
+      - linux
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
       - LICENSE
@@ -47,18 +70,23 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# Homebrew cask published to a personal tap.
-# Requires a GitHub repo named "homebrew-tap" under the same owner and a token
-# with write access exported as GITHUB_TOKEN (or HOMEBREW_TAP_GITHUB_TOKEN).
-# A cask (rather than a formula) is used so Homebrew strips the macOS quarantine
-# attribute on install, avoiding Gatekeeper warnings on the unsigned binary.
 homebrew_casks:
   - name: ssh-agent-proxy
+    ids:
+      - darwin
     repository:
       owner: krisiasty
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/krisiasty/ssh-agent-proxy"
     description: "Filtering proxy for ssh-agent: expose per-group filtered views of your keys"
+    license: "Apache-2.0"
+    binaries:
+      - ssh-agent-proxy
+    hooks:
+      post:
+        install: |
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", staged_path]
     caveats: |
       Configure ssh-agent-proxy, then install the LaunchAgent with:
         ssh-agent-proxy -install
