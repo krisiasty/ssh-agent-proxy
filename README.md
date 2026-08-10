@@ -143,12 +143,14 @@ for both command-line processing and ingestion by log-management systems.
 
 With the default `debug: false` configuration, the proxy logs:
 
-- version, configuration path, upstream socket, cache duration, and group startup;
+- version, configuration path, upstream socket, cache and telemetry intervals, and
+  group startup;
 - client connections and disconnections, including UID, PID, and process name when the
   operating system provides them;
 - successful client identity-list requests, including the group and number of returned
   identities;
 - successful client sign requests, including the group and public-key fingerprint;
+- runtime telemetry every ten minutes;
 - shutdown, refused operations, reconnects, and any warnings or errors.
 
 For example:
@@ -158,6 +160,30 @@ For example:
 {"time":"2026-08-09T22:55:55.873+02:00","level":"INFO","msg":"list identities","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","count":2}
 {"time":"2026-08-09T22:55:55.893+02:00","level":"INFO","msg":"sign","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","fingerprint":"SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM"}
 {"time":"2026-08-09T22:55:55.921+02:00","level":"INFO","msg":"client disconnected","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh"}
+```
+
+### Runtime telemetry
+
+The proxy samples its Go runtime every second and emits one `runtime telemetry` info
+event every ten minutes. The `current` group contains a fresh sample taken at report
+time; `max` contains the highest value observed for each field during that interval.
+After the event is emitted, the interval maximum resets to the current values.
+
+Both groups contain:
+
+| Field | Description |
+| --- | --- |
+| `uptime_seconds` | Process telemetry uptime in seconds |
+| `goroutines` | Live goroutines |
+| `os_threads` | OS threads created by the Go runtime |
+| `heap_alloc_bytes` | Bytes allocated to heap objects |
+| `heap_inuse_bytes` | Bytes in in-use heap spans |
+| `stack_inuse_bytes` | Bytes in stack spans |
+| `runtime_reserved_bytes` | Bytes reserved by the Go runtime |
+| `heap_objects` | Live heap objects |
+
+```jsonl
+{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"runtime telemetry","current":{"uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041},"max":{"uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}}
 ```
 
 ### Debug logging

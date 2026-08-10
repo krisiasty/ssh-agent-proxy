@@ -127,7 +127,8 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 		t.Errorf("config log unexpectedly contains upstream: %v", configLog)
 	}
 	upstreamLog := entries[2]
-	if upstreamLog["msg"] != "starting" || upstreamLog["upstream"] != upstream || upstreamLog["cache_seconds"] != float64(3) {
+	if upstreamLog["msg"] != "starting" || upstreamLog["upstream"] != upstream || upstreamLog["cache_seconds"] != float64(3) ||
+		upstreamLog["telemetry_sample"] != "1s" || upstreamLog["telemetry_report"] != "10m0s" {
 		t.Errorf("upstream log = %v, want starting and upstream path", upstreamLog)
 	}
 	if _, ok := upstreamLog["config"]; ok {
