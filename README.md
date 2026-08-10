@@ -152,7 +152,7 @@ With the default `debug: false` configuration, the proxy logs:
 - successful client identity-list requests, including the group and number of returned
   identities;
 - successful client sign requests, including the group and public-key fingerprint;
-- runtime telemetry once group startup completes and every ten minutes;
+- three runtime telemetry records once group startup completes and every ten minutes;
 - shutdown, refused operations, reconnects, and any warnings or errors.
 
 For example:
@@ -168,13 +168,14 @@ For example:
 
 ### Runtime telemetry
 
-The proxy samples its Go runtime every second and emits a `runtime telemetry` info
-event once group startup completes, then periodically every ten minutes. The `current`
-group contains a fresh sample taken at report time; `max` contains the highest value
-observed for each field during that interval. After the event is emitted, the interval
-maximum resets to the current values.
+The proxy samples its Go runtime every second and emits three info events once group
+startup completes, then periodically every ten minutes. `telemetry current` contains a
+fresh sample taken at report time, `telemetry max` contains the highest values observed
+during that interval, and `telemetry interval` contains activity since the previous
+report. Splitting the report keeps each JSONL record reasonably short. After the events
+are emitted, the interval maximum and counters reset.
 
-Both groups contain:
+The current and maximum records contain:
 
 | Field | Description |
 | --- | --- |
@@ -183,12 +184,24 @@ Both groups contain:
 | `os_threads` | OS threads created by the Go runtime |
 | `heap_alloc_bytes` | Bytes allocated to heap objects |
 | `heap_inuse_bytes` | Bytes in in-use heap spans |
+| `heap_live_bytes` | Reachable heap bytes marked by the most recent garbage collection |
+| `heap_goal_bytes` | Target heap size for the end of the current garbage-collection cycle |
 | `stack_inuse_bytes` | Bytes in stack spans |
 | `runtime_reserved_bytes` | Bytes reserved by the Go runtime |
 | `heap_objects` | Live heap objects |
 
+The interval record contains:
+
+| Field | Description |
+| --- | --- |
+| `heap_allocated_bytes` | Heap bytes allocated during the interval |
+| `heap_allocated_objects` | Heap objects allocated during the interval |
+| `gc_cycles` | Completed garbage-collection cycles during the interval |
+
 ```jsonl
-{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"runtime telemetry","current":{"uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041},"max":{"uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}}
+{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"telemetry current","uptime_seconds":117000.000737511,"goroutines":16,"os_threads":7,"heap_alloc_bytes":1713304,"heap_inuse_bytes":3194880,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":491520,"runtime_reserved_bytes":13728008,"heap_objects":10041}
+{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"telemetry max","uptime_seconds":117000.000737511,"goroutines":17,"os_threads":7,"heap_alloc_bytes":2493920,"heap_inuse_bytes":3858432,"heap_live_bytes":1605632,"heap_goal_bytes":4194304,"stack_inuse_bytes":524288,"runtime_reserved_bytes":13728008,"heap_objects":19349}
+{"time":"2026-08-09T23:10:34.642Z","level":"INFO","msg":"telemetry interval","heap_allocated_bytes":171064,"heap_allocated_objects":594,"gc_cycles":1}
 ```
 
 ### Debug logging

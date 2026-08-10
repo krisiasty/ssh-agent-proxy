@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -30,24 +31,42 @@ func TestRuntimeTelemetrySamplesImmediately(t *testing.T) {
 func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 	startedAt := time.Unix(1_700_000_000, 0)
 	now := startedAt.Add(time.Second)
-	values := []runtimeValues{
+	values := []runtimeSample{
 		{
-			goroutines:           10,
-			osThreads:            4,
-			heapAllocBytes:       100,
-			heapInuseBytes:       220,
-			stackInuseBytes:      50,
-			runtimeReservedBytes: 500,
-			heapObjects:          20,
+			values: runtimeValues{
+				goroutines:           10,
+				osThreads:            4,
+				heapAllocBytes:       100,
+				heapInuseBytes:       220,
+				heapLiveBytes:        80,
+				heapGoalBytes:        400,
+				stackInuseBytes:      50,
+				runtimeReservedBytes: 500,
+				heapObjects:          20,
+			},
+			counters: runtimeCounters{
+				heapAllocatedBytes:   1_000,
+				heapAllocatedObjects: 200,
+				gcCycles:             3,
+			},
 		},
 		{
-			goroutines:           8,
-			osThreads:            6,
-			heapAllocBytes:       140,
-			heapInuseBytes:       200,
-			stackInuseBytes:      70,
-			runtimeReservedBytes: 480,
-			heapObjects:          25,
+			values: runtimeValues{
+				goroutines:           8,
+				osThreads:            6,
+				heapAllocBytes:       140,
+				heapInuseBytes:       200,
+				heapLiveBytes:        90,
+				heapGoalBytes:        380,
+				stackInuseBytes:      70,
+				runtimeReservedBytes: 480,
+				heapObjects:          25,
+			},
+			counters: runtimeCounters{
+				heapAllocatedBytes:   1_300,
+				heapAllocatedObjects: 220,
+				gcCycles:             4,
+			},
 		},
 	}
 	next := 0
@@ -55,7 +74,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		logger:    slog.New(slog.DiscardHandler),
 		startedAt: startedAt,
 		now:       func() time.Time { return now },
-		read: func() runtimeValues {
+		read: func() runtimeSample {
 			value := values[next]
 			next++
 			return value
@@ -73,6 +92,8 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		osThreads:            6,
 		heapAllocBytes:       140,
 		heapInuseBytes:       200,
+		heapLiveBytes:        90,
+		heapGoalBytes:        380,
 		stackInuseBytes:      70,
 		runtimeReservedBytes: 480,
 		heapObjects:          25,
@@ -85,6 +106,8 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		osThreads:            6,
 		heapAllocBytes:       140,
 		heapInuseBytes:       220,
+		heapLiveBytes:        90,
+		heapGoalBytes:        400,
 		stackInuseBytes:      70,
 		runtimeReservedBytes: 500,
 		heapObjects:          25,
@@ -92,16 +115,19 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 		t.Fatalf("maximum values = %+v", maximum)
 	}
 
-	reportedCurrent, reportedMaximum := telemetry.takeReport()
+	reportedCurrent, reportedMaximum, interval := telemetry.takeReport()
 	if reportedCurrent != current || reportedMaximum != maximum {
 		t.Fatalf("report = (%+v, %+v), want (%+v, %+v)", reportedCurrent, reportedMaximum, current, maximum)
+	}
+	if interval != (runtimeInterval{heapAllocatedBytes: 300, heapAllocatedObjects: 20, gcCycles: 1}) {
+		t.Fatalf("interval = %+v", interval)
 	}
 	if telemetry.maximum != current {
 		t.Fatalf("maximum after report = %+v, want current %+v", telemetry.maximum, current)
 	}
 }
 
-func TestRuntimeTelemetryLogContainsCurrentAndMaximumGroups(t *testing.T) {
+func TestRuntimeTelemetryLogsCurrentMaximumAndIntervalEvents(t *testing.T) {
 	var output bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&output, nil))
 	startedAt := time.Unix(1_700_000_000, 0)
@@ -109,40 +135,50 @@ func TestRuntimeTelemetryLogContainsCurrentAndMaximumGroups(t *testing.T) {
 		logger:    logger,
 		startedAt: startedAt,
 		now:       func() time.Time { return startedAt.Add(10 * time.Second) },
-		read: func() runtimeValues {
-			return runtimeValues{
-				goroutines: 7, osThreads: 3, heapAllocBytes: 100, heapInuseBytes: 150,
-				stackInuseBytes: 20, runtimeReservedBytes: 300, heapObjects: 11,
+		read: func() runtimeSample {
+			return runtimeSample{
+				values: runtimeValues{
+					goroutines: 7, osThreads: 3, heapAllocBytes: 100, heapInuseBytes: 150,
+					heapLiveBytes: 90, heapGoalBytes: 400,
+					stackInuseBytes: 20, runtimeReservedBytes: 300, heapObjects: 11,
+				},
+				counters: runtimeCounters{
+					heapAllocatedBytes: 1_300, heapAllocatedObjects: 220, gcCycles: 4,
+				},
 			}
 		},
 		maximum: runtimeValues{
 			goroutines: 9, osThreads: 4, heapAllocBytes: 120, heapInuseBytes: 180,
+			heapLiveBytes: 95, heapGoalBytes: 420,
 			stackInuseBytes: 25, runtimeReservedBytes: 350, heapObjects: 13,
+		},
+		intervalAt: runtimeCounters{
+			heapAllocatedBytes: 1_000, heapAllocatedObjects: 200, gcCycles: 3,
 		},
 		initialized: true,
 	}
 
 	telemetry.logReport()
 
-	var event map[string]any
-	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
-		t.Fatalf("decode telemetry log: %v", err)
+	decoder := json.NewDecoder(&output)
+	events := make([]map[string]any, 3)
+	for i := range events {
+		if err := decoder.Decode(&events[i]); err != nil {
+			t.Fatalf("decode telemetry log %d: %v", i+1, err)
+		}
+		if events[i]["level"] != "INFO" {
+			t.Fatalf("event %d = %v", i+1, events[i])
+		}
 	}
-	if event["level"] != "INFO" || event["msg"] != "runtime telemetry" {
-		t.Fatalf("event = %v", event)
-	}
-	current, ok := event["current"].(map[string]any)
-	if !ok {
-		t.Fatalf("current group = %#v", event["current"])
-	}
-	maximum, ok := event["max"].(map[string]any)
-	if !ok {
-		t.Fatalf("max group = %#v", event["max"])
+	var extra map[string]any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("unexpected trailing telemetry data: event=%v err=%v", extra, err)
 	}
 	wantCurrent := map[string]any{
 		"uptime_seconds": float64(10),
 		"goroutines":     float64(7), "os_threads": float64(3),
 		"heap_alloc_bytes": float64(100), "heap_inuse_bytes": float64(150),
+		"heap_live_bytes": float64(90), "heap_goal_bytes": float64(400),
 		"stack_inuse_bytes": float64(20), "runtime_reserved_bytes": float64(300),
 		"heap_objects": float64(11),
 	}
@@ -150,15 +186,28 @@ func TestRuntimeTelemetryLogContainsCurrentAndMaximumGroups(t *testing.T) {
 		"uptime_seconds": float64(10),
 		"goroutines":     float64(9), "os_threads": float64(4),
 		"heap_alloc_bytes": float64(120), "heap_inuse_bytes": float64(180),
+		"heap_live_bytes": float64(95), "heap_goal_bytes": float64(420),
 		"stack_inuse_bytes": float64(25), "runtime_reserved_bytes": float64(350),
 		"heap_objects": float64(13),
 	}
-	assertTelemetryGroup(t, "current", current, wantCurrent)
-	assertTelemetryGroup(t, "max", maximum, wantMaximum)
+	wantInterval := map[string]any{
+		"heap_allocated_bytes": float64(300), "heap_allocated_objects": float64(20),
+		"gc_cycles": float64(1),
+	}
+	assertTelemetryEvent(t, events[0], "telemetry current", wantCurrent)
+	assertTelemetryEvent(t, events[1], "telemetry max", wantMaximum)
+	assertTelemetryEvent(t, events[2], "telemetry interval", wantInterval)
+}
+
+func TestRuntimeCounterDeltaDoesNotUnderflow(t *testing.T) {
+	if delta := counterDelta(2, 3); delta != 0 {
+		t.Fatalf("counter delta after regression = %d, want 0", delta)
+	}
 }
 
 func TestRuntimeMetricsReaderReadsValues(t *testing.T) {
-	values := newRuntimeMetricsReader().read()
+	sample := newRuntimeMetricsReader().read()
+	values := sample.values
 	if values.goroutines == 0 {
 		t.Error("goroutine count is zero")
 	}
@@ -171,8 +220,15 @@ func TestRuntimeMetricsReaderReadsValues(t *testing.T) {
 	if values.heapInuseBytes < values.heapAllocBytes {
 		t.Errorf("heap in use %d is below allocated heap %d", values.heapInuseBytes, values.heapAllocBytes)
 	}
+	if values.heapGoalBytes < values.heapLiveBytes {
+		t.Errorf("heap goal %d is below live heap %d", values.heapGoalBytes, values.heapLiveBytes)
+	}
 	if values.runtimeReservedBytes < values.heapInuseBytes+values.stackInuseBytes {
 		t.Errorf("runtime reserved bytes are inconsistent: %+v", values)
+	}
+	if sample.counters.heapAllocatedBytes < values.heapAllocBytes ||
+		sample.counters.heapAllocatedObjects < values.heapObjects {
+		t.Errorf("runtime counters are inconsistent: %+v", sample)
 	}
 }
 
@@ -194,7 +250,7 @@ func TestRuntimeMetricsReaderConcurrentSafe(t *testing.T) {
 	for range 8 {
 		wg.Go(func() {
 			for range 100 {
-				values := reader.read()
+				values := reader.read().values
 				if values.goroutines == 0 || values.osThreads == 0 {
 					t.Errorf("invalid concurrent runtime values: %+v", values)
 					return
@@ -211,11 +267,17 @@ func TestTelemetrySamplingAndReportingAreConcurrentSafe(t *testing.T) {
 		logger:    slog.New(slog.DiscardHandler),
 		startedAt: time.Now(),
 		now:       time.Now,
-		read: func() runtimeValues {
+		read: func() runtimeSample {
 			n := value.Add(1)
-			return runtimeValues{
-				goroutines: n, osThreads: n, heapAllocBytes: n, heapInuseBytes: n,
-				stackInuseBytes: n, runtimeReservedBytes: n, heapObjects: n,
+			return runtimeSample{
+				values: runtimeValues{
+					goroutines: n, osThreads: n, heapAllocBytes: n, heapInuseBytes: n,
+					heapLiveBytes: n, heapGoalBytes: n,
+					stackInuseBytes: n, runtimeReservedBytes: n, heapObjects: n,
+				},
+				counters: runtimeCounters{
+					heapAllocatedBytes: n, heapAllocatedObjects: n, gcCycles: n,
+				},
 			}
 		},
 	}
@@ -245,6 +307,8 @@ func TestTelemetrySamplingAndReportingAreConcurrentSafe(t *testing.T) {
 		{"os_threads", current.osThreads, maximum.osThreads},
 		{"heap_alloc_bytes", current.heapAllocBytes, maximum.heapAllocBytes},
 		{"heap_inuse_bytes", current.heapInuseBytes, maximum.heapInuseBytes},
+		{"heap_live_bytes", current.heapLiveBytes, maximum.heapLiveBytes},
+		{"heap_goal_bytes", current.heapGoalBytes, maximum.heapGoalBytes},
 		{"stack_inuse_bytes", current.stackInuseBytes, maximum.stackInuseBytes},
 		{"runtime_reserved_bytes", current.runtimeReservedBytes, maximum.runtimeReservedBytes},
 		{"heap_objects", current.heapObjects, maximum.heapObjects},
@@ -281,14 +345,20 @@ func TestTelemetryIntervals(t *testing.T) {
 	}
 }
 
-func assertTelemetryGroup(t *testing.T, name string, got, want map[string]any) {
+func assertTelemetryEvent(t *testing.T, event map[string]any, message string, want map[string]any) {
 	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("%s fields = %v, want %v", name, got, want)
+	if event["msg"] != message {
+		t.Fatalf("event message = %v, want %q", event["msg"], message)
+	}
+	for _, key := range []string{"time", "level", "msg"} {
+		delete(event, key)
+	}
+	if len(event) != len(want) {
+		t.Fatalf("%s fields = %v, want %v", message, event, want)
 	}
 	for key, value := range want {
-		if got[key] != value {
-			t.Errorf("%s.%s = %v, want %v", name, key, got[key], value)
+		if event[key] != value {
+			t.Errorf("%s.%s = %v, want %v", message, key, event[key], value)
 		}
 	}
 }
