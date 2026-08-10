@@ -144,7 +144,9 @@ for both command-line processing and ingestion by log-management systems.
 With the default `debug: false` configuration, the proxy logs:
 
 - version, configuration path, upstream socket, cache and telemetry intervals, and
-  group startup;
+  group startup with the number of distinct matched keys;
+- one warning for each configured selector that matches no upstream key, identifying
+  its group, config index, and selector type without logging the selector value;
 - client connections and disconnections, including UID, PID, and process name when the
   operating system provides them;
 - successful client identity-list requests, including the group and number of returned
@@ -156,6 +158,8 @@ With the default `debug: false` configuration, the proxy logs:
 For example:
 
 ```jsonl
+{"time":"2026-08-09T22:55:55.850+02:00","level":"INFO","msg":"serving group","group":"work","socket":"/Users/example/.ssh/agent-work.sock","keys":2}
+{"time":"2026-08-09T22:55:55.851+02:00","level":"WARN","msg":"configured key selector matched no upstream key","group":"work","config_index":3,"selector_type":"comment"}
 {"time":"2026-08-09T22:55:55.870+02:00","level":"INFO","msg":"client connected","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh"}
 {"time":"2026-08-09T22:55:55.873+02:00","level":"INFO","msg":"list identities","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","count":2}
 {"time":"2026-08-09T22:55:55.893+02:00","level":"INFO","msg":"sign","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","fingerprint":"SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM"}
@@ -304,18 +308,18 @@ groups:
 
 Configuration is read once at startup; run `ssh-agent-proxy -restart` to apply changes.
 
-If the config cannot be read or validated, or the upstream agent is unavailable during
-startup, the service logs the error and idles rather than exiting into a restart loop.
-Fix the config or upstream agent and restart the service. In `-foreground` mode it
-returns the error and exits instead. With no enabled groups, it idles without connecting
-to the upstream agent because it has no sockets to serve.
+If the config cannot be read or validated, or the initial upstream connection cannot be
+opened, the service logs the error and idles rather than exiting into a restart loop. Fix
+the config or upstream agent and restart the service. In `-foreground` mode it returns
+the error and exits instead. With no enabled groups, it idles without connecting to the
+upstream agent because it has no sockets to serve.
 
-Group keys are resolved lazily rather than during startup. If an upstream agent accepts
-connections while locked or initially has no keys, the proxy can start serving and will
-pick up matching keys after the agent is unlocked or populated. Successful upstream key
-lists are cached process-wide for the configured `--cache` interval. Concurrent refreshes
-across every group share one request; if a refresh fails, the last successful list is
-served until the next interval.
+One shared upstream identity list resolves every enabled group during startup. If the
+connected upstream agent is locked or listing otherwise fails, the proxy still starts
+serving and defers resolution until a client request. It picks up matching keys after the
+agent is unlocked or populated. Successful upstream key lists are cached process-wide
+for the configured `--cache` interval. Concurrent refreshes across every group share one
+request; if a refresh fails, the last successful list is served until the next interval.
 
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup

@@ -120,11 +120,14 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}()
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log)
 
-	// Create one shared authorization state per group. Keys are resolved lazily
-	// so a locked or empty upstream agent can become usable without a restart.
+	// Create one shared authorization state per group. A successful initial list
+	// seeds every group from the same upstream snapshot; later requests refresh
+	// the snapshots so a locked or empty agent can recover without a restart.
 	type enrichedGroup struct {
 		g             config.Group
 		authorization *groupAuthorization
+		resolvedKeys  int
+		resolved      bool
 	}
 	egs := make([]enrichedGroup, 0, len(enabledGroups))
 	for _, g := range enabledGroups {
@@ -132,6 +135,15 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			g:             g,
 			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
+	}
+	allKeys, err := upstream.List()
+	if err != nil {
+		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
+	} else {
+		for i := range egs {
+			egs[i].resolvedKeys = len(egs[i].authorization.resolve(allKeys, "startup"))
+			egs[i].resolved = true
+		}
 	}
 
 	var listeners []net.Listener
@@ -144,7 +156,11 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			return errors.Join(listenErr, s.closeListeners(listeners))
 		}
 		listeners = append(listeners, ln)
-		s.log.Info("serving group", "group", g.Name, "socket", g.Socket, "keys", len(g.Keys))
+		logAttrs := []any{"group", g.Name, "socket", g.Socket}
+		if eg.resolved {
+			logAttrs = append(logAttrs, "keys", eg.resolvedKeys)
+		}
+		s.log.Info("serving group", logAttrs...)
 		go func() {
 			if err := s.acceptLoop(ctx, ln, g, eg.authorization, upstream); err != nil {
 				acceptFailures <- err

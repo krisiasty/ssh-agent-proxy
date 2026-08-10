@@ -106,6 +106,31 @@ func TestFilterOrderAndDedup(t *testing.T) {
 	}
 }
 
+func TestResolveReportsPerMatcherCountsBeforeDeduplication(t *testing.T) {
+	first := makeKey(t, "shared")
+	second := makeKey(t, "shared")
+	upstream := []*agent.Key{first, second}
+	matchers := []Matcher{
+		mustMatcher(t, "comment", "shared"),
+		mustMatcher(t, "sha256", ssh.FingerprintSHA256(first)),
+		mustMatcher(t, "comment", "missing"),
+	}
+
+	resolved, matchCounts := Resolve(upstream, matchers)
+	if len(resolved) != 2 || resolved[0] != first || resolved[1] != second {
+		t.Errorf("Resolve() keys = %v, want [first second] in upstream order", comments(resolved))
+	}
+	wantCounts := []int{2, 1, 0}
+	if len(matchCounts) != len(wantCounts) {
+		t.Fatalf("Resolve() match counts = %v, want %v", matchCounts, wantCounts)
+	}
+	for i := range wantCounts {
+		if matchCounts[i] != wantCounts[i] {
+			t.Errorf("Resolve() match count %d = %d, want %d", i, matchCounts[i], wantCounts[i])
+		}
+	}
+}
+
 func mustMatcher(t *testing.T, typ, value string) Matcher {
 	t.Helper()
 	m, err := NewMatcher(typ, value)
