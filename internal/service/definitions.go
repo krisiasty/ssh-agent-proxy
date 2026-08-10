@@ -13,6 +13,11 @@ import (
 
 const launchdPlistDoctype = `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`
 
+var launchdCanonicalElements = strings.NewReplacer(
+	"<true></true>", "<true/>",
+	"<false></false>", "<false/>",
+)
+
 var (
 	reLaunchdProgram = regexp.MustCompile(`"Program"\s*=\s*("(?:\\.|[^"\\])*");`)
 	reLaunchdArg0    = regexp.MustCompile(`"ProgramArguments"\s*=\s*\(\s*("(?:\\.|[^"\\])*")`)
@@ -124,7 +129,11 @@ func renderLaunchdPlist(label string, programArguments []string, logPath string)
 	}); err != nil {
 		return nil, fmt.Errorf("encoding launchd plist: %w", err)
 	}
-	return buf.Bytes(), nil
+
+	// encoding/xml emits empty elements using separate start/end tags. They
+	// are valid XML, but launchd's property-list parser rejects expanded
+	// boolean elements and requires the canonical <true/> and <false/> forms.
+	return []byte(launchdCanonicalElements.Replace(buf.String())), nil
 }
 
 func (p launchdPlist) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {

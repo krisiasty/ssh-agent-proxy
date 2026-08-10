@@ -102,6 +102,16 @@ func TestRenderLaunchdPlistEscapesValues(t *testing.T) {
 			t.Errorf("plist does not contain XML escape %q:\n%s", escaped, data)
 		}
 	}
+	for _, element := range []string{"<true/>", "<false/>"} {
+		if !strings.Contains(string(data), element) {
+			t.Errorf("plist does not contain canonical boolean element %q:\n%s", element, data)
+		}
+	}
+	for _, invalid := range []string{"<true></true>", "<false></false>"} {
+		if strings.Contains(string(data), invalid) {
+			t.Errorf("plist contains launchd-incompatible boolean element %q:\n%s", invalid, data)
+		}
+	}
 }
 
 func TestParseLaunchdProgramUnescapesProgram(t *testing.T) {

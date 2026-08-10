@@ -135,10 +135,23 @@ func (m *launchdManager) launchctl(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "launchctl", args...) //nolint:gosec // fixed command; args are program-controlled, not shell-interpreted.
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("launchctl %s: %w", strings.Join(args, " "), err)
+	out, err := cmd.CombinedOutput()
+	return launchctlCommandError(args, out, err)
+}
+
+func launchctlCommandError(args []string, out []byte, runErr error) error {
+	message := strings.TrimSpace(string(out))
+	if runErr != nil {
+		if message != "" {
+			return fmt.Errorf("launchctl %s: %s: %w", strings.Join(args, " "), message, runErr)
+		}
+		return fmt.Errorf("launchctl %s: %w", strings.Join(args, " "), runErr)
+	}
+	// Legacy launchctl load/unload commands can print a failure diagnostic but
+	// still exit successfully. Treat any diagnostic as an error so callers do
+	// not report a failed installation as successful.
+	if message != "" {
+		return fmt.Errorf("launchctl %s: %s", strings.Join(args, " "), message)
 	}
 	return nil
 }
