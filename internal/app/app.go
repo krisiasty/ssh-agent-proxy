@@ -85,8 +85,8 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 	log.Info("starting",
 		"upstream", cfg.Upstream,
 		"cache_seconds", int64(cacheTTL/time.Second),
-		"telemetry_sample_interval", telemetrySampleInterval.String(),
-		"telemetry_report_interval", telemetryReportInterval.String())
+		"telemetry_sample", telemetrySampleInterval.String(),
+		"telemetry_report", telemetryReportInterval.String())
 
 	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
 	if err := srv.Run(ctx, cfg.Groups); err != nil {
