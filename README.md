@@ -249,12 +249,12 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 
 | Key                 | Required | Description                                                             |
 | ------------------- | -------- | ----------------------------------------------------------------------- |
-| `upstream`          | yes      | Path to the upstream SSH agent socket. Env vars (`${VAR}`) and `~` are expanded. |
+| `upstream`          | yes      | Absolute path to the upstream SSH agent socket. Environment variables and `~` are not expanded. |
 | `debug`             | no       | `true` for verbose logging (default `false`).                           |
 | `groups`            | no       | List of groups. With none defined, no keys are exposed.                 |
 | `groups[].name`     | yes\*    | Unique name for the group (used in logs). \*Required if the group exists.|
 | `groups[].enabled`  | no       | `true` (default) to expose the group, `false` to skip it.               |
-| `groups[].socket`   | yes\*    | Socket path this group is exposed on (\*required if the group exists).  |
+| `groups[].socket`   | yes\*    | Absolute socket path this group is exposed on; no environment-variable or `~` expansion (\*required if the group exists). |
 | `groups[].keys`     | no       | Ordered list of key entries assigned to the group.                      |
 | `groups[].keys[].comment` | no\* | Exact, case-sensitive key comment. \*Exactly one match field is required per entry. |
 | `groups[].keys[].md5` | no\* | MD5 fingerprint, with an optional `MD5:` prefix.                        |
@@ -263,6 +263,8 @@ The config file is YAML, stored at `os.UserConfigDir()/ssh-agent-proxy/config.ya
 Notes:
 
 - Each group needs a **unique `name`**; it appears in log messages.
+- `upstream` and group socket paths must be written as absolute paths. Values such
+  as `${SSH_AUTH_SOCK}` and `~/.ssh/agent.sock` are not expanded.
 - Enabled groups must use distinct socket paths, including paths that become
   equivalent after cleaning or resolving existing symlinked directories. An enabled
   group socket also cannot resolve to the upstream agent socket.
@@ -277,14 +279,14 @@ Notes:
 - Keys appear in a group in the order their entries are listed.
 - A config entry that matches several upstream keys includes them all; one that matches
   no upstream key is skipped.
-- On macOS run as a LaunchAgent, `${SSH_AUTH_SOCK}` may not be present in the service's
-  environment; if the upstream agent isn't found, set an explicit `upstream:` path.
+- On macOS, configure the LaunchAgent with the upstream agent's explicit absolute
+  socket path; do not use `${SSH_AUTH_SOCK}` in the configuration.
 
 ### Sample configuration
 
 ```yaml
 # Path to the upstream SSH agent socket (required).
-upstream: ${SSH_AUTH_SOCK}
+upstream: /absolute/path/to/upstream-agent.sock
 
 # Verbose logging.
 debug: false
@@ -294,14 +296,14 @@ debug: false
 groups:
   - name: work
     enabled: true
-    socket: ~/.ssh/agent-work.sock
+    socket: /absolute/path/to/agent-work.sock
     keys:
       - comment: "laptop@work"
       - sha256: "SHA256:9N6igGbuSz87xjbn/QUg/C5yfT1nLBMw+MkKnZoOrLI"
 
   - name: personal
     enabled: false
-    socket: ~/.ssh/agent-personal.sock
+    socket: /absolute/path/to/agent-personal.sock
     keys:
       - md5: "MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9"
 ```
