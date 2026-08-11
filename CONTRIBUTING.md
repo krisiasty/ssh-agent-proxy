@@ -20,9 +20,13 @@ go mod tidy
 go mod verify
 gofmt -w .
 go vet ./...
+golangci-lint run ./...
 go test -race ./...
 go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 ```
+
+The integration tests use `ssh-agent`, `ssh-add`, and `ssh-keygen` when they are
+available. CI requires and exercises all three OpenSSH tools on Linux and macOS.
 
 Use `actionlint` when changing files under `.github/workflows`. To validate release
 packaging without publishing anything, run:
