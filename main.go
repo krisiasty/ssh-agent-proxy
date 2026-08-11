@@ -43,6 +43,7 @@ func run() error {
 		fStart      = flag.Bool("start", false, "start the service, then exit")
 		fStop       = flag.Bool("stop", false, "stop the service, then exit")
 		fRestart    = flag.Bool("restart", false, "restart the service, then exit")
+		fReload     = flag.Bool("reload", false, "reload the running service configuration, then exit")
 		fStatus     = flag.Bool("status", false, "print service status, then exit")
 		fDiag       = flag.Bool("diag", false, "check configuration, service, upstream, and group health, then exit")
 		fList       = flag.Bool("list", false, "list upstream keys as ready-to-paste config entries")
@@ -73,7 +74,7 @@ func run() error {
 	// Ensure at most one lifecycle action is requested.
 	actions := map[string]bool{
 		"-install": *fInstall, "-reinstall": *fReinstall, "-uninstall": *fUninstall,
-		"-start": *fStart, "-stop": *fStop, "-restart": *fRestart,
+		"-start": *fStart, "-stop": *fStop, "-restart": *fRestart, "-reload": *fReload,
 		"-status": *fStatus, "-diag": *fDiag, "-list": *fList,
 	}
 	var chosen string
@@ -102,7 +103,7 @@ func run() error {
 				return err
 			}
 			if created {
-				fmt.Printf("created default config: %s\nedit it, then restart\n", cfgPath)
+				fmt.Printf("created default config: %s\nedit it, then send SIGHUP to reload\n", cfgPath)
 			}
 		}
 		return app.Run(cfgPath, *fForeground, time.Duration(*fCache)*time.Second, app.Version{Version: version, Commit: commit, Date: date})
@@ -162,6 +163,11 @@ func manageService(cfgPath, action string, cacheSeconds int) error {
 			return err
 		}
 		fmt.Println("ssh-agent-proxy restarted.")
+	case "-reload":
+		if err := mgr.Reload(); err != nil {
+			return err
+		}
+		fmt.Println("ssh-agent-proxy reload requested.")
 	case "-status":
 		st, err := mgr.Status()
 		if err != nil {
@@ -187,5 +193,5 @@ func printInstalled(cfgPath string, mgr service.Manager) {
 	fmt.Println("ssh-agent-proxy installed and started.")
 	fmt.Printf("  config: %s\n", cfgPath)
 	fmt.Printf("  logs:   %s\n", mgr.LogHint())
-	fmt.Println("\nEdit the config, then run: ssh-agent-proxy -restart")
+	fmt.Println("\nEdit the config, then run: ssh-agent-proxy -reload")
 }

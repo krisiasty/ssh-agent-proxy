@@ -4,7 +4,6 @@ package peercreds
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -17,41 +16,42 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func get(ctx context.Context, conn io.Reader) (info Info, retErr error) {
+func get(ctx context.Context, conn io.Reader) (Info, error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return Info{}, io.EOF
 	}
 
-	f, err := uc.File()
+	raw, err := uc.SyscallConn()
 	if err != nil {
 		return Info{}, err
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("closing peer socket descriptor: %w", err))
+	var cred *unix.Xucred
+	var pid int
+	var credErr, pidErr error
+	if err := raw.Control(func(fd uintptr) {
+		// Read UID from LOCAL_PEERCRED (struct xucred).
+		cred, credErr = unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
+		if credErr == nil {
+			// Read PID from LOCAL_PEERPID socket option.
+			pid, pidErr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
 		}
-	}()
-
-	fd := int(f.Fd())
-
-	// Read UID from LOCAL_PEERCRED (struct xucred).
-	cred, err := unix.GetsockoptXucred(fd, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
-	if err != nil {
+	}); err != nil {
 		return Info{}, err
 	}
-
-	// Read PID from LOCAL_PEERPID socket option.
-	pid, err := unix.GetsockoptInt(fd, unix.SOL_LOCAL, unix.LOCAL_PEERPID)
-	if err != nil {
+	if credErr != nil {
+		return Info{}, credErr
+	}
+	if pidErr != nil {
 		// Return UID — PID may be unavailable if socket is not connected.
+		//nolint:nilerr // UID remains useful when the optional PID lookup fails.
 		return Info{UID: cred.Uid}, nil
 	}
 	if pid < 0 || pid > math.MaxInt32 {
 		return Info{UID: cred.Uid}, fmt.Errorf("peer PID %d is outside the supported range", pid)
 	}
 
-	info = Info{
+	info := Info{
 		PID: int32(pid),
 		UID: cred.Uid,
 	}

@@ -90,8 +90,9 @@ func (m *launchdManager) Reinstall() error { return reinstall(m) }
 
 func (m *launchdManager) LogHint() string { return m.logPath }
 
-func (m *launchdManager) Start() error { return m.launchctl("start", Label) }
-func (m *launchdManager) Stop() error  { return m.launchctl("stop", Label) }
+func (m *launchdManager) Start() error  { return m.launchctl("start", Label) }
+func (m *launchdManager) Stop() error   { return m.launchctl("stop", Label) }
+func (m *launchdManager) Reload() error { return reloadService(m, signalReload) }
 
 func (m *launchdManager) Restart() error {
 	st, err := m.Status()

@@ -83,10 +83,10 @@ ssh-agent-proxy -install
 
 Runtime logs use JSON Lines; see [Logging](#logging) for the default and debug output.
 
-Then edit the config (see below) and restart:
+Then edit the config (see below) and reload:
 
 ```sh
-ssh-agent-proxy -restart
+ssh-agent-proxy -reload
 ```
 
 ## Uninstallation
@@ -108,6 +108,7 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 | `-start`       | Start the service, then exit.                                          |
 | `-stop`        | Stop the service, then exit.                                           |
 | `-restart`     | Restart the service, then exit.                                        |
+| `-reload`      | Ask the running managed service to reload its config, then exit.       |
 | `-status`      | Print service status (installed / running), then exit.                 |
 | `-diag`        | Check configuration, service, upstream, and group health, then exit.   |
 | `-list`        | List upstream keys as ready-to-paste config entries, then exit.        |
@@ -120,6 +121,25 @@ The lifecycle flags are mutually exclusive. With no flag, the tool runs the prox
 the foreground of the current process — this is how the service manager runs it.
 When installing or reinstalling a managed service, the selected `--cache` value is
 saved in its service definition.
+
+### Reloading configuration
+
+```sh
+ssh-agent-proxy -reload
+```
+
+sends `SIGHUP` to the running managed service. The process reads and validates its
+configured file before disturbing the active proxy. If validation fails, it logs the
+error and keeps serving the current configuration. After successful validation it
+replaces the upstream connection and group listeners; existing client connections are
+closed so clients reconnect against the new authorization state.
+
+If replacement startup fails—for example, because a new socket cannot be bound—the
+proxy restores the previous working configuration. A managed service that is idling
+after an initial config or upstream error can also recover when reloaded. A foreground
+process accepts `SIGHUP` directly; `-reload` specifically targets the installed managed
+service. The command-line `--cache` value is not reloaded because it is stored in the
+service definition.
 
 ### Diagnosing service health
 
@@ -257,7 +277,7 @@ expired cache; concurrent misses share one refresh and increment `waits` while b
 
 ### Debug logging
 
-Set `debug: true` in the configuration and restart the proxy to include debug records.
+Set `debug: true` in the configuration and reload the proxy to include debug records.
 Debug mode adds:
 
 - runtime and proxy telemetry immediately after group startup and every ten minutes;
@@ -374,11 +394,12 @@ groups:
       - md5: "MD5:d7:4a:ab:42:5a:c8:a6:fc:c3:a2:c2:9d:86:bc:4b:a9"
 ```
 
-Configuration is read once at startup; run `ssh-agent-proxy -restart` to apply changes.
+Configuration is read at startup and on `SIGHUP`; run `ssh-agent-proxy -reload` to apply
+changes to a managed service.
 
 If the config cannot be read or validated, or the initial upstream connection cannot be
 opened, the service logs the error and idles rather than exiting into a restart loop. Fix
-the config or upstream agent and restart the service. In `-foreground` mode it returns
+the config or upstream agent and reload the service. In `-foreground` mode it returns
 the error and exits instead. With no enabled groups, it idles without connecting to the
 upstream agent because it has no sockets to serve.
 
