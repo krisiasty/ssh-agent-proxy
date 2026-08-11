@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +54,10 @@ type Server struct {
 	listen            func(context.Context, string) (net.Listener, error)
 	onReady           func()
 	telemetry         *proxyTelemetry
+	clientsMu         sync.Mutex
+	clients           map[net.Conn]struct{}
+	clientsClosing    bool
+	clientWG          sync.WaitGroup
 }
 
 // nextConnID returns a random 8-character hex string for log correlation.
@@ -67,7 +72,13 @@ func (s *Server) nextConnID() string {
 
 // NewServer returns a Server that forwards to the upstream agent socket.
 func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
-	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, telemetry: newProxyTelemetry(ctx, log)}
+	s := &Server{
+		upstream:  upstream,
+		cacheTTL:  cacheTTL,
+		log:       log,
+		telemetry: newProxyTelemetry(ctx, log),
+		clients:   make(map[net.Conn]struct{}),
+	}
 	s.newUpstreamClient = func(ctx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
 		return newReconnectClientWithTelemetry(ctx, upstream, log, s.telemetry)
 	}
@@ -176,7 +187,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		ln, err := s.listen(ctx, g.Socket)
 		if err != nil {
 			listenErr := fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
-			return errors.Join(listenErr, s.closeListeners(listeners))
+			return errors.Join(listenErr, s.closeServing(listeners))
 		}
 		listeners = append(listeners, ln)
 		logAttrs := []any{"group", g.Name, "socket", g.Socket}
@@ -197,10 +208,14 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	select {
 	case <-ctx.Done():
 		s.log.Info("shutting down")
-		return s.closeListeners(listeners)
+		return s.closeServing(listeners)
 	case err := <-acceptFailures:
-		return errors.Join(err, s.closeListeners(listeners))
+		return errors.Join(err, s.closeServing(listeners))
 	}
+}
+
+func (s *Server) closeServing(listeners []net.Listener) error {
+	return errors.Join(s.closeListeners(listeners), s.closeClients())
 }
 
 func (s *Server) closeListeners(listeners []net.Listener) error {
@@ -354,8 +369,55 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group
 			return fmt.Errorf("%w: group %q socket %q: %w", ErrListenerFailure, g.Name, g.Socket, err)
 		}
 		retryDelay = 0
-		go s.serveConn(ctx, conn, g, authorization, upClient)
+		s.startClient(ctx, conn, g, authorization, upClient)
 	}
+}
+
+func (s *Server) startClient(ctx context.Context, conn net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
+	s.clientsMu.Lock()
+	if s.clientsClosing {
+		s.clientsMu.Unlock()
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.log.Debug("closing client accepted during shutdown", "err", err)
+		}
+		return
+	}
+	s.clients[conn] = struct{}{}
+	s.clientWG.Add(1)
+	s.clientsMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.clientsMu.Lock()
+			delete(s.clients, conn)
+			s.clientsMu.Unlock()
+			s.clientWG.Done()
+		}()
+		s.serveConn(ctx, conn, g, authorization, upClient)
+	}()
+}
+
+func (s *Server) closeClients() error {
+	s.clientsMu.Lock()
+	s.clientsClosing = true
+	clients := make([]net.Conn, 0, len(s.clients))
+	for conn := range s.clients {
+		clients = append(clients, conn)
+	}
+	s.clientsMu.Unlock()
+
+	var closeErr error
+	shutdownDeadline := time.Now()
+	for _, conn := range clients {
+		if err := conn.SetDeadline(shutdownDeadline); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErr = errors.Join(closeErr, fmt.Errorf("interrupting client connection: %w", err))
+		}
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErr = errors.Join(closeErr, fmt.Errorf("closing client connection: %w", err))
+		}
+	}
+	s.clientWG.Wait()
+	return closeErr
 }
 
 func waitForAcceptRetry(ctx context.Context, delay time.Duration) bool {

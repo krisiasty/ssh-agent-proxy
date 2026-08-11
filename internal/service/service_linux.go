@@ -89,6 +89,7 @@ func (m *systemdManager) LogHint() string {
 func (m *systemdManager) Start() error   { return m.systemctl("start", unitName) }
 func (m *systemdManager) Stop() error    { return m.systemctl("stop", unitName) }
 func (m *systemdManager) Restart() error { return m.systemctl("restart", unitName) }
+func (m *systemdManager) Reload() error  { return reloadService(m, signalReload) }
 
 func (m *systemdManager) Status() (Status, error) {
 	st := Status{}

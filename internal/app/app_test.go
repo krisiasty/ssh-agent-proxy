@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/proxy"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 func TestShouldReturnProxyError(t *testing.T) {
@@ -161,6 +164,82 @@ func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 	}
 }
 
+func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) {
+	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
+	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-reload-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("removing test directory: %v", err)
+		}
+	})
+
+	upstream := startTestAgent(t, filepath.Join(dir, "upstream.sock"))
+	configPath := filepath.Join(dir, "config.yaml")
+	firstSocket := filepath.Join(dir, "first.sock")
+	secondSocket := filepath.Join(dir, "second.sock")
+	writeReloadConfig(t, configPath, upstream, "first", firstSocket)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithReload(ctx, reload, configPath, true, 0, Version{Version: "test", Commit: "none", Date: "unknown"})
+	}()
+	waitForAgentSocket(t, firstSocket)
+	var dialer net.Dialer
+	persistentConn, err := dialer.DialContext(t.Context(), "unix", firstSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = persistentConn.Close() }()
+	if _, err := agent.NewClient(persistentConn).List(); err != nil {
+		t.Fatalf("listing through persistent pre-reload connection: %v", err)
+	}
+
+	if err := os.WriteFile(configPath, []byte("not: valid: yaml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reload <- syscall.SIGHUP
+	time.Sleep(100 * time.Millisecond)
+	waitForAgentSocket(t, firstSocket)
+
+	writeReloadConfig(t, configPath, upstream, "second", secondSocket)
+	reload <- syscall.SIGHUP
+	waitForAgentSocket(t, secondSocket)
+	waitForPathRemoval(t, firstSocket)
+	waitForConnectionClose(t, persistentConn)
+
+	secondConn, err := dialer.DialContext(t.Context(), "unix", secondSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = secondConn.Close() }()
+	if _, err := agent.NewClient(secondConn).List(); err != nil {
+		t.Fatalf("listing through second persistent connection: %v", err)
+	}
+	failedSocket := filepath.Join(dir, "failed.sock")
+	writeReloadConfig(t, configPath, filepath.Join(dir, "missing-upstream.sock"), "failed", failedSocket)
+	reload <- syscall.SIGHUP
+	waitForConnectionClose(t, secondConn)
+	waitForAgentSocket(t, secondSocket)
+	if _, err := os.Lstat(failedSocket); !os.IsNotExist(err) {
+		t.Errorf("failed replacement left socket %q behind: %v", failedSocket, err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWithReload() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runWithReload() did not stop after cancellation")
+	}
+}
+
 func writeRuntimeConfig(t *testing.T, upstream string) string {
 	t.Helper()
 
@@ -171,4 +250,85 @@ func writeRuntimeConfig(t *testing.T, upstream string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func startTestAgent(t *testing.T, socket string) string {
+	t.Helper()
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(t.Context(), "unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		keyring := agent.NewKeyring()
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(agentConn net.Conn) {
+				defer func() { _ = agentConn.Close() }()
+				_ = agent.ServeAgent(keyring, agentConn)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing test agent: %v", err)
+		}
+		<-done
+	})
+	return socket
+}
+
+func writeReloadConfig(t *testing.T, path, upstream, group, socket string) {
+	t.Helper()
+	body := fmt.Sprintf("upstream: %q\ngroups:\n  - name: %q\n    socket: %q\n", upstream, group, socket)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForAgentSocket(t *testing.T, socket string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		_, err := proxy.ListAgentKeys(ctx, socket)
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("agent socket %q did not become ready", socket)
+}
+
+func waitForPathRemoval(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("path %q was not removed", path)
+}
+
+func waitForConnectionClose(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("pre-reload client connection remained open")
+	} else {
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatal("pre-reload client connection was not closed")
+		}
+	}
 }

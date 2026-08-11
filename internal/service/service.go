@@ -37,10 +37,31 @@ type Manager interface {
 	Start() error
 	Stop() error
 	Restart() error
+	Reload() error
 	Status() (Status, error)
 	// LogHint describes where the service's logs go, phrased to read after
 	// "logs:" (a file path on macOS, a journalctl command on Linux).
 	LogHint() string
+}
+
+func reloadService(m Manager, signal func(string) error) error {
+	st, err := m.Status()
+	if err != nil {
+		return err
+	}
+	if !st.Installed {
+		return errors.New("ssh-agent-proxy is not installed")
+	}
+	if !st.Running {
+		return errors.New("ssh-agent-proxy is not running")
+	}
+	if st.PID == "" {
+		return errors.New("ssh-agent-proxy service has no process id")
+	}
+	if err := signal(st.PID); err != nil {
+		return fmt.Errorf("signaling ssh-agent-proxy process %s: %w", st.PID, err)
+	}
+	return nil
 }
 
 // reinstall replaces an existing installation: uninstall (only if currently
