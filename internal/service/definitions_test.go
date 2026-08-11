@@ -46,6 +46,13 @@ func TestRenderSystemdUnitEscapesArguments(t *testing.T) {
 	if program != executable {
 		t.Errorf("program = %q, want %q", program, executable)
 	}
+	parsedArgs, err := parseSystemdExecStart(unit)
+	if err != nil {
+		t.Fatalf("parseSystemdExecStart() error = %v", err)
+	}
+	if got := configArgument(parsedArgs); got != cfgPath {
+		t.Errorf("configArgument() = %q, want %q", got, cfgPath)
+	}
 }
 
 func TestParseSystemdExecStartBinarySupportsLegacyUnit(t *testing.T) {
@@ -143,5 +150,59 @@ func TestParseLaunchdProgramFallsBackToFirstArgument(t *testing.T) {
 func TestParseLaunchdProgramRejectsMalformedEscape(t *testing.T) {
 	if _, err := parseLaunchdProgram(`{ "Program" = "/Applications/bad\qpath"; }`); err == nil {
 		t.Fatal("parseLaunchdProgram() error = nil, want malformed escape error")
+	}
+}
+
+func TestParseLaunchdArguments(t *testing.T) {
+	want := []string{"/Applications/SSH Agent Proxy/proxy", "-config", "/Users/test/config.yaml", "--cache", "3"}
+	quoted := make([]string, 0, len(want))
+	for _, arg := range want {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	output := `{ "ProgramArguments" = (` + strings.Join(quoted, ", ") + `); }`
+
+	got, err := parseLaunchdArguments(output)
+	if err != nil {
+		t.Fatalf("parseLaunchdArguments() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseLaunchdArguments() = %#v, want %#v", got, want)
+	}
+	if gotConfig := configArgument(got); gotConfig != want[2] {
+		t.Errorf("configArgument() = %q, want %q", gotConfig, want[2])
+	}
+}
+
+func TestParseLaunchdPlistArguments(t *testing.T) {
+	want := []string{"/usr/local/bin/ssh-agent-proxy", "-config", "/Users/test/config.yaml", "--cache", "3"}
+	data, err := renderLaunchdPlist(Label, want, "/tmp/proxy.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseLaunchdPlistArguments(data)
+	if err != nil {
+		t.Fatalf("parseLaunchdPlistArguments() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseLaunchdPlistArguments() = %#v, want %#v", got, want)
+	}
+}
+
+func TestConfigArgumentSupportsFlagForms(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "short separate", args: []string{"proxy", "-config", "/short"}, want: "/short"},
+		{name: "long separate", args: []string{"proxy", "--config", "/long"}, want: "/long"},
+		{name: "short equals", args: []string{"proxy", "-config=/short-equals"}, want: "/short-equals"},
+		{name: "long equals", args: []string{"proxy", "--config=/long-equals"}, want: "/long-equals"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := configArgument(test.args); got != test.want {
+				t.Errorf("configArgument(%q) = %q, want %q", test.args, got, test.want)
+			}
+		})
 	}
 }

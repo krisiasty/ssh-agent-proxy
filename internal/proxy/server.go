@@ -429,22 +429,37 @@ func ListUpstream(upstream string, w io.Writer) (retErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	conn, err := dialer.DialContext(ctx, "unix", upstream)
+	ks, err := ListAgentKeys(ctx, upstream)
 	if err != nil {
-		return fmt.Errorf("connecting to upstream agent %q: %w", upstream, err)
-	}
-	defer func() {
-		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			retErr = errors.Join(retErr, fmt.Errorf("closing upstream agent connection: %w", err))
-		}
-	}()
-
-	ks, err := agent.NewClient(conn).List()
-	if err != nil {
-		return fmt.Errorf("listing upstream keys: %w", err)
+		return err
 	}
 	_, err = io.WriteString(w, formatKeys(ks))
 	return err
+}
+
+// ListAgentKeys connects to an SSH agent socket and returns its identities.
+// The context bounds both connecting and the agent request.
+func ListAgentKeys(ctx context.Context, socket string) (ks []*agent.Key, retErr error) {
+	conn, err := dialer.DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to agent %q: %w", socket, err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("closing agent connection: %w", err))
+		}
+	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting agent connection deadline: %w", err)
+		}
+	}
+
+	ks, err = agent.NewClient(conn).List()
+	if err != nil {
+		return nil, fmt.Errorf("listing agent keys: %w", err)
+	}
+	return ks, nil
 }
 
 // formatKeys renders the upstream keys as commented config entries.

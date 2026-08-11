@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/app"
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/diag"
 	"github.com/krisiasty/ssh-agent-proxy/internal/proxy"
 	"github.com/krisiasty/ssh-agent-proxy/internal/service"
 )
@@ -42,6 +44,7 @@ func run() error {
 		fStop       = flag.Bool("stop", false, "stop the service, then exit")
 		fRestart    = flag.Bool("restart", false, "restart the service, then exit")
 		fStatus     = flag.Bool("status", false, "print service status, then exit")
+		fDiag       = flag.Bool("diag", false, "check configuration, service, upstream, and group health, then exit")
 		fList       = flag.Bool("list", false, "list upstream keys as ready-to-paste config entries")
 		fForeground = flag.Bool("foreground", false, "run in the foreground, logging to stdout")
 		fConfig     = flag.String("config", "", "path to config file (default: <user config dir>/ssh-agent-proxy/config.yaml)")
@@ -71,7 +74,7 @@ func run() error {
 	actions := map[string]bool{
 		"-install": *fInstall, "-reinstall": *fReinstall, "-uninstall": *fUninstall,
 		"-start": *fStart, "-stop": *fStop, "-restart": *fRestart,
-		"-status": *fStatus, "-list": *fList,
+		"-status": *fStatus, "-diag": *fDiag, "-list": *fList,
 	}
 	var chosen string
 	for name, set := range actions {
@@ -87,6 +90,8 @@ func run() error {
 	switch chosen {
 	case "-list":
 		return listKeys(cfgPath)
+	case "-diag":
+		return diag.Run(context.Background(), cfgPath, *fCache, os.Stdout)
 	case "":
 		// No lifecycle action: run the service runtime. In foreground mode,
 		// scaffold a default config if none exists yet so the tool can be
