@@ -2,7 +2,7 @@ package proxy
 
 import (
 	"context"
-	"crypto/dsa"
+	"crypto/dsa" //nolint:staticcheck // DSA is inspected only to report the size of legacy upstream public keys.
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -66,8 +66,8 @@ func (s *Server) nextConnID() string {
 }
 
 // NewServer returns a Server that forwards to the upstream agent socket.
-func NewServer(upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
-	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, telemetry: newProxyTelemetry(log)}
+func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) *Server {
+	s := &Server{upstream: upstream, cacheTTL: cacheTTL, log: log, telemetry: newProxyTelemetry(ctx, log)}
 	s.newUpstreamClient = func(ctx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
 		return newReconnectClientWithTelemetry(ctx, upstream, log, s.telemetry)
 	}

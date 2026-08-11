@@ -69,7 +69,7 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 	}
 
 	log := logging.Setup(cfg.Debug)
-	srv := proxy.NewServer(cfg.Upstream, cacheTTL, log)
+	srv := proxy.NewServer(ctx, cfg.Upstream, cacheTTL, log)
 	if cfg.Debug {
 		telemetryCtx, stopTelemetry := context.WithCancel(ctx)
 		telemetry := newRuntimeTelemetry(log)

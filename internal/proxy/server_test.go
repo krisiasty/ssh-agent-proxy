@@ -26,7 +26,7 @@ import (
 func TestAcceptLoopTreatsShutdownClosureAsClean(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	listener := newScriptedListener(net.ErrClosed)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -43,7 +43,7 @@ func TestAcceptLoopTreatsShutdownClosureAsClean(t *testing.T) {
 func TestAcceptLoopRetriesTemporaryFailure(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	temporaryErr := &injectedTemporaryError{err: errors.New("file descriptor pressure")}
 	listener := newScriptedListener(temporaryErr, net.ErrClosed)
 
@@ -68,7 +68,7 @@ func TestAcceptLoopRetriesTemporaryFailure(t *testing.T) {
 func TestAcceptLoopReportsTerminalFailure(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	terminalErr := errors.New("terminal accept error")
 	listener := newScriptedListener(terminalErr)
 
@@ -92,7 +92,7 @@ func TestAcceptLoopReportsTerminalFailure(t *testing.T) {
 
 func TestServerRunPropagatesTerminalAcceptFailure(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	terminalErr := errors.New("terminal accept error")
 	listener := newScriptedListener(terminalErr)
 	srv.listen = func(context.Context, string) (net.Listener, error) {
@@ -201,7 +201,7 @@ func TestServerRunWithoutEnabledGroupsDoesNotDialUpstream(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), missingUpstream, 0, slog.New(slog.DiscardHandler))
 
 	t.Run("no groups", func(t *testing.T) {
 		t.Parallel()
@@ -230,7 +230,7 @@ func TestServerRunSignalsReadyWithoutEnabledGroups(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 	var readyCalls atomic.Int64
 	srv.SetReadyCallback(func() {
 		readyCalls.Add(1)
@@ -248,7 +248,7 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	t.Parallel()
 
 	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(missingUpstream, 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), missingUpstream, 0, slog.New(slog.DiscardHandler))
 	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
 
 	err := srv.Run(t.Context(), groups)
@@ -263,7 +263,7 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	srv.SetReadyCallback(func() {
 		log.Info("server ready callback")
 	})
@@ -384,7 +384,7 @@ groups:
 func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := NewServer("unused", 0, log)
+	srv := NewServer(t.Context(), "unused", 0, log)
 	keyring := newTestKeyring(t)
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)
@@ -516,7 +516,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	path := filepath.Join(dir, "group.sock")
 	live := listenUnix(t, path)
 
-	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if ln != nil {
 		closeListener(t, ln)
@@ -542,7 +542,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 		t.Fatalf("creating stale socket: %v", err)
 	}
 
-	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 	ln, err := srv.listen(t.Context(), path)
 	if err != nil {
 		t.Fatalf("listen() error = %v, want nil", err)
@@ -556,7 +556,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 func TestListenerClosePreservesReplacementSocket(t *testing.T) {
 	dir := shortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
-	srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 
 	owned, err := srv.listen(t.Context(), path)
 	if err != nil {
@@ -615,7 +615,7 @@ func TestSocketLockHelper(t *testing.T) {
 
 	switch want {
 	case "blocked":
-		srv := NewServer("unused", 0, slog.New(slog.DiscardHandler))
+		srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 		upstreamCalled := false
 		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
 			upstreamCalled = true

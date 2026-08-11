@@ -73,10 +73,6 @@ type upstreamCall struct {
 	enabled   bool
 }
 
-func beginUpstreamCall(ctx context.Context, log *slog.Logger, operation string, attrs ...any) upstreamCall {
-	return beginTrackedUpstreamCall(ctx, log, nil, operation, attrs...)
-}
-
 func beginTrackedUpstreamCall(ctx context.Context, log *slog.Logger, telemetry *proxyTelemetry, operation string, attrs ...any) upstreamCall {
 	if !log.Enabled(ctx, slog.LevelDebug) {
 		return upstreamCall{telemetry: telemetry}
@@ -126,10 +122,6 @@ type reconnectClient struct {
 	dial func() (agent.ExtendedAgent, net.Conn, error)
 
 	mu sync.Mutex // guards reconnect: only one goroutine reconnects at a time
-}
-
-func newReconnectClient(parentCtx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
-	return newReconnectClientWithTelemetry(parentCtx, upstream, log, nil)
 }
 
 func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {

@@ -34,8 +34,8 @@ type proxyTelemetry struct {
 	cacheWaits     atomic.Uint64
 }
 
-func newProxyTelemetry(log *slog.Logger) *proxyTelemetry {
-	if !log.Enabled(context.Background(), slog.LevelDebug) {
+func newProxyTelemetry(ctx context.Context, log *slog.Logger) *proxyTelemetry {
+	if !log.Enabled(ctx, slog.LevelDebug) {
 		return nil
 	}
 	return &proxyTelemetry{log: log}

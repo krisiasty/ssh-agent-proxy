@@ -13,7 +13,7 @@ import (
 func TestProxyTelemetryLogsAndResetsInterval(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	telemetry := newProxyTelemetry(log)
+	telemetry := newProxyTelemetry(t.Context(), log)
 	telemetry.clientConnected()
 	telemetry.clientConnected()
 	telemetry.clientDisconnected()
@@ -57,8 +57,8 @@ func TestProxyTelemetryLogsAndResetsInterval(t *testing.T) {
 }
 
 func TestProxyTelemetryDisabledWithoutDebugLogging(t *testing.T) {
-	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	if telemetry := newProxyTelemetry(log); telemetry != nil {
+	log := slog.New(slog.DiscardHandler)
+	if telemetry := newProxyTelemetry(t.Context(), log); telemetry != nil {
 		t.Fatalf("proxy telemetry = %p, want nil at info level", telemetry)
 	}
 }
