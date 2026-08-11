@@ -26,6 +26,7 @@ type Status struct {
 	Running   bool
 	PID       string // process id if running, else ""
 	Program   string // binary path the service is configured to run, else ""
+	Config    string // config path the service is configured to use, else ""
 }
 
 // Manager installs and controls the platform service.

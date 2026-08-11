@@ -116,21 +116,24 @@ func (m *systemdManager) Status() (Status, error) {
 			st.PID = pid
 		}
 	}
-	program, err := m.execStartBinary()
+	args, err := m.execStartArguments()
 	if err != nil {
 		return st, err
 	}
-	st.Program = program
+	if len(args) > 0 {
+		st.Program = args[0]
+	}
+	st.Config = configArgument(args)
 	return st, nil
 }
 
-// execStartBinary reads the binary path from the unit file's ExecStart line.
-func (m *systemdManager) execStartBinary() (string, error) {
+// execStartArguments reads the command from the unit file's ExecStart line.
+func (m *systemdManager) execStartArguments() ([]string, error) {
 	data, err := os.ReadFile(m.unitPath)
 	if err != nil {
-		return "", fmt.Errorf("reading unit file: %w", err)
+		return nil, fmt.Errorf("reading unit file: %w", err)
 	}
-	return parseSystemdExecStartBinary(string(data))
+	return parseSystemdExecStart(string(data))
 }
 
 func (m *systemdManager) systemctl(args ...string) error {

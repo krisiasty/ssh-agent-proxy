@@ -112,6 +112,20 @@ func (m *launchdManager) Status() (Status, error) {
 	st := Status{}
 	if _, err := os.Stat(m.plistPath); err == nil {
 		st.Installed = true
+		data, readErr := os.ReadFile(m.plistPath)
+		if readErr != nil {
+			return st, fmt.Errorf("reading launchd plist: %w", readErr)
+		}
+		args, parseErr := parseLaunchdPlistArguments(data)
+		if parseErr != nil {
+			return st, parseErr
+		}
+		if len(args) > 0 {
+			st.Program = args[0]
+		}
+		st.Config = configArgument(args)
+	} else if !os.IsNotExist(err) {
+		return st, fmt.Errorf("checking launchd plist: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
@@ -126,7 +140,17 @@ func (m *launchdManager) Status() (Status, error) {
 		if parseErr != nil {
 			return st, parseErr
 		}
-		st.Program = program
+		if program != "" {
+			st.Program = program
+		}
+		args, parseErr := parseLaunchdArguments(s)
+		if parseErr != nil {
+			return st, parseErr
+		}
+		if len(args) > 0 {
+			st.Program = args[0]
+			st.Config = configArgument(args)
+		}
 	}
 	return st, nil
 }

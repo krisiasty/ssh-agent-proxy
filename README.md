@@ -109,6 +109,7 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 | `-stop`        | Stop the service, then exit.                                           |
 | `-restart`     | Restart the service, then exit.                                        |
 | `-status`      | Print service status (installed / running), then exit.                 |
+| `-diag`        | Check configuration, service, upstream, and group health, then exit.   |
 | `-list`        | List upstream keys as ready-to-paste config entries, then exit.        |
 | `-foreground`  | Run in the foreground, logging to stdout (for testing / debugging).    |
 | `-config PATH` | Use an alternate config file path.                                     |
@@ -119,6 +120,31 @@ The lifecycle flags are mutually exclusive. With no flag, the tool runs the prox
 the foreground of the current process — this is how the service manager runs it.
 When installing or reinstalling a managed service, the selected `--cache` value is
 saved in its service definition.
+
+### Diagnosing service health
+
+```sh
+ssh-agent-proxy -diag
+```
+
+performs read-only checks of the selected configuration and reports each result as
+`[PASS]`, `[WARN]`, or `[FAIL]`. It verifies that:
+
+- the configuration loads and validates;
+- an installed service is running with the selected config and current executable;
+- the upstream agent accepts an identity request;
+- every selector's match count can be resolved; and
+- each enabled group socket returns the exact expected keys in configured order.
+
+Disabled groups are reported but not probed. An unmatched selector is a warning. An
+invalid config, unreachable upstream, stopped installed service, different installed
+config, unavailable enabled socket, or unexpected group result is a failure. If no
+managed service is installed, responding group sockets are recognized as a foreground
+or otherwise unmanaged proxy.
+
+Diagnostic output contains counts but never prints selector values, key comments,
+fingerprints, or public-key blobs. The command continues independent checks after a
+failure and exits non-zero if any check fails.
 
 ### Discovering your keys
 
