@@ -42,3 +42,6 @@ config.yaml
 
 # GoReleaser output
 /dist/
+
+# graphify knowledge graph output
+graphify-out/
