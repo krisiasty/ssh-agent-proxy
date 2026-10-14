@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,33 +42,15 @@ func TestShouldReturnProxyError(t *testing.T) {
 func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.yaml")
 
-	stdout := os.Stdout
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = write
-	t.Cleanup(func() {
-		os.Stdout = stdout
-	})
-
+	_, finish := captureRuntimeLogs(t)
 	runErr := Run(path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
-	if err := write.Close(); err != nil {
-		t.Fatal(err)
-	}
-	output, err := io.ReadAll(read)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := read.Close(); err != nil {
-		t.Fatal(err)
-	}
+	entries := finish()
 
 	if runErr == nil {
 		t.Fatal("Run() error = nil, want a configuration error")
 	}
-	if len(output) != 0 {
-		t.Errorf("Run() logged foreground error %q, want no output", output)
+	if len(entries) != 0 {
+		t.Errorf("Run() logged foreground error %v, want no output", entries)
 	}
 }
 
@@ -86,43 +67,16 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 	upstream := filepath.Join(t.TempDir(), "missing-agent.sock")
 	path := writeRuntimeConfig(t, upstream)
 
-	stdout := os.Stdout
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = write
-	t.Cleanup(func() {
-		os.Stdout = stdout
-	})
-
+	_, finish := captureRuntimeLogs(t)
 	runErr := run(t.Context(), path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
-	if err := write.Close(); err != nil {
-		t.Fatal(err)
-	}
-	output, err := io.ReadAll(read)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := read.Close(); err != nil {
-		t.Fatal(err)
-	}
 	if runErr == nil {
 		t.Fatal("run() error = nil, want proxy startup error")
 	}
+	entries := finish()
+	if len(entries) != 3 {
+		t.Fatalf("startup emitted %d log lines, want 3: %v", len(entries), entries)
+	}
 
-	lines := bytes.Split(bytes.TrimSpace(output), []byte{'\n'})
-	if len(lines) != 3 {
-		t.Fatalf("startup emitted %d log lines, want 3:\n%s", len(lines), output)
-	}
-	entries := make([]map[string]any, 0, len(lines))
-	for i, line := range lines {
-		var entry map[string]any
-		if err := json.Unmarshal(line, &entry); err != nil {
-			t.Fatalf("startup log line %d is not valid JSON: %v\n%s", i+1, err, line)
-		}
-		entries = append(entries, entry)
-	}
 	configLog := entries[1]
 	if configLog["msg"] != "configuration loaded" ||
 		configLog["config"] != path ||
@@ -143,19 +97,21 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 }
 
 func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
+	events, _ := captureRuntimeLogs(t)
 	path := writeRuntimeConfig(t, filepath.Join(t.TempDir(), "missing-agent.sock"))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- run(ctx, path, false, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	}()
-
+	t.Cleanup(func() { cancel() })
+	waitForRuntimeLog(t, events, "proxy startup error")
+	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
 	select {
 	case err := <-done:
 		t.Fatalf("run() returned before cancellation with error %v", err)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
-
 	cancel()
 	select {
 	case err := <-done:
@@ -506,7 +462,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 					t.Fatal("foreground reload failure tried to restore an unready config")
 				}
 			} else {
-				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
+				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
 			}
 			if calls := backend.listCalls.Load(); calls != 1 {
 				t.Errorf("unready config was retried: List calls = %d, want 1", calls)
@@ -530,7 +486,137 @@ func TestShutdownPrecedesPendingReload(t *testing.T) {
 	}
 }
 
-func captureRuntimeLogs(t *testing.T) (<-chan map[string]any, func() []map[string]any) {
+func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
+	for _, foreground := range []bool{false, true} {
+		name := "managed"
+		if foreground {
+			name = "foreground"
+		}
+		t.Run(name, func(t *testing.T) {
+			events, _ := captureRuntimeLogs(t)
+			dir := testutil.ShortSocketDir(t)
+			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			backend.stall.Store(true)
+			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
+			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
+			writeReloadConfig(t, path, upstream, "initial", socket)
+			ctx, cancel := context.WithCancel(t.Context())
+			reload, done := make(chan os.Signal, 1), make(chan error, 1)
+			go func() { done <- runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) }()
+			var release sync.Once
+			t.Cleanup(func() {
+				cancel()
+				release.Do(func() { close(backend.release) })
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("shutdown: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("runtime did not stop")
+				}
+			})
+			select {
+			case <-backend.blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("initial startup did not stall")
+			}
+			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reload <- syscall.SIGHUP
+			waitForRuntimeLog(t, events, "configuration reload failed; keeping current configuration")
+			// Readiness must still come from the original runtime, even though
+			// the config on disk is invalid and cannot be loaded again.
+			release.Do(func() { close(backend.release) })
+			waitForAgentSocket(t, socket)
+			waitForRuntimeLog(t, events, "configuration reloaded")
+		})
+	}
+}
+
+func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
+	events, finish := captureRuntimeLogs(t)
+	dir := testutil.ShortSocketDir(t)
+	upstream := startTestAgent(t, filepath.Join(dir, "upstream.sock"))
+	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
+	writeReloadConfig(t, path, upstream, "ready", socket)
+	ctx, cancel := context.WithCancel(t.Context())
+	reload, done := make(chan os.Signal, 1), make(chan error, 1)
+	go func() { done <- runWithReload(ctx, reload, path, false, 0, Version{Version: "test"}) }()
+	finished := false
+	t.Cleanup(func() {
+		cancel()
+		if !finished {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("runtime did not stop")
+			}
+		}
+	})
+	waitForAgentSocket(t, socket)
+	// Keep the existing upstream connection alive but prevent rollback from
+	// dialing it again. Both the candidate and the single rollback fail.
+	if err := os.Remove(upstream); err != nil {
+		t.Fatal(err)
+	}
+	writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
+	reload <- syscall.SIGHUP
+	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
+	if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reload <- syscall.SIGHUP
+	waitForRuntimeLog(t, events, "configuration reload failed; remaining idle")
+	cancel()
+	select {
+	case err := <-done:
+		finished = true
+		if err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle service did not stop")
+	}
+	launches := 0
+	for _, entry := range finish() {
+		if entry["msg"] == "configuration loaded" {
+			launches++
+		}
+	}
+	if launches != 3 {
+		t.Errorf("runtime launches = %d, want initial, candidate and one rollback", launches)
+	}
+}
+
+func TestRuntimeLogCaptureRetainsBufferedEvents(t *testing.T) {
+	events, finish := captureRuntimeLogs(t)
+	encoder := json.NewEncoder(os.Stdout)
+	for range 256 {
+		if err := encoder.Encode(map[string]any{"msg": "startup detail"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := encoder.Encode(map[string]any{"msg": "previous configuration restored"}); err != nil {
+		t.Fatal(err)
+	}
+	// Finish decoding before waiting so the old bounded event buffer would
+	// deterministically have dropped the target event.
+	if entries := finish(); len(entries) != 257 {
+		t.Fatalf("captured %d entries, want 257", len(entries))
+	}
+	waitForRuntimeLog(t, events, "previous configuration restored")
+}
+
+type runtimeLogCapture struct {
+	mu      sync.Mutex
+	entries []map[string]any
+	next    int
+	changed chan struct{}
+}
+
+func captureRuntimeLogs(t *testing.T) (*runtimeLogCapture, func() []map[string]any) {
 	t.Helper()
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -538,9 +624,8 @@ func captureRuntimeLogs(t *testing.T) (<-chan map[string]any, func() []map[strin
 	}
 	original := os.Stdout
 	os.Stdout = writer
-	events := make(chan map[string]any, 128)
+	events := &runtimeLogCapture{changed: make(chan struct{}, 1)}
 	done := make(chan struct{})
-	var entries []map[string]any
 	go func() {
 		defer close(done)
 		decoder := json.NewDecoder(reader)
@@ -552,9 +637,11 @@ func captureRuntimeLogs(t *testing.T) (<-chan map[string]any, func() []map[strin
 				}
 				return
 			}
-			entries = append(entries, entry)
+			events.mu.Lock()
+			events.entries = append(events.entries, entry)
+			events.mu.Unlock()
 			select {
-			case events <- entry:
+			case events.changed <- struct{}{}:
 			default:
 			}
 		}
@@ -571,22 +658,29 @@ func captureRuntimeLogs(t *testing.T) (<-chan map[string]any, func() []map[strin
 				t.Error(err)
 			}
 		})
-		return entries
+		return events.entries
 	}
 	t.Cleanup(func() { finish() })
 	return events, finish
 }
 
-func waitForRuntimeLog(t *testing.T, events <-chan map[string]any, message string) {
+func waitForRuntimeLog(t *testing.T, events *runtimeLogCapture, message string) {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
-		select {
-		case entry := <-events:
+		events.mu.Lock()
+		for events.next < len(events.entries) {
+			entry := events.entries[events.next]
+			events.next++
 			if entry["msg"] == message {
+				events.mu.Unlock()
 				return
 			}
+		}
+		events.mu.Unlock()
+		select {
+		case <-events.changed:
 		case <-timer.C:
 			t.Fatalf("timed out waiting for runtime log %q", message)
 		}

@@ -74,7 +74,7 @@ func runWithReload(
 	var current *runtimeInstance
 	var lastGood, next *config.Config
 	var rollbackCause error
-	reloadPending, firstLoad, initialStartup := true, true, false
+	reloadPending, suppressReloadLog := true, true
 
 	stopCurrent := func() error {
 		if current == nil {
@@ -95,7 +95,7 @@ func runWithReload(
 			switch {
 			case rollbackCause != nil:
 				log.Info("previous configuration restored", "config", cfgPath, "groups", len(lastGood.Groups))
-			case !initialStartup:
+			case !suppressReloadLog:
 				log.Info("configuration reloaded", "config", cfgPath, "groups", len(lastGood.Groups))
 			}
 			rollbackCause = nil
@@ -111,7 +111,6 @@ func runWithReload(
 		observeReadiness()
 		if reloadPending {
 			reloadPending = false
-			initialStartup, firstLoad = firstLoad, false
 			candidate, loadErr := config.Load(cfgPath)
 			if ctx.Err() != nil {
 				return stopCurrent()
@@ -119,18 +118,20 @@ func runWithReload(
 			observeReadiness()
 			switch {
 			case loadErr == nil:
-				if !initialStartup {
+				if !suppressReloadLog {
 					log.Info("configuration reload requested", "config", cfgPath)
 				}
 				next, rollbackCause = candidate, nil
-			case current != nil && current.started:
+			case current != nil && (current.started || lastGood == nil):
 				log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
 				continue
-			case lastGood != nil:
+			case current != nil && lastGood != nil:
 				log.Error("configuration reload failed", "err", loadErr)
 				log.Warn("restoring previous configuration")
 				next, rollbackCause = lastGood, loadErr
-				initialStartup = false
+			case lastGood != nil:
+				log.Error("configuration reload failed; remaining idle", "err", loadErr)
+				continue
 			default:
 				stopErr := stopCurrent()
 				if ctx.Err() != nil {
@@ -173,6 +174,7 @@ func runWithReload(
 			continue
 		case <-reload:
 			reloadPending = true
+			suppressReloadLog = false
 		case <-ready:
 			// Commit the configuration at the top of the loop, after checking
 			// shutdown, rather than treating a clean early exit as readiness.
@@ -194,7 +196,6 @@ func runWithReload(
 				log.Error("configuration reload failed", "err", runtimeErr)
 				log.Warn("restoring previous configuration")
 				next, rollbackCause = lastGood, runtimeErr
-				initialStartup = false
 				continue
 			}
 			if rollbackCause != nil {
@@ -203,8 +204,13 @@ func runWithReload(
 			if shouldReturnProxyError(ctx, foreground, runtimeErr) {
 				return runtimeErr
 			}
-			log.Error("proxy runtime error", "err", runtimeErr)
-			log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
+			if !started && lastGood == nil {
+				log.Error("proxy startup error", "err", runtimeErr)
+				log.Error("idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
+			} else {
+				log.Error("proxy runtime error", "err", runtimeErr)
+				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
+			}
 		}
 	}
 }

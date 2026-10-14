@@ -399,3 +399,38 @@ func (l *shutdownFailureListener) Accept() (net.Conn, error) {
 	}
 	return conn, err
 }
+
+func TestServerStartupErrorsDuringCancellation(t *testing.T) {
+	failure := errors.New("injected startup failure")
+	for _, phase := range []string{"dial", "listen"} {
+		for _, cause := range []error{failure, context.Canceled} {
+			t.Run(phase+"/"+cause.Error(), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				srv := NewServer(ctx, "unused", 0, slog.New(slog.DiscardHandler))
+				srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
+					if phase == "dial" {
+						cancel()
+						return nil, fmt.Errorf("dial: %w", cause)
+					}
+					client := &reconnectClient{ctx: ctx, log: log}
+					client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
+					return client, nil
+				}
+				srv.listen = func(context.Context, string) (net.Listener, error) {
+					cancel()
+					return nil, fmt.Errorf("listen: %w", cause)
+				}
+				socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
+				err := srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}})
+				if errors.Is(cause, context.Canceled) {
+					if err != nil {
+						t.Errorf("Run() error = %v, want clean cancellation", err)
+					}
+				} else if !errors.Is(err, failure) {
+					t.Errorf("Run() error = %v, want original failure", err)
+				}
+			})
+		}
+	}
+}
