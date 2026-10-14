@@ -403,6 +403,9 @@ the config or upstream agent and reload the service. In `-foreground` mode it re
 the error and exits instead. With no enabled groups, it idles without connecting to the
 upstream agent because it has no sockets to serve.
 
+Stopping or reloading the service interrupts outstanding upstream requests, allowing
+recovery even when the upstream agent stops responding.
+
 One shared upstream identity list resolves every enabled group during startup. If the
 connected upstream agent is locked or listing otherwise fails, the proxy still starts
 serving and defers resolution until a client request. It picks up matching keys after the

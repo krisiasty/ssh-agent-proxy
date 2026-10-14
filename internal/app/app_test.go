@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -254,6 +256,11 @@ func writeRuntimeConfig(t *testing.T, upstream string) string {
 
 func startTestAgent(t *testing.T, socket string) string {
 	t.Helper()
+	return startTestAgentWithBackend(t, socket, agent.NewKeyring())
+}
+
+func startTestAgentWithBackend(t *testing.T, socket string, backend agent.Agent) string {
+	t.Helper()
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(t.Context(), "unix", socket)
 	if err != nil {
@@ -262,7 +269,6 @@ func startTestAgent(t *testing.T, socket string) string {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		keyring := agent.NewKeyring()
 		for {
 			conn, acceptErr := listener.Accept()
 			if acceptErr != nil {
@@ -270,7 +276,7 @@ func startTestAgent(t *testing.T, socket string) string {
 			}
 			go func(agentConn net.Conn) {
 				defer func() { _ = agentConn.Close() }()
-				_ = agent.ServeAgent(keyring, agentConn)
+				_ = agent.ServeAgent(backend, agentConn)
 			}(conn)
 		}
 	}()
@@ -281,6 +287,87 @@ func startTestAgent(t *testing.T, socket string) string {
 		<-done
 	})
 	return socket
+}
+
+func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
+	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
+	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-reload-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+	upstream := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
+	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+	configPath := filepath.Join(dir, "config.yaml")
+	socket := filepath.Join(dir, "group.sock")
+	writeReloadConfig(t, configPath, upstream, "first", socket)
+	ctx, cancel := context.WithCancel(t.Context())
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithReload(ctx, reload, configPath, false, 0, Version{Version: "test"})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		close(backend.release)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("runWithReload() shutdown error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("runtime did not stop during cleanup")
+		}
+	})
+	waitForAgentSocket(t, socket)
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	backend.stall.Store(true)
+	request := make(chan error, 1)
+	go func() {
+		_, err := agent.NewClient(conn).List()
+		request <- err
+	}()
+	select {
+	case <-backend.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not reach stalled upstream")
+	}
+
+	// Reuse the same socket to verify that reload releases its ownership lock.
+	writeReloadConfig(t, configPath, healthy, "replacement", socket)
+	reload <- syscall.SIGHUP
+	waitForAgentSocket(t, socket)
+	select {
+	case err := <-request:
+		if err == nil {
+			t.Error("blocked request unexpectedly succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reload did not interrupt the old upstream request")
+	}
+	waitForConnectionClose(t, conn)
+}
+
+type reloadBlockingAgent struct {
+	agent.Agent
+	stall     atomic.Bool
+	blocked   chan struct{}
+	release   chan struct{}
+	blockOnce sync.Once
+}
+
+func (a *reloadBlockingAgent) List() ([]*agent.Key, error) {
+	if a.stall.Load() {
+		a.blockOnce.Do(func() { close(a.blocked) })
+		<-a.release
+	}
+	return a.Agent.List()
 }
 
 func writeReloadConfig(t *testing.T, path, upstream, group, socket string) {

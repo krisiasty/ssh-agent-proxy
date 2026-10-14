@@ -101,6 +101,9 @@ func (s *Server) SetReadyCallback(callback func()) {
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
 func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	enabledGroups := make([]config.Group, 0, len(groups))
 	for _, g := range groups {
 		if !g.IsEnabled() {
@@ -141,16 +144,24 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	// dies, so a single failure does not kill all clients.
 	rc, err := s.newUpstreamClient(ctx, s.upstream, s.log)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if rc.telemetry == nil {
 		rc.telemetry = s.telemetry
 	}
+	var listeners []net.Listener
 	defer func() {
+		// Interrupt upstream requests before waiting for client handlers, also
+		// on listener failures while the caller's context is still active.
+		cancel()
 		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Warn("closing upstream connection", "err", err)
 			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 		}
+		runErr = errors.Join(runErr, s.closeServing(listeners))
 	}()
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
@@ -171,6 +182,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		})
 	}
 	allKeys, err := upstream.List()
+	if ctx.Err() != nil {
+		return nil
+	}
 	if err != nil {
 		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
 	} else {
@@ -180,14 +194,13 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 	}
 
-	var listeners []net.Listener
 	acceptFailures := make(chan error, len(egs))
 	for _, eg := range egs {
 		g := eg.g
 		ln, err := s.listen(ctx, g.Socket)
 		if err != nil {
 			listenErr := fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
-			return errors.Join(listenErr, s.closeServing(listeners))
+			return listenErr
 		}
 		listeners = append(listeners, ln)
 		logAttrs := []any{"group", g.Name, "socket", g.Socket}
@@ -208,9 +221,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	select {
 	case <-ctx.Done():
 		s.log.Info("shutting down")
-		return s.closeServing(listeners)
+		return nil
 	case err := <-acceptFailures:
-		return errors.Join(err, s.closeServing(listeners))
+		return err
 	}
 }
 
