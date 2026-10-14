@@ -13,21 +13,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
-	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
 
 func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 	for _, scenario := range []struct {
-		name     string
-		startup  bool
-		sign     bool
-		terminal bool
+		name         string
+		startup      bool
+		sign         bool
+		terminal     bool
+		nilTelemetry bool
 	}{
 		{name: "initial list", startup: true},
+		{name: "initial list without telemetry", startup: true, nilTelemetry: true},
 		{name: "client list"},
 		{name: "client sign", sign: true},
 		{name: "listener failure during list", terminal: true},
@@ -35,14 +35,14 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := shortSocketDir(t)
-			backend := newShutdownAgent(t)
+			backend := newBlockingListAgent(t)
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
 			backend.blockListAt = 2
 			if scenario.startup {
 				backend.blockListAt = 1
 			}
 			if scenario.sign {
-				backend.blockListAt = 0
+				backend.blockListAt = -1
 				backend.blockSign = true
 			}
 			upstream := filepath.Join(dir, "upstream.sock")
@@ -60,6 +60,11 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(t.Context())
 			srv := NewServer(ctx, upstream, 0, slog.New(slog.DiscardHandler))
+			if scenario.nilTelemetry {
+				srv.newUpstreamClient = func(ctx context.Context, socket string, log *slog.Logger) (*reconnectClient, error) {
+					return newReconnectClientWithTelemetry(ctx, socket, log, nil)
+				}
+			}
 			ready := make(chan struct{})
 			srv.SetReadyCallback(func() { close(ready) })
 			var listener *shutdownFailureListener
@@ -80,7 +85,9 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 
 			var request *asyncResult
 			if !scenario.startup {
-				waitForShutdownEvent(t, ready, "proxy readiness")
+				if !waitForEvent(t, ready, "proxy readiness") {
+					return
+				}
 				var dialer net.Dialer
 				conn, dialErr := dialer.DialContext(t.Context(), "unix", socket)
 				if dialErr != nil {
@@ -97,7 +104,9 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 					return listErr
 				})
 			}
-			waitForShutdownEvent(t, backend.blocked, "stalled upstream request")
+			if !waitForEvent(t, backend.started, "stalled upstream request") {
+				return
+			}
 			if scenario.terminal {
 				listener.fail.Store(true)
 				closeListener(t, listener)
@@ -138,7 +147,7 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			name = "explicit close"
 		}
 		t.Run(name, func(t *testing.T) {
-			backend := newShutdownAgent(t)
+			backend := newBlockingListAgent(t)
 			upstream := filepath.Join(shortSocketDir(t), "upstream.sock")
 			serveShutdownAgent(t, upstream, backend)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -167,7 +176,9 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 				reconnected = client.reconnect(original)
 				return nil
 			})
-			waitForShutdownEvent(t, entered, "replacement dial")
+			if !waitForEvent(t, entered, "replacement dial") {
+				return
+			}
 			closed := runAsync(func() error {
 				if !explicitClose {
 					cancel()
@@ -222,46 +233,44 @@ func TestReconnectClientCloseIsFinalAndIdempotent(t *testing.T) {
 	}
 }
 
-type shutdownAgent struct {
-	agent.ExtendedAgent
-	blockListAt int32
-	blockSign   bool
-	listCalls   atomic.Int32
-	blocked     chan struct{}
-	release     chan struct{}
-	blockOnce   sync.Once
-	releaseOnce sync.Once
-}
-
-func newShutdownAgent(t *testing.T) *shutdownAgent {
-	t.Helper()
-	return &shutdownAgent{ExtendedAgent: newTestKeyring(t), blocked: make(chan struct{}), release: make(chan struct{})}
-}
-
-func (a *shutdownAgent) List() ([]*agent.Key, error) {
-	if calls := a.listCalls.Add(1); a.blockListAt > 0 && calls >= a.blockListAt {
-		a.stall()
+func TestServerClosesListenersBeforeUpstream(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	srv := NewServer(t.Context(), "unused", 0, log)
+	listener := newScriptedListener(errors.New("terminal listener failure"))
+	srv.listen = func(context.Context, string) (net.Listener, error) { return listener, nil }
+	transport := &shutdownObservingTransport{onClose: func() {
+		if !listener.Closed() {
+			t.Error("upstream closed before the group listener")
+		}
+		srv.clientsMu.Lock()
+		closing := srv.clientsClosing
+		srv.clientsMu.Unlock()
+		if !closing {
+			t.Error("upstream closed before new clients were refused")
+		}
+	}}
+	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
+		client := &reconnectClient{ctx: ctx, log: log}
+		client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: transport})
+		return client, nil
 	}
-	return a.ExtendedAgent.List()
-}
-
-func (a *shutdownAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	if a.blockSign {
-		a.stall()
+	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	if err := srv.Run(t.Context(), []config.Group{{Name: "test", Socket: socket}}); !errors.Is(err, ErrListenerFailure) {
+		t.Errorf("Run() error = %v, want listener failure", err)
 	}
-	return a.ExtendedAgent.SignWithFlags(key, data, flags)
 }
 
-func (a *shutdownAgent) stall() {
-	a.blockOnce.Do(func() { close(a.blocked) })
-	<-a.release
+type shutdownObservingTransport struct {
+	testUpstreamTransport
+	onClose func()
 }
 
-func (a *shutdownAgent) unblock() {
-	a.releaseOnce.Do(func() { close(a.release) })
+func (c *shutdownObservingTransport) Close() error {
+	c.onClose()
+	return c.testUpstreamTransport.Close()
 }
 
-func serveShutdownAgent(t *testing.T, socket string, backend *shutdownAgent) {
+func serveShutdownAgent(t *testing.T, socket string, backend *blockingListAgent) {
 	t.Helper()
 	listener := listenUnix(t, socket)
 	accepted := make(chan net.Conn, 1)
@@ -284,15 +293,6 @@ func serveShutdownAgent(t *testing.T, socket string, backend *shutdownAgent) {
 		}
 		waitForAsyncStop(t, result, "test upstream agent")
 	})
-}
-
-func waitForShutdownEvent(t *testing.T, event <-chan struct{}, name string) {
-	t.Helper()
-	select {
-	case <-event:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for %s", name)
-	}
 }
 
 type shutdownFailureListener struct {

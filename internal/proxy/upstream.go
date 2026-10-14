@@ -159,10 +159,6 @@ func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string,
 		return nil, fmt.Errorf("initial upstream connection: %w", err)
 	}
 	rc.current.Store(&upstreamConn{client: client, conn: conn})
-	context.AfterFunc(clientCtx, func() {
-		// Close caches its result for the owner's synchronous teardown.
-		_ = rc.Close(clientCtx)
-	})
 	return rc, nil
 }
 

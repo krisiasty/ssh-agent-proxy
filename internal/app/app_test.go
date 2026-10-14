@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -167,16 +168,7 @@ func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 }
 
 func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) {
-	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
-	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-reload-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("removing test directory: %v", err)
-		}
-	})
+	dir := shortSocketDir(t)
 
 	upstream := startTestAgent(t, filepath.Join(dir, "upstream.sock"))
 	configPath := filepath.Join(dir, "config.yaml")
@@ -290,12 +282,7 @@ func startTestAgentWithBackend(t *testing.T, socket string, backend agent.Agent)
 }
 
 func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
-	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
-	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-reload-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := shortSocketDir(t)
 	backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
 	upstream := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
 	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
@@ -352,6 +339,98 @@ func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 		t.Fatal("reload did not interrupt the old upstream request")
 	}
 	waitForConnectionClose(t, conn)
+}
+
+func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
+	for _, replacing := range []bool{false, true} {
+		name := "initial startup"
+		if replacing {
+			name = "replacement startup"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := shortSocketDir(t)
+			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			backend.stall.Store(true)
+			blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
+			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+			configPath := filepath.Join(dir, "config.yaml")
+			socket := filepath.Join(dir, "group.sock")
+			initial := blocked
+			if replacing {
+				initial = healthy
+			}
+			writeReloadConfig(t, configPath, initial, "initial", socket)
+			ctx, cancel := context.WithCancel(t.Context())
+			reload := make(chan os.Signal, 1)
+			done := make(chan error, 1)
+			go func() {
+				done <- runWithReload(ctx, reload, configPath, false, 0, Version{Version: "test"})
+			}()
+			t.Cleanup(func() {
+				cancel()
+				close(backend.release)
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("runtime shutdown: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("runtime did not stop during cleanup")
+				}
+			})
+			if replacing {
+				waitForAgentSocket(t, socket)
+				writeReloadConfig(t, configPath, blocked, "blocked", socket)
+				reload <- syscall.SIGHUP
+			}
+			select {
+			case <-backend.blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("startup did not reach the stalled upstream")
+			}
+			writeReloadConfig(t, configPath, healthy, "recovered", socket)
+			reload <- syscall.SIGHUP
+			// The stalled agent stays blocked until cleanup. Recovery must use
+			// the new configuration and release the previous socket lock.
+			waitForAgentSocket(t, socket)
+		})
+	}
+}
+
+func TestRuntimeWaitReadyRejectsAbortedStartup(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		canceled bool
+		ready    bool
+	}{
+		{name: "nil exit before readiness"},
+		{name: "canceled before readiness", canceled: true},
+		{name: "cancellation races readiness", canceled: true, ready: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ready := make(chan struct{})
+			if scenario.ready {
+				close(ready)
+			}
+			if scenario.canceled {
+				cancel()
+			}
+			instance := &runtimeInstance{cancel: func() {}, done: make(chan error, 1), log: slog.New(slog.DiscardHandler)}
+			instance.done <- nil
+			err := instance.waitReady(ctx, ready, nil)
+			if err == nil {
+				t.Fatal("aborted startup reported successful readiness")
+			}
+			if scenario.canceled && !errors.Is(err, context.Canceled) {
+				t.Errorf("startup error = %v, want cancellation", err)
+			}
+			if err := instance.stop(); err != nil {
+				t.Errorf("clean aborted runtime stop = %v", err)
+			}
+		})
+	}
 }
 
 type reloadBlockingAgent struct {
@@ -418,4 +497,19 @@ func waitForConnectionClose(t *testing.T, conn net.Conn) {
 			t.Fatal("pre-reload client connection was not closed")
 		}
 	}
+}
+
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
+	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-reload-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("removing test directory: %v", err)
+		}
+	})
+	return dir
 }

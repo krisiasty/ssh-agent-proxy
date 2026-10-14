@@ -701,3 +701,14 @@ func removeSocket(t *testing.T, path string) {
 		t.Errorf("removing socket: %v", err)
 	}
 }
+
+func waitForEvent(t *testing.T, event <-chan struct{}, name string) bool {
+	t.Helper()
+	select {
+	case <-event:
+		return true
+	case <-time.After(5 * time.Second):
+		t.Errorf("timed out waiting for %s", name)
+		return false
+	}
+}

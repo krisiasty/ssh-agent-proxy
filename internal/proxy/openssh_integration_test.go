@@ -132,15 +132,7 @@ func runAsync(fn func() error) *asyncResult {
 
 func waitForAsyncStop(t *testing.T, result *asyncResult, name string) bool {
 	t.Helper()
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-result.done:
-		return true
-	case <-timer.C:
-		t.Errorf("timed out waiting for %s to stop", name)
-		return false
-	}
+	return waitForEvent(t, result.done, name+" to stop")
 }
 
 func waitForIntegrationSocket(t *testing.T, path string, result *asyncResult, diagnostic func() string) {

@@ -149,19 +149,20 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 		return err
 	}
-	if rc.telemetry == nil {
-		rc.telemetry = s.telemetry
-	}
 	var listeners []net.Listener
 	defer func() {
-		// Interrupt upstream requests before waiting for client handlers, also
-		// on listener failures while the caller's context is still active.
+		// Refuse accepted clients and close listeners before interrupting the
+		// upstream, then wait for the handlers that were already running.
+		s.clientsMu.Lock()
+		s.clientsClosing = true
+		s.clientsMu.Unlock()
+		runErr = errors.Join(runErr, s.closeListeners(listeners))
 		cancel()
 		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Warn("closing upstream connection", "err", err)
 			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 		}
-		runErr = errors.Join(runErr, s.closeServing(listeners))
+		runErr = errors.Join(runErr, s.closeClients())
 	}()
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
@@ -181,7 +182,11 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
 	}
+	// Only startup needs an asynchronous close: the serving loop observes
+	// cancellation itself and performs the ordered teardown above.
+	stopStartupClose := context.AfterFunc(ctx, func() { _ = rc.Close(ctx) })
 	allKeys, err := upstream.List()
+	stopStartupClose()
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -225,10 +230,6 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	case err := <-acceptFailures:
 		return err
 	}
-}
-
-func (s *Server) closeServing(listeners []net.Listener) error {
-	return errors.Join(s.closeListeners(listeners), s.closeClients())
 }
 
 func (s *Server) closeListeners(listeners []net.Listener) error {
@@ -388,7 +389,7 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group
 
 func (s *Server) startClient(ctx context.Context, conn net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
 	s.clientsMu.Lock()
-	if s.clientsClosing {
+	if s.clientsClosing || ctx.Err() != nil {
 		s.clientsMu.Unlock()
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Debug("closing client accepted during shutdown", "err", err)

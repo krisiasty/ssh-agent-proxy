@@ -244,10 +244,13 @@ func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
 
 type blockingListAgent struct {
 	agent.ExtendedAgent
-	listCalls atomic.Int64
-	started   chan struct{}
-	release   chan struct{}
-	startOnce sync.Once
+	listCalls   atomic.Int64
+	blockListAt int64 // Zero blocks the first list; negative disables list blocking.
+	blockSign   bool
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
 }
 
 type toggleListAgent struct {
@@ -264,11 +267,32 @@ func (a *toggleListAgent) List() ([]*agent.Key, error) {
 	return a.ExtendedAgent.List()
 }
 
+func newBlockingListAgent(t *testing.T) *blockingListAgent {
+	t.Helper()
+	return &blockingListAgent{ExtendedAgent: newTestKeyring(t), started: make(chan struct{}), release: make(chan struct{})}
+}
+
 func (a *blockingListAgent) List() ([]*agent.Key, error) {
-	a.listCalls.Add(1)
+	if calls := a.listCalls.Add(1); a.blockListAt >= 0 && calls >= max(1, a.blockListAt) {
+		a.stall()
+	}
+	return a.ExtendedAgent.List()
+}
+
+func (a *blockingListAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	if a.blockSign {
+		a.stall()
+	}
+	return a.ExtendedAgent.SignWithFlags(key, data, flags)
+}
+
+func (a *blockingListAgent) stall() {
 	a.startOnce.Do(func() { close(a.started) })
 	<-a.release
-	return a.ExtendedAgent.List()
+}
+
+func (a *blockingListAgent) unblock() {
+	a.releaseOnce.Do(func() { close(a.release) })
 }
 
 func addAgentKey(t *testing.T, up agent.ExtendedAgent, comment string) ssh.PublicKey {
