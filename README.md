@@ -130,7 +130,8 @@ ssh-agent-proxy -reload
 
 sends `SIGHUP` to the running managed service. The process reads and validates its
 configured file before disturbing the active proxy. If validation fails, it logs the
-error and keeps the current runtime, including one that is still starting. An invalid
+error and keeps a serving runtime or a rollback already in progress. If no configuration
+has reached readiness yet, it also keeps a runtime that is still starting. An invalid
 reload leaves an already idle service idle. After successful validation it
 replaces the upstream connection and group listeners; existing client connections are
 closed so clients reconnect against the new authorization state.

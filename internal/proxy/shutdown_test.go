@@ -62,7 +62,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			srv := NewServer(ctx, upstream, 0, slog.New(slog.DiscardHandler))
 			if scenario.nilTelemetry {
-				srv.newUpstreamClient = func(ctx context.Context, socket string, log *slog.Logger) (*reconnectClient, error) {
+				srv.newUpstreamClient = func(ctx context.Context, socket string, log *slog.Logger, _ *proxyTelemetry) (*reconnectClient, error) {
 					return newReconnectClientWithTelemetry(ctx, socket, log, nil)
 				}
 			}
@@ -77,16 +77,16 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 				listener = &shutdownFailureListener{Listener: ln}
 				return listener, nil
 			}
-			result := runAsync(func() error { return srv.Run(ctx, cfg.Groups) })
+			result := testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
 			t.Cleanup(func() {
 				cancel()
 				backend.unblock()
-				waitForAsyncStop(t, result, "proxy server")
+				testutil.WaitForAsyncStop(t, result, "proxy server")
 			})
 
-			var request *asyncResult
+			var request *testutil.AsyncResult
 			if !scenario.startup {
-				if !waitForEvent(t, ready, "proxy readiness") {
+				if !testutil.WaitForEvent(t, ready, "proxy readiness") {
 					return
 				}
 				var dialer net.Dialer
@@ -96,7 +96,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = conn.Close() })
 				client := agent.NewClient(conn)
-				request = runAsync(func() error {
+				request = testutil.RunAsync(func() error {
 					if scenario.sign {
 						_, signErr := client.Sign(pub, []byte("payload"))
 						return signErr
@@ -105,7 +105,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 					return listErr
 				})
 			}
-			if !waitForEvent(t, backend.started, "stalled upstream request") {
+			if !testutil.WaitForEvent(t, backend.started, "stalled upstream request") {
 				return
 			}
 			if scenario.terminal {
@@ -114,17 +114,17 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 			} else {
 				cancel()
 			}
-			if !waitForAsyncStop(t, result, "proxy with unresponsive upstream") {
+			if !testutil.WaitForAsyncStop(t, result, "proxy with unresponsive upstream") {
 				return
 			}
 			if scenario.terminal {
-				if !errors.Is(result.err, ErrListenerFailure) {
-					t.Errorf("Run() error = %v, want listener failure", result.err)
+				if !errors.Is(result.Err(), ErrListenerFailure) {
+					t.Errorf("Run() error = %v, want listener failure", result.Err())
 				}
-			} else if result.err != nil {
-				t.Errorf("Run() error = %v, want clean cancellation", result.err)
+			} else if result.Err() != nil {
+				t.Errorf("Run() error = %v, want clean cancellation", result.Err())
 			}
-			if request != nil && waitForAsyncStop(t, request, "blocked client request") && request.err == nil {
+			if request != nil && testutil.WaitForAsyncStop(t, request, "blocked client request") && request.Err() == nil {
 				t.Error("interrupted client request unexpectedly succeeded")
 			}
 			if _, err := os.Lstat(socket); !os.IsNotExist(err) {
@@ -173,23 +173,23 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 				return backend.ExtendedAgent, replacement, nil
 			}
 			var reconnected bool
-			result := runAsync(func() error {
+			result := testutil.RunAsync(func() error {
 				reconnected = client.reconnect(original)
 				return nil
 			})
-			if !waitForEvent(t, entered, "replacement dial") {
+			if !testutil.WaitForEvent(t, entered, "replacement dial") {
 				return
 			}
-			closed := runAsync(func() error {
+			closed := testutil.RunAsync(func() error {
 				if !explicitClose {
 					cancel()
 				}
 				return client.Close(t.Context())
 			})
-			if !waitForAsyncStop(t, closed, "upstream close during reconnect") {
+			if !testutil.WaitForAsyncStop(t, closed, "upstream close during reconnect") {
 				return
 			}
-			if !waitForAsyncStop(t, result, "reconnect during shutdown") {
+			if !testutil.WaitForAsyncStop(t, result, "reconnect during shutdown") {
 				return
 			}
 			if reconnected || client.current.Load() != original {
@@ -198,8 +198,8 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			if got := replacement.closeCalls.Load(); got != 1 {
 				t.Errorf("discarded connection closes = %d, want 1", got)
 			}
-			if closed.err != nil {
-				t.Errorf("Close() error = %v", closed.err)
+			if closed.Err() != nil {
+				t.Errorf("Close() error = %v", closed.Err())
 			}
 		})
 	}
@@ -250,8 +250,8 @@ func TestServerClosesListenersBeforeUpstream(t *testing.T) {
 			t.Error("upstream closed before new clients were refused")
 		}
 	}}
-	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
-		client := &reconnectClient{ctx: ctx, log: log}
+	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
 		client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: transport})
 		return client, nil
 	}
@@ -272,8 +272,8 @@ func TestServerListenCancellationIsClean(t *testing.T) {
 			defer cancel()
 			log := slog.New(slog.DiscardHandler)
 			srv := NewServer(ctx, "unused", 0, log)
-			srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
-				client := &reconnectClient{ctx: ctx, log: log}
+			srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+				client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
 				client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
 				return client, nil
 			}
@@ -290,17 +290,17 @@ func TestServerListenCancellationIsClean(t *testing.T) {
 			var ready atomic.Bool
 			srv.SetReadyCallback(func() { ready.Store(true) })
 			socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
-			result := runAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
-			t.Cleanup(func() { cancel(); waitForAsyncStop(t, result, "proxy server") })
-			if !waitForEvent(t, binding, "listen phase") {
+			result := testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+			t.Cleanup(func() { cancel(); testutil.WaitForAsyncStop(t, result, "proxy server") })
+			if !testutil.WaitForEvent(t, binding, "listen phase") {
 				return
 			}
 			cancel()
-			if !waitForAsyncStop(t, result, "proxy server") {
+			if !testutil.WaitForAsyncStop(t, result, "proxy server") {
 				return
 			}
-			if result.err != nil {
-				t.Errorf("Run() returned error for cancellation: %v", result.err)
+			if result.Err() != nil {
+				t.Errorf("Run() returned error for cancellation: %v", result.Err())
 			}
 			if ready.Load() {
 				t.Error("canceled startup announced readiness")
@@ -333,7 +333,7 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { cancel(); _ = client.Close(t.Context()) })
-			result := runAsync(func() error {
+			result := testutil.RunAsync(func() error {
 				if signing {
 					_, err := client.SignWithFlags(pub, []byte("payload"), 0)
 					return err
@@ -341,11 +341,11 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 				_, err := client.List()
 				return err
 			})
-			if !waitForEvent(t, backend.started, "blocked wire request") {
+			if !testutil.WaitForEvent(t, backend.started, "blocked wire request") {
 				return
 			}
 			cancel()
-			if waitForAsyncStop(t, result, "wire request") && result.err == nil {
+			if testutil.WaitForAsyncStop(t, result, "wire request") && result.Err() == nil {
 				t.Error("canceled wire request succeeded")
 			}
 		})
@@ -366,7 +366,7 @@ func serveShutdownAgent(t *testing.T, socket string, backend *blockingListAgent)
 	t.Helper()
 	listener := listenUnix(t, socket)
 	accepted := make(chan net.Conn, 1)
-	result := runAsync(func() error {
+	result := testutil.RunAsync(func() error {
 		conn, err := listener.Accept()
 		if err != nil {
 			close(accepted)
@@ -383,7 +383,7 @@ func serveShutdownAgent(t *testing.T, socket string, backend *blockingListAgent)
 		if conn, ok := <-accepted; ok {
 			_ = conn.Close()
 		}
-		waitForAsyncStop(t, result, "test upstream agent")
+		testutil.WaitForAsyncStop(t, result, "test upstream agent")
 	})
 }
 
@@ -408,12 +408,12 @@ func TestServerStartupErrorsDuringCancellation(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				srv := NewServer(ctx, "unused", 0, slog.New(slog.DiscardHandler))
-				srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
+				srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
 					if phase == "dial" {
 						cancel()
 						return nil, fmt.Errorf("dial: %w", cause)
 					}
-					client := &reconnectClient{ctx: ctx, log: log}
+					client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
 					client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
 					return client, nil
 				}

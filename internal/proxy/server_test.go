@@ -106,8 +106,8 @@ func TestServerRunPropagatesTerminalAcceptFailure(t *testing.T) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
-	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger, ctx: ctx}
+	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := &reconnectClient{upstream: "unused", log: logger, ctx: ctx, telemetry: telemetry}
 		rc.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
 		return rc, nil
 	}
@@ -276,8 +276,8 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	addAgentKey(t, keyring, "shared")
 	up := &countingListAgent{ExtendedAgent: keyring}
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: log}
+	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := &reconnectClient{upstream: "unused", log: log, telemetry: telemetry}
 		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
@@ -287,11 +287,7 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	stopped := make(chan struct{})
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-stopped:
-		case <-time.After(5 * time.Second):
-			t.Error("Server.Run() did not stop during cleanup")
-		}
+		testutil.WaitForEvent(t, stopped, "proxy server to stop")
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
@@ -390,8 +386,8 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger}
+	srv.newUpstreamClient = func(_ context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := &reconnectClient{upstream: "unused", log: logger, telemetry: telemetry}
 		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
@@ -401,11 +397,7 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	stopped := make(chan struct{})
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-stopped:
-		case <-time.After(5 * time.Second):
-			t.Error("Server.Run() did not stop during cleanup")
-		}
+		testutil.WaitForEvent(t, stopped, "proxy server to stop")
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
@@ -450,6 +442,13 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 		t.Fatalf("closing upstream server connection: %v", err)
 	}
 
+	if got := srv.telemetry.upstreamCalls.Load(); got != 3 {
+		t.Errorf("injected client upstream calls = %d, want failed list, successful list and close", got)
+	}
+	if got := srv.telemetry.upstreamErrors.Load(); got != 1 {
+		t.Errorf("injected client upstream errors = %d, want 1", got)
+	}
+
 	entries := decodeDebugLogs(t, output.Bytes())
 	warning := findDebugLog(t, entries, "initial config key resolution failed; deferring until client request", "")
 	if _, ok := warning["err"].(string); !ok {
@@ -492,7 +491,7 @@ func (a *countingListAgent) List() ([]*agent.Key, error) {
 
 func waitForSocket(t *testing.T, path string, done <-chan error) {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(testutil.WaitTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -618,7 +617,7 @@ func TestSocketLockHelper(t *testing.T) {
 	case "blocked":
 		srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 		upstreamCalled := false
-		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
+		srv.newUpstreamClient = func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error) {
 			upstreamCalled = true
 			return nil, errors.New("upstream constructor must not run while socket is locked")
 		}
@@ -685,16 +684,5 @@ func removeSocket(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		t.Errorf("removing socket: %v", err)
-	}
-}
-
-func waitForEvent(t *testing.T, event <-chan struct{}, name string) bool {
-	t.Helper()
-	select {
-	case <-event:
-		return true
-	case <-time.After(5 * time.Second):
-		t.Errorf("timed out waiting for %s", name)
-		return false
 	}
 }

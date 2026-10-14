@@ -45,10 +45,10 @@ func TestOpenSSHClientInteroperability(t *testing.T) {
 	if err := agentCmd.Start(); err != nil {
 		t.Fatalf("starting OpenSSH agent: %v", err)
 	}
-	agentResult := runAsync(agentCmd.Wait)
+	agentResult := testutil.RunAsync(agentCmd.Wait)
 	t.Cleanup(func() {
 		stopAgent()
-		_ = waitForAsyncStop(t, agentResult, "OpenSSH agent")
+		_ = testutil.WaitForAsyncStop(t, agentResult, "OpenSSH agent")
 	})
 	waitForIntegrationSocket(t, upstreamSocket, agentResult, func() string {
 		return string(agentOutput.Bytes())
@@ -81,11 +81,11 @@ groups:
 
 	proxyCtx, stopProxy := context.WithCancel(t.Context())
 	srv := NewServer(proxyCtx, cfg.Upstream, 0, slog.New(slog.DiscardHandler))
-	proxyResult := runAsync(func() error { return srv.Run(proxyCtx, cfg.Groups) })
+	proxyResult := testutil.RunAsync(func() error { return srv.Run(proxyCtx, cfg.Groups) })
 	t.Cleanup(func() {
 		stopProxy()
-		if waitForAsyncStop(t, proxyResult, "proxy server") && proxyResult.err != nil {
-			t.Errorf("proxy server stopped with error: %v", proxyResult.err)
+		if testutil.WaitForAsyncStop(t, proxyResult, "proxy server") && proxyResult.Err() != nil {
+			t.Errorf("proxy server stopped with error: %v", proxyResult.Err())
 		}
 	})
 	waitForIntegrationSocket(t, groupSocket, proxyResult, func() string { return "" })
@@ -117,28 +117,9 @@ groups:
 	}
 }
 
-type asyncResult struct {
-	done chan struct{}
-	err  error
-}
-
-func runAsync(fn func() error) *asyncResult {
-	result := &asyncResult{done: make(chan struct{})}
-	go func() {
-		result.err = fn()
-		close(result.done)
-	}()
-	return result
-}
-
-func waitForAsyncStop(t *testing.T, result *asyncResult, name string) bool {
+func waitForIntegrationSocket(t *testing.T, path string, result *testutil.AsyncResult, diagnostic func() string) {
 	t.Helper()
-	return waitForEvent(t, result.done, name+" to stop")
-}
-
-func waitForIntegrationSocket(t *testing.T, path string, result *asyncResult, diagnostic func() string) {
-	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(testutil.WaitTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -149,8 +130,8 @@ func waitForIntegrationSocket(t *testing.T, path string, result *asyncResult, di
 			t.Fatalf("inspecting integration socket: %v", err)
 		}
 		select {
-		case <-result.done:
-			t.Fatalf("socket owner stopped before serving %q: %v\n%s", path, result.err, diagnostic())
+		case <-result.Done():
+			t.Fatalf("socket owner stopped before serving %q: %v\n%s", path, result.Err(), diagnostic())
 		case <-deadline.C:
 			t.Fatalf("timed out waiting for integration socket %q\n%s", path, diagnostic())
 		case <-ticker.C:

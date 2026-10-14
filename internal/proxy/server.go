@@ -50,7 +50,7 @@ type Server struct {
 	upstream          string
 	cacheTTL          time.Duration
 	log               *slog.Logger
-	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
+	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
 	onReady           func()
 	telemetry         *proxyTelemetry
@@ -79,9 +79,7 @@ func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log
 		telemetry: newProxyTelemetry(ctx, log),
 		clients:   make(map[net.Conn]struct{}),
 	}
-	s.newUpstreamClient = func(ctx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
-		return newReconnectClientWithTelemetry(ctx, upstream, log, s.telemetry)
-	}
+	s.newUpstreamClient = newReconnectClientWithTelemetry
 	s.listen = s.listenUnix
 	return s
 }
@@ -167,7 +165,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
 	// The reconnecting wrapper will dial a fresh connection if the current one
 	// dies, so a single failure does not kill all clients.
-	rc, err = s.newUpstreamClient(ctx, s.upstream, s.log)
+	rc, err = s.newUpstreamClient(ctx, s.upstream, s.log, s.telemetry)
 	if err != nil {
 		return err
 	}

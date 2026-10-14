@@ -72,9 +72,7 @@ func runWithReload(
 ) error {
 	log := logging.Setup(false)
 	var current *runtimeInstance
-	var lastGood, next *config.Config
-	var rollbackCause error
-	reloadPending, suppressReloadLog := true, true
+	var lastGood *config.Config
 
 	stopCurrent := func() error {
 		if current == nil {
@@ -85,87 +83,95 @@ func runWithReload(
 		return err
 	}
 	observeReadiness := func() {
-		if current == nil || current.started || ctx.Err() != nil {
+		if current.state() == runtimeIdle || current.state() == runtimeServing || ctx.Err() != nil {
 			return
 		}
 		select {
 		case <-current.ready:
-			current.started = true
+			previousState := current.state()
+			current.phase = runtimeServing
 			lastGood = current.cfg
 			switch {
-			case rollbackCause != nil:
+			case previousState == runtimeRollingBack:
 				log.Info("previous configuration restored", "config", cfgPath, "groups", len(lastGood.Groups))
-			case !suppressReloadLog:
+			case current.reloaded:
 				log.Info("configuration reloaded", "config", cfgPath, "groups", len(lastGood.Groups))
 			}
-			rollbackCause = nil
+			current.rollbackCause = nil
 		default:
 		}
 	}
+	start := func(cfg *config.Config, rollbackCause error, reloaded bool) error {
+		stopErr := stopCurrent()
+		if ctx.Err() != nil {
+			return stopErr
+		}
+		if stopErr != nil {
+			log.Warn("stopping current runtime for reload", "err", stopErr)
+		}
+		current = launchRuntime(ctx, cfgPath, cfg, cacheTTL, version)
+		current.reloaded = reloaded
+		current.rollbackCause = rollbackCause
+		if rollbackCause != nil {
+			current.phase = runtimeRollingBack
+		}
+		log = current.log
+		return nil
+	}
+	loadConfiguration := func(initial bool) error {
+		if ctx.Err() != nil {
+			return stopCurrent()
+		}
+		candidate, loadErr := config.Load(cfgPath)
+		if ctx.Err() != nil {
+			return stopCurrent()
+		}
+		observeReadiness()
+		if loadErr == nil {
+			if !initial {
+				log.Info("configuration reload requested", "config", cfgPath)
+			}
+			return start(candidate, nil, !initial)
+		}
 
+		switch current.state() {
+		case runtimeStarting:
+			if lastGood != nil {
+				log.Error("configuration reload failed", "err", loadErr)
+				log.Warn("restoring previous configuration")
+				return start(lastGood, loadErr, true)
+			}
+			log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
+		case runtimeRollingBack, runtimeServing:
+			log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
+		case runtimeIdle:
+			switch {
+			case lastGood != nil:
+				log.Error("configuration reload failed; remaining idle", "err", loadErr)
+			case foreground:
+				return loadErr
+			default:
+				log.Error("configuration error", "err", loadErr)
+				log.Error("idling until stopped or reloaded; fix the config and send SIGHUP")
+			}
+		}
+		return nil
+	}
+
+	if err := loadConfiguration(true); err != nil {
+		return err
+	}
 	for {
 		// Every startup, reload, and rollback passes this shutdown check.
 		if ctx.Err() != nil {
 			return stopCurrent()
 		}
 		observeReadiness()
-		if reloadPending {
-			reloadPending = false
-			candidate, loadErr := config.Load(cfgPath)
-			if ctx.Err() != nil {
-				return stopCurrent()
-			}
-			observeReadiness()
-			switch {
-			case loadErr == nil:
-				if !suppressReloadLog {
-					log.Info("configuration reload requested", "config", cfgPath)
-				}
-				next, rollbackCause = candidate, nil
-			case current != nil && (current.started || lastGood == nil):
-				log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
-				continue
-			case current != nil && lastGood != nil:
-				log.Error("configuration reload failed", "err", loadErr)
-				log.Warn("restoring previous configuration")
-				next, rollbackCause = lastGood, loadErr
-			case lastGood != nil:
-				log.Error("configuration reload failed; remaining idle", "err", loadErr)
-				continue
-			default:
-				stopErr := stopCurrent()
-				if ctx.Err() != nil {
-					return stopErr
-				}
-				if stopErr != nil {
-					loadErr = errors.Join(loadErr, stopErr)
-				}
-				if foreground {
-					return loadErr
-				}
-				log.Error("configuration error", "err", loadErr)
-				log.Error("idling until stopped or reloaded; fix the config and send SIGHUP")
-				continue
-			}
-		}
-		if next != nil {
-			stopErr := stopCurrent()
-			if ctx.Err() != nil {
-				return stopErr
-			}
-			if stopErr != nil {
-				log.Warn("stopping current runtime for reload", "err", stopErr)
-			}
-			current = launchRuntime(ctx, cfgPath, next, cacheTTL, version)
-			log = current.log
-			next = nil
-		}
-
 		var ready <-chan struct{}
 		var done <-chan error
 		if current != nil {
 			done = current.done
-			if !current.started {
+			if current.state() != runtimeServing {
 				ready = current.ready
 			}
 		}
@@ -173,41 +179,46 @@ func runWithReload(
 		case <-ctx.Done():
 			continue
 		case <-reload:
-			reloadPending = true
-			suppressReloadLog = false
+			if err := loadConfiguration(false); err != nil {
+				return err
+			}
 		case <-ready:
 			// Commit the configuration at the top of the loop, after checking
 			// shutdown, rather than treating a clean early exit as readiness.
 			continue
 		case runtimeErr := <-done:
 			observeReadiness()
-			current.finished = true
-			current.runErr = runtimeErr
-			current.cancel()
+			state, rollbackCause := current.state(), current.rollbackCause
+			current.markFinished(runtimeErr)
 			if ctx.Err() != nil {
 				return stopCurrent()
 			}
-			started := current.started
 			current = nil
 			if runtimeErr == nil {
 				runtimeErr = errors.New("proxy runtime stopped unexpectedly")
 			}
-			if !started && lastGood != nil && rollbackCause == nil {
+			if state == runtimeStarting && lastGood != nil {
 				log.Error("configuration reload failed", "err", runtimeErr)
 				log.Warn("restoring previous configuration")
-				next, rollbackCause = lastGood, runtimeErr
+				if err := start(lastGood, runtimeErr, true); err != nil {
+					return err
+				}
 				continue
 			}
-			if rollbackCause != nil {
+			if state == runtimeRollingBack {
 				runtimeErr = errors.Join(rollbackCause, fmt.Errorf("restoring previous configuration: %w", runtimeErr))
 			}
-			if shouldReturnProxyError(ctx, foreground, runtimeErr) {
+			if shouldReturnProxyError(foreground, runtimeErr) {
 				return runtimeErr
 			}
-			if !started && lastGood == nil {
+			switch state {
+			case runtimeRollingBack:
+				log.Error("restoring previous configuration failed", "err", runtimeErr)
+				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
+			case runtimeStarting:
 				log.Error("proxy startup error", "err", runtimeErr)
 				log.Error("idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
-			} else {
+			default:
 				log.Error("proxy runtime error", "err", runtimeErr)
 				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 			}
@@ -215,15 +226,26 @@ func runWithReload(
 	}
 }
 
+type runtimeState uint8
+
+const (
+	runtimeIdle runtimeState = iota
+	runtimeStarting
+	runtimeRollingBack
+	runtimeServing
+)
+
 type runtimeInstance struct {
-	cfg      *config.Config
-	ready    <-chan struct{}
-	started  bool
-	cancel   context.CancelFunc
-	done     chan error
-	log      *slog.Logger
-	finished bool
-	runErr   error
+	cfg           *config.Config
+	ready         <-chan struct{}
+	phase         runtimeState
+	reloaded      bool
+	rollbackCause error
+	cancel        context.CancelFunc
+	done          chan error
+	log           *slog.Logger
+	finished      bool
+	runErr        error
 }
 
 func launchRuntime(
@@ -271,6 +293,7 @@ func launchRuntime(
 
 	instance := &runtimeInstance{
 		cfg:    cfg,
+		phase:  runtimeStarting,
 		ready:  ready,
 		cancel: cancel,
 		done:   make(chan error, 1),
@@ -286,16 +309,29 @@ func launchRuntime(
 	return instance
 }
 
-func (r *runtimeInstance) stop() error {
-	if r.finished {
-		return r.runErr
+// state treats the absence of a runtime as idle.
+func (r *runtimeInstance) state() runtimeState {
+	if r == nil {
+		return runtimeIdle
 	}
-	r.cancel()
-	r.runErr = <-r.done
+	return r.phase
+}
+
+// markFinished records a consumed completion result and releases the context.
+func (r *runtimeInstance) markFinished(err error) {
+	r.runErr = err
 	r.finished = true
+	r.cancel()
+}
+
+func (r *runtimeInstance) stop() error {
+	if !r.finished {
+		r.cancel()
+		r.markFinished(<-r.done)
+	}
 	return r.runErr
 }
 
-func shouldReturnProxyError(ctx context.Context, foreground bool, err error) bool {
-	return foreground || ctx.Err() != nil || errors.Is(err, proxy.ErrListenerFailure)
+func shouldReturnProxyError(foreground bool, err error) bool {
+	return foreground || errors.Is(err, proxy.ErrListenerFailure)
 }

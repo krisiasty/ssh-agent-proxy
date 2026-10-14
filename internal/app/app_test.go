@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,20 +23,14 @@ import (
 
 func TestShouldReturnProxyError(t *testing.T) {
 	listenerErr := fmt.Errorf("runtime failure: %w", proxy.ErrListenerFailure)
-	if !shouldReturnProxyError(t.Context(), false, listenerErr) {
+	if !shouldReturnProxyError(false, listenerErr) {
 		t.Error("listener failure should be returned so the service supervisor can restart")
 	}
-	if shouldReturnProxyError(t.Context(), false, errors.New("startup failure")) {
+	if shouldReturnProxyError(false, errors.New("startup failure")) {
 		t.Error("managed-service startup failure should idle")
 	}
-	if !shouldReturnProxyError(t.Context(), true, errors.New("foreground failure")) {
+	if !shouldReturnProxyError(true, errors.New("foreground failure")) {
 		t.Error("foreground failure should be returned")
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if !shouldReturnProxyError(ctx, false, errors.New("shutdown failure")) {
-		t.Error("failure during context cancellation should be returned")
 	}
 }
 
@@ -100,26 +95,20 @@ func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 	events, _ := captureRuntimeLogs(t)
 	path := writeRuntimeConfig(t, filepath.Join(t.TempDir(), "missing-agent.sock"))
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- run(ctx, path, false, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
-	}()
-	t.Cleanup(func() { cancel() })
+	done := testutil.RunAsync(func() error {
+		return run(ctx, path, false, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
+	})
+	t.Cleanup(func() { cancel(); testutil.WaitForAsyncStop(t, done, "runtime") })
 	waitForRuntimeLog(t, events, "proxy startup error")
 	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
 	select {
-	case err := <-done:
-		t.Fatalf("run() returned before cancellation with error %v", err)
+	case <-done.Done():
+		t.Fatalf("run() returned before cancellation with error %v", done.Err())
 	default:
 	}
 	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run() error after cancellation = %v, want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("run() did not stop after context cancellation")
+	if testutil.WaitForAsyncStop(t, done, "runtime") && done.Err() != nil {
+		t.Fatalf("run() error after cancellation = %v, want nil", done.Err())
 	}
 }
 
@@ -180,13 +169,10 @@ func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) 
 	}
 
 	cancel()
-	select {
-	case err := <-done:
+	if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 		if err != nil {
 			t.Fatalf("runWithReload() error = %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("runWithReload() did not stop after cancellation")
 	}
 }
 
@@ -254,13 +240,10 @@ func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		close(backend.release)
-		select {
-		case err := <-done:
+		if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 			if err != nil {
 				t.Errorf("runWithReload() shutdown error = %v", err)
 			}
-		case <-time.After(5 * time.Second):
-			t.Error("runtime did not stop during cleanup")
 		}
 	})
 	waitForAgentSocket(t, socket)
@@ -276,23 +259,18 @@ func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 		_, err := agent.NewClient(conn).List()
 		request <- err
 	}()
-	select {
-	case <-backend.blocked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("client did not reach stalled upstream")
+	if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+		return
 	}
 
 	// Reuse the same socket to verify that reload releases its ownership lock.
 	writeReloadConfig(t, configPath, healthy, "replacement", socket)
 	reload <- syscall.SIGHUP
 	waitForAgentSocket(t, socket)
-	select {
-	case err := <-request:
+	if err, ok := testutil.Receive(t, request, "client request"); ok {
 		if err == nil {
 			t.Error("blocked request unexpectedly succeeded")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reload did not interrupt the old upstream request")
 	}
 	waitForConnectionClose(t, conn)
 }
@@ -325,13 +303,10 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 			t.Cleanup(func() {
 				cancel()
 				close(backend.release)
-				select {
-				case err := <-done:
+				if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 					if err != nil {
 						t.Errorf("runtime shutdown: %v", err)
 					}
-				case <-time.After(5 * time.Second):
-					t.Error("runtime did not stop during cleanup")
 				}
 			})
 			if replacing {
@@ -339,10 +314,8 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 				writeReloadConfig(t, configPath, blocked, "blocked", socket)
 				reload <- syscall.SIGHUP
 			}
-			select {
-			case <-backend.blocked:
-			case <-time.After(5 * time.Second):
-				t.Fatal("startup did not reach the stalled upstream")
+			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+				return
 			}
 			writeReloadConfig(t, configPath, healthy, "recovered", socket)
 			reload <- syscall.SIGHUP
@@ -386,22 +359,17 @@ func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		close(backend.release)
-		select {
-		case err := <-done:
+		if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 			if err != nil {
 				t.Errorf("shutdown: %v", err)
 			}
-		case <-time.After(5 * time.Second):
-			t.Error("runtime did not stop")
 		}
 	})
 	waitForAgentSocket(t, socket)
 	writeReloadConfig(t, path, blocked, "never-ready", socket)
 	reload <- syscall.SIGHUP
-	select {
-	case <-backend.blocked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("replacement startup did not stall")
+	if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+		return
 	}
 	if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -435,31 +403,23 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 				if finished {
 					return
 				}
-				select {
-				case err := <-done:
+				if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 					if err != nil {
 						t.Errorf("shutdown: %v", err)
 					}
-				case <-time.After(5 * time.Second):
-					t.Error("runtime did not stop")
 				}
 			})
-			select {
-			case <-backend.blocked:
-			case <-time.After(5 * time.Second):
-				t.Fatal("initial startup did not stall")
+			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+				return
 			}
 			writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
 			reload <- syscall.SIGHUP
 			if foreground {
-				select {
-				case err := <-done:
+				if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 					finished = true
 					if err == nil {
 						t.Error("foreground reload failure returned nil")
 					}
-				case <-time.After(5 * time.Second):
-					t.Fatal("foreground reload failure tried to restore an unready config")
 				}
 			} else {
 				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
@@ -493,7 +453,7 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			name = "foreground"
 		}
 		t.Run(name, func(t *testing.T) {
-			events, _ := captureRuntimeLogs(t)
+			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
 			backend.stall.Store(true)
@@ -501,25 +461,18 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "initial", socket)
 			ctx, cancel := context.WithCancel(t.Context())
-			reload, done := make(chan os.Signal, 1), make(chan error, 1)
-			go func() { done <- runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) }()
+			reload := make(chan os.Signal, 1)
+			done := testutil.RunAsync(func() error { return runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) })
 			var release sync.Once
 			t.Cleanup(func() {
 				cancel()
 				release.Do(func() { close(backend.release) })
-				select {
-				case err := <-done:
-					if err != nil {
-						t.Errorf("shutdown: %v", err)
-					}
-				case <-time.After(5 * time.Second):
-					t.Error("runtime did not stop")
+				if testutil.WaitForAsyncStop(t, done, "runtime") && done.Err() != nil {
+					t.Errorf("shutdown: %v", done.Err())
 				}
 			})
-			select {
-			case <-backend.blocked:
-			case <-time.After(5 * time.Second):
-				t.Fatal("initial startup did not stall")
+			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+				return
 			}
 			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -530,7 +483,15 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			// the config on disk is invalid and cannot be loaded again.
 			release.Do(func() { close(backend.release) })
 			waitForAgentSocket(t, socket)
-			waitForRuntimeLog(t, events, "configuration reloaded")
+			cancel()
+			if !testutil.WaitForAsyncStop(t, done, "runtime") {
+				return
+			}
+			for _, entry := range finish() {
+				if entry["msg"] == "configuration reloaded" || entry["msg"] == "configuration reload requested" {
+					t.Errorf("invalid reload logged a successful reload: %v", entry)
+				}
+			}
 		})
 	}
 }
@@ -548,10 +509,8 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		if !finished {
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Error("runtime did not stop")
+			if err, ok := testutil.Receive(t, done, "runtime to stop"); ok && err != nil {
+				t.Errorf("shutdown: %v", err)
 			}
 		}
 	})
@@ -563,6 +522,7 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	}
 	writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
 	reload <- syscall.SIGHUP
+	waitForRuntimeLog(t, events, "restoring previous configuration failed")
 	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
 	if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -570,14 +530,11 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	reload <- syscall.SIGHUP
 	waitForRuntimeLog(t, events, "configuration reload failed; remaining idle")
 	cancel()
-	select {
-	case err := <-done:
+	if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 		finished = true
 		if err != nil {
 			t.Errorf("shutdown: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("idle service did not stop")
 	}
 	launches := 0
 	for _, entry := range finish() {
@@ -587,6 +544,99 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	}
 	if launches != 3 {
 		t.Errorf("runtime launches = %d, want initial, candidate and one rollback", launches)
+	}
+}
+
+func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
+	for _, scenario := range []struct {
+		name         string
+		failRollback bool
+		foreground   bool
+	}{
+		{name: "restored"},
+		{name: "failed managed rollback", failRollback: true},
+		{name: "failed foreground rollback", failRollback: true, foreground: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			events, finish := captureRuntimeLogs(t)
+			dir := testutil.ShortSocketDir(t)
+			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
+			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
+			writeReloadConfig(t, path, upstream, "original", socket)
+			ctx, cancel := context.WithCancel(t.Context())
+			reload := make(chan os.Signal, 1)
+			done := testutil.RunAsync(func() error {
+				return runWithReload(ctx, reload, path, scenario.foreground, 0, Version{Version: "test"})
+			})
+			var release sync.Once
+			t.Cleanup(func() {
+				cancel()
+				release.Do(func() { close(backend.release) })
+				testutil.WaitForAsyncStop(t, done, "runtime")
+			})
+			waitForAgentSocket(t, socket)
+			backend.stall.Store(true)
+			missing := filepath.Join(dir, "failed-candidate.sock")
+			writeReloadConfig(t, path, missing, "failed", socket)
+			reload <- syscall.SIGHUP
+			if !testutil.WaitForEvent(t, backend.blocked, "rollback startup") {
+				return
+			}
+			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reload <- syscall.SIGHUP
+			waitForRuntimeLog(t, events, "configuration reload failed; keeping current configuration")
+			if scenario.failRollback {
+				// Startup is still blocked, so take the released group socket to
+				// force a distinct rollback error after the invalid reload.
+				var lc net.ListenConfig
+				listener, err := lc.Listen(t.Context(), "unix", socket)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+			}
+			release.Do(func() { close(backend.release) })
+			if !scenario.failRollback {
+				waitForRuntimeLog(t, events, "previous configuration restored")
+				waitForAgentSocket(t, socket)
+			} else if !scenario.foreground {
+				waitForRuntimeLog(t, events, "restoring previous configuration failed")
+			}
+			if !scenario.foreground {
+				cancel()
+			}
+			if !testutil.WaitForAsyncStop(t, done, "runtime") {
+				return
+			}
+			if scenario.foreground {
+				if err := done.Err(); !errors.Is(err, proxy.ErrSocketInUse) || !strings.Contains(err.Error(), missing) {
+					t.Errorf("rollback error = %v, want both candidate dial and rollback bind failures", err)
+				}
+			} else if err := done.Err(); err != nil {
+				t.Errorf("shutdown: %v", err)
+			}
+			launches, rollbackErrors := 0, 0
+			for _, entry := range finish() {
+				switch entry["msg"] {
+				case "configuration loaded":
+					launches++
+				case "restoring previous configuration failed":
+					rollbackErrors++
+					if cause, ok := entry["err"].(string); !ok || !strings.Contains(cause, missing) {
+						t.Errorf("rollback log lost the candidate failure: %v", entry)
+					}
+				}
+			}
+			if launches != 3 {
+				t.Errorf("runtime launches = %d, want initial, candidate and one rollback", launches)
+			}
+			if scenario.failRollback && !scenario.foreground && rollbackErrors != 1 {
+				t.Errorf("rollback failure logs = %d, want 1", rollbackErrors)
+			}
+		})
 	}
 }
 
@@ -666,7 +716,7 @@ func captureRuntimeLogs(t *testing.T) (*runtimeLogCapture, func() []map[string]a
 
 func waitForRuntimeLog(t *testing.T, events *runtimeLogCapture, message string) {
 	t.Helper()
-	timer := time.NewTimer(5 * time.Second)
+	timer := time.NewTimer(testutil.WaitTimeout)
 	defer timer.Stop()
 	for {
 		events.mu.Lock()
@@ -697,7 +747,7 @@ func writeReloadConfig(t *testing.T, path, upstream, group, socket string) {
 
 func waitForAgentSocket(t *testing.T, socket string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testutil.WaitTimeout)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 		_, err := proxy.ListAgentKeys(ctx, socket)
@@ -712,7 +762,7 @@ func waitForAgentSocket(t *testing.T, socket string) {
 
 func waitForPathRemoval(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testutil.WaitTimeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Lstat(path); os.IsNotExist(err) {
 			return
@@ -724,7 +774,7 @@ func waitForPathRemoval(t *testing.T, path string) {
 
 func waitForConnectionClose(t *testing.T, conn net.Conn) {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(testutil.WaitTimeout)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
