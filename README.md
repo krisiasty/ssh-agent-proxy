@@ -435,7 +435,7 @@ group silently unavailable.
 go build -o ssh-agent-proxy .
 ```
 
-Requires Go 1.26+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
+Requires Go 1.27.2+. Dependencies: `golang.org/x/crypto` (SSH agent protocol) and
 `go.yaml.in/yaml/v3` (config).
 
 ## Development and releases
