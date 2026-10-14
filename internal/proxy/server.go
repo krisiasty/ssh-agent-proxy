@@ -476,7 +476,7 @@ func (s *Server) serveConn(ctx context.Context, client net.Conn, g config.Group,
 		identityLog:   identityLog,
 		telemetry:     s.telemetry,
 	}
-	if err := agent.ServeAgent(fa, client); err != nil && !errors.Is(err, io.EOF) {
+	if err := agent.ServeAgent(fa, client); !errors.Is(err, io.EOF) {
 		if s.telemetry != nil {
 			s.telemetry.clientErrors.Add(1)
 		}
