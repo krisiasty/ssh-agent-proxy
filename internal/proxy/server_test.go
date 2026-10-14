@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -296,7 +297,7 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 		}
 	})
 
-	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	cfgData := fmt.Sprintf(`upstream: /tmp/upstream.sock
 groups:
@@ -409,7 +410,7 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
-	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	go func() {
 		done <- srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}})
 		close(stopped)
@@ -512,7 +513,7 @@ func waitForSocket(t *testing.T, path string, done <-chan error) {
 }
 
 func TestListenRefusesLiveSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	live := listenUnix(t, path)
 
@@ -534,7 +535,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 }
 
 func TestListenReplacesOnlyStaleSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	stale := listenUnix(t, path)
 	closeListener(t, stale)
@@ -554,7 +555,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 }
 
 func TestListenerClosePreservesReplacementSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 
@@ -583,7 +584,7 @@ func TestListenerClosePreservesReplacementSocket(t *testing.T) {
 }
 
 func TestSecondServerProcessCannotTakeOverSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	lock, err := acquireSocketLock(path)
 	if err != nil {
@@ -655,21 +656,6 @@ func runSocketLockHelper(t *testing.T, path, expectation string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("socket lock subprocess failed: %v\n%s", err, output)
 	}
-}
-
-func shortSocketDir(t *testing.T) string {
-	t.Helper()
-	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
-	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("removing socket test directory: %v", err)
-		}
-	})
-	return dir
 }
 
 func listenUnix(t *testing.T, path string) net.Listener {

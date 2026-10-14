@@ -135,7 +135,10 @@ replaces the upstream connection and group listeners; existing client connection
 closed so clients reconnect against the new authorization state.
 
 If replacement startup fails—for example, because a new socket cannot be bound—the
-proxy restores the previous working configuration. A managed service that is idling
+proxy restores the last configuration that reached readiness. This also applies when
+a reload interrupts a stalled replacement and the newly saved configuration is invalid.
+With no ready configuration to restore, managed mode idles and foreground mode returns
+the startup error. A managed service that is idling
 after an initial config or upstream error can also recover when reloaded. A foreground
 process accepts `SIGHUP` directly; `-reload` specifically targets the installed managed
 service. The command-line `--cache` value is not reloaded because it is stored in the

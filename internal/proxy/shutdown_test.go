@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh/agent"
 )
 
@@ -34,7 +35,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 		{name: "listener failure during sign", sign: true, terminal: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			dir := shortSocketDir(t)
+			dir := testutil.ShortSocketDir(t)
 			backend := newBlockingListAgent(t)
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
 			backend.blockListAt = 2
@@ -148,7 +149,7 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			backend := newBlockingListAgent(t)
-			upstream := filepath.Join(shortSocketDir(t), "upstream.sock")
+			upstream := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
 			serveShutdownAgent(t, upstream, backend)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -167,7 +168,7 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			entered := make(chan struct{})
 			client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
 				close(entered)
-				<-client.logContext().Done()
+				<-client.ctx.Done()
 				// Model a successful dial racing with cancellation.
 				return backend.ExtendedAgent, replacement, nil
 			}
@@ -254,9 +255,100 @@ func TestServerClosesListenersBeforeUpstream(t *testing.T) {
 		client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: transport})
 		return client, nil
 	}
-	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	if err := srv.Run(t.Context(), []config.Group{{Name: "test", Socket: socket}}); !errors.Is(err, ErrListenerFailure) {
 		t.Errorf("Run() error = %v, want listener failure", err)
+	}
+}
+
+func TestServerListenCancellationIsClean(t *testing.T) {
+	for _, successfulBind := range []bool{false, true} {
+		name := "probe error"
+		if successfulBind {
+			name = "bind completed during cancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			log := slog.New(slog.DiscardHandler)
+			srv := NewServer(ctx, "unused", 0, log)
+			srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
+				client := &reconnectClient{ctx: ctx, log: log}
+				client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
+				return client, nil
+			}
+			binding := make(chan struct{})
+			srv.listen = func(ctx context.Context, path string) (net.Listener, error) {
+				close(binding)
+				<-ctx.Done()
+				if successfulBind {
+					// Model a bind that succeeds just as its context is canceled.
+					return srv.listenUnix(context.WithoutCancel(ctx), path)
+				}
+				return nil, fmt.Errorf("probing existing socket: %w", ctx.Err())
+			}
+			var ready atomic.Bool
+			srv.SetReadyCallback(func() { ready.Store(true) })
+			socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
+			result := runAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+			t.Cleanup(func() { cancel(); waitForAsyncStop(t, result, "proxy server") })
+			if !waitForEvent(t, binding, "listen phase") {
+				return
+			}
+			cancel()
+			if !waitForAsyncStop(t, result, "proxy server") {
+				return
+			}
+			if result.err != nil {
+				t.Errorf("Run() returned error for cancellation: %v", result.err)
+			}
+			if ready.Load() {
+				t.Error("canceled startup announced readiness")
+			}
+			if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+				t.Errorf("startup left a socket behind: %v", err)
+			}
+		})
+	}
+}
+
+func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
+	for _, signing := range []bool{false, true} {
+		name := "list"
+		if signing {
+			name = "sign"
+		}
+		t.Run(name, func(t *testing.T) {
+			backend := newBlockingListAgent(t)
+			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
+			if signing {
+				backend.blockListAt, backend.blockSign = -1, true
+			}
+			socket := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
+			serveShutdownAgent(t, socket, backend)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client, err := newReconnectClientWithTelemetry(ctx, socket, slog.New(slog.DiscardHandler), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cancel(); _ = client.Close(t.Context()) })
+			result := runAsync(func() error {
+				if signing {
+					_, err := client.SignWithFlags(pub, []byte("payload"), 0)
+					return err
+				}
+				_, err := client.List()
+				return err
+			})
+			if !waitForEvent(t, backend.started, "blocked wire request") {
+				return
+			}
+			cancel()
+			if waitForAsyncStop(t, result, "wire request") && result.err == nil {
+				t.Error("canceled wire request succeeded")
+			}
+		})
 	}
 }
 

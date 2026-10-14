@@ -153,9 +153,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	defer func() {
 		// Refuse accepted clients and close listeners before interrupting the
 		// upstream, then wait for the handlers that were already running.
-		s.clientsMu.Lock()
-		s.clientsClosing = true
-		s.clientsMu.Unlock()
+		s.refuseNewClients()
 		runErr = errors.Join(runErr, s.closeListeners(listeners))
 		cancel()
 		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -182,11 +180,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
 	}
-	// Only startup needs an asynchronous close: the serving loop observes
-	// cancellation itself and performs the ordered teardown above.
-	stopStartupClose := context.AfterFunc(ctx, func() { _ = rc.Close(ctx) })
 	allKeys, err := upstream.List()
-	stopStartupClose()
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -204,10 +198,16 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		g := eg.g
 		ln, err := s.listen(ctx, g.Socket)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			listenErr := fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
 			return listenErr
 		}
 		listeners = append(listeners, ln)
+		if ctx.Err() != nil {
+			return nil
+		}
 		logAttrs := []any{"group", g.Name, "socket", g.Socket}
 		if eg.resolved {
 			logAttrs = append(logAttrs, "keys", eg.resolvedKeys)
@@ -411,9 +411,14 @@ func (s *Server) startClient(ctx context.Context, conn net.Conn, g config.Group,
 	}()
 }
 
-func (s *Server) closeClients() error {
+func (s *Server) refuseNewClients() {
 	s.clientsMu.Lock()
 	s.clientsClosing = true
+	s.clientsMu.Unlock()
+}
+
+func (s *Server) closeClients() error {
+	s.clientsMu.Lock()
 	clients := make([]net.Conn, 0, len(s.clients))
 	for conn := range s.clients {
 		clients = append(clients, conn)

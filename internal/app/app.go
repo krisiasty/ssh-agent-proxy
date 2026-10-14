@@ -62,8 +62,6 @@ func run(ctx context.Context, cfgPath string, foreground bool, cacheTTL time.Dur
 	return runWithReload(ctx, nil, cfgPath, foreground, cacheTTL, version)
 }
 
-var errReloadRequested = errors.New("runtime startup interrupted by reload")
-
 func runWithReload(
 	ctx context.Context,
 	reload <-chan os.Signal,
@@ -73,136 +71,148 @@ func runWithReload(
 	version Version,
 ) error {
 	log := logging.Setup(false)
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		if foreground {
-			return err
-		}
-		log.Error("configuration error", "err", err)
-		log.Error("idling until stopped or reloaded; fix the config and send SIGHUP")
-		cfg = nil
-	}
-
-	reloadPending := false
 	var current *runtimeInstance
-	if cfg != nil {
-		current, err = launchRuntime(ctx, reload, cfgPath, cfg, cacheTTL, version)
-		switch {
-		case errors.Is(err, errReloadRequested):
-			reloadPending = true
-			log = current.log
-			current = nil
-		case err != nil:
-			if ctx.Err() != nil {
-				return current.stop()
+	var lastGood, next *config.Config
+	var rollbackCause error
+	reloadPending, firstLoad, initialStartup := true, true, false
+
+	stopCurrent := func() error {
+		if current == nil {
+			return nil
+		}
+		err := current.stop()
+		current = nil
+		return err
+	}
+	observeReadiness := func() {
+		if current == nil || current.started || ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-current.ready:
+			current.started = true
+			lastGood = current.cfg
+			switch {
+			case rollbackCause != nil:
+				log.Info("previous configuration restored", "config", cfgPath, "groups", len(lastGood.Groups))
+			case !initialStartup:
+				log.Info("configuration reloaded", "config", cfgPath, "groups", len(lastGood.Groups))
 			}
-			if shouldReturnProxyError(ctx, foreground, err) {
-				return err
-			}
-			log = current.log
-			log.Error("proxy startup error", "err", err)
-			log.Error("idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
-			current = nil
+			rollbackCause = nil
 		default:
-			log = current.log
 		}
 	}
 
 	for {
-		if !reloadPending {
-			var runtimeDone <-chan error
-			if current != nil {
-				runtimeDone = current.done
+		// Every startup, reload, and rollback passes this shutdown check.
+		if ctx.Err() != nil {
+			return stopCurrent()
+		}
+		observeReadiness()
+		if reloadPending {
+			reloadPending = false
+			initialStartup, firstLoad = firstLoad, false
+			candidate, loadErr := config.Load(cfgPath)
+			if ctx.Err() != nil {
+				return stopCurrent()
 			}
-			select {
-			case <-ctx.Done():
-				if current == nil {
-					return nil
+			observeReadiness()
+			switch {
+			case loadErr == nil:
+				if !initialStartup {
+					log.Info("configuration reload requested", "config", cfgPath)
 				}
-				return current.stop()
-			case runtimeErr := <-runtimeDone:
-				current.finished = true
-				current.runErr = runtimeErr
-				if runtimeErr == nil {
-					runtimeErr = errors.New("proxy runtime stopped unexpectedly")
-				}
-				if shouldReturnProxyError(ctx, foreground, runtimeErr) {
-					return runtimeErr
-				}
-				log.Error("proxy runtime error", "err", runtimeErr)
-				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
-				current = nil
+				next, rollbackCause = candidate, nil
+			case current != nil && current.started:
+				log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
 				continue
-			case <-reload:
+			case lastGood != nil:
+				log.Error("configuration reload failed", "err", loadErr)
+				log.Warn("restoring previous configuration")
+				next, rollbackCause = lastGood, loadErr
+				initialStartup = false
+			default:
+				stopErr := stopCurrent()
+				if ctx.Err() != nil {
+					return stopErr
+				}
+				if stopErr != nil {
+					loadErr = errors.Join(loadErr, stopErr)
+				}
+				if foreground {
+					return loadErr
+				}
+				log.Error("configuration error", "err", loadErr)
+				log.Error("idling until stopped or reloaded; fix the config and send SIGHUP")
+				continue
 			}
 		}
-		reloadPending = false
-		candidate, loadErr := config.Load(cfgPath)
-		if loadErr != nil {
-			log.Error("configuration reload failed; keeping current configuration", "err", loadErr)
-			continue
-		}
-
-		previous := cfg
-		log.Info("configuration reload requested", "config", cfgPath)
-		if current != nil {
-			if stopErr := current.stop(); stopErr != nil {
+		if next != nil {
+			stopErr := stopCurrent()
+			if ctx.Err() != nil {
+				return stopErr
+			}
+			if stopErr != nil {
 				log.Warn("stopping current runtime for reload", "err", stopErr)
 			}
-			current = nil
+			current = launchRuntime(ctx, cfgPath, next, cacheTTL, version)
+			log = current.log
+			next = nil
 		}
 
-		replacement, reloadErr := launchRuntime(ctx, reload, cfgPath, candidate, cacheTTL, version)
-		if errors.Is(reloadErr, errReloadRequested) {
-			reloadPending = true
-			continue
-		}
-		if reloadErr == nil {
-			cfg = candidate
-			current = replacement
-			log = replacement.log
-			log.Info("configuration reloaded", "config", cfgPath, "groups", len(candidate.Groups))
-			continue
-		}
-		if ctx.Err() != nil {
-			return replacement.stop()
-		}
-		replacement.log.Error("configuration reload failed", "err", reloadErr)
-
-		if previous == nil {
-			if shouldReturnProxyError(ctx, foreground, reloadErr) {
-				return reloadErr
+		var ready <-chan struct{}
+		var done <-chan error
+		if current != nil {
+			done = current.done
+			if !current.started {
+				ready = current.ready
 			}
-			log = replacement.log
-			log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
-			continue
 		}
-
-		replacement.log.Warn("restoring previous configuration")
-		rollback, rollbackErr := launchRuntime(ctx, reload, cfgPath, previous, cacheTTL, version)
-		if errors.Is(rollbackErr, errReloadRequested) {
+		select {
+		case <-ctx.Done():
+			continue
+		case <-reload:
 			reloadPending = true
+		case <-ready:
+			// Commit the configuration at the top of the loop, after checking
+			// shutdown, rather than treating a clean early exit as readiness.
 			continue
+		case runtimeErr := <-done:
+			observeReadiness()
+			current.finished = true
+			current.runErr = runtimeErr
+			current.cancel()
+			if ctx.Err() != nil {
+				return stopCurrent()
+			}
+			started := current.started
+			current = nil
+			if runtimeErr == nil {
+				runtimeErr = errors.New("proxy runtime stopped unexpectedly")
+			}
+			if !started && lastGood != nil && rollbackCause == nil {
+				log.Error("configuration reload failed", "err", runtimeErr)
+				log.Warn("restoring previous configuration")
+				next, rollbackCause = lastGood, runtimeErr
+				initialStartup = false
+				continue
+			}
+			if rollbackCause != nil {
+				runtimeErr = errors.Join(rollbackCause, fmt.Errorf("restoring previous configuration: %w", runtimeErr))
+			}
+			if shouldReturnProxyError(ctx, foreground, runtimeErr) {
+				return runtimeErr
+			}
+			log.Error("proxy runtime error", "err", runtimeErr)
+			log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 		}
-		if rollbackErr == nil {
-			current = rollback
-			log = rollback.log
-			log.Info("previous configuration restored", "config", cfgPath, "groups", len(previous.Groups))
-			continue
-		}
-		if ctx.Err() != nil {
-			return rollback.stop()
-		}
-		if shouldReturnProxyError(ctx, foreground, rollbackErr) {
-			return errors.Join(reloadErr, fmt.Errorf("restoring previous configuration: %w", rollbackErr))
-		}
-		log = rollback.log
-		log.Error("restoring previous configuration failed", "err", rollbackErr)
-		log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 	}
 }
 
 type runtimeInstance struct {
+	cfg      *config.Config
+	ready    <-chan struct{}
+	started  bool
 	cancel   context.CancelFunc
 	done     chan error
 	log      *slog.Logger
@@ -212,12 +222,11 @@ type runtimeInstance struct {
 
 func launchRuntime(
 	parent context.Context,
-	reload <-chan os.Signal,
 	cfgPath string,
 	cfg *config.Config,
 	cacheTTL time.Duration,
 	version Version,
-) (*runtimeInstance, error) {
+) *runtimeInstance {
 	ctx, cancel := context.WithCancel(parent)
 	log := logging.Setup(cfg.Debug)
 	srv := proxy.NewServer(ctx, cfg.Upstream, cacheTTL, log)
@@ -255,6 +264,8 @@ func launchRuntime(
 		"telemetry_report", telemetryReportInterval.String())
 
 	instance := &runtimeInstance{
+		cfg:    cfg,
+		ready:  ready,
 		cancel: cancel,
 		done:   make(chan error, 1),
 		log:    log,
@@ -266,31 +277,7 @@ func launchRuntime(
 		instance.done <- runErr
 	}()
 
-	return instance, instance.waitReady(parent, ready, reload)
-}
-
-func (r *runtimeInstance) waitReady(parent context.Context, ready <-chan struct{}, reload <-chan os.Signal) error {
-	select {
-	case <-ready:
-		return parent.Err()
-	case err := <-r.done:
-		r.finished = true
-		r.runErr = err
-		if parent.Err() != nil {
-			return errors.Join(parent.Err(), err)
-		}
-		if err == nil {
-			return errors.New("proxy runtime stopped before becoming ready")
-		}
-		return err
-	case <-parent.Done():
-		return parent.Err()
-	case <-reload:
-		if err := r.stop(); err != nil {
-			r.log.Warn("stopping runtime startup for reload", "err", err)
-		}
-		return errReloadRequested
-	}
+	return instance
 }
 
 func (r *runtimeInstance) stop() error {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 )
 
 const openSSHTestNamespace = "ssh-agent-proxy-test"
@@ -25,7 +26,7 @@ func TestOpenSSHClientInteroperability(t *testing.T) {
 	sshAdd := requireOpenSSHBinary(t, "ssh-add")
 	sshKeygen := requireOpenSSHBinary(t, "ssh-keygen")
 
-	socketDir := shortSocketDir(t)
+	socketDir := testutil.ShortSocketDir(t)
 	upstreamSocket := filepath.Join(socketDir, "upstream.sock")
 	groupSocket := filepath.Join(socketDir, "group.sock")
 

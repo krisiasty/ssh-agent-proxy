@@ -26,7 +26,15 @@ type upstreamConn struct {
 // reads, which lets reconnectClient distinguish them from a broken transport.
 type failureTrackingConn struct {
 	net.Conn
-	failed atomic.Bool
+	failed           atomic.Bool
+	stopCancellation func() bool
+}
+
+func (c *failureTrackingConn) Close() error {
+	if c.stopCancellation != nil {
+		c.stopCancellation()
+	}
+	return c.Conn.Close()
 }
 
 func (c *failureTrackingConn) Read(p []byte) (int, error) {
@@ -142,6 +150,12 @@ func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string,
 			return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
 		}
 		trackedConn := &failureTrackingConn{Conn: conn}
+		// Cancellation interrupts every pending wire operation without closing
+		// resources outside the server's ordered teardown. Signing has no
+		// deadline until the lifetime of this connection is canceled.
+		trackedConn.stopCancellation = context.AfterFunc(clientCtx, func() {
+			_ = conn.SetDeadline(time.Now())
+		})
 		call.finish(nil)
 		return agent.NewClient(trackedConn), trackedConn, nil
 	}
@@ -173,6 +187,10 @@ func (r *reconnectClient) logContext() context.Context {
 	return context.Background()
 }
 
+func (r *reconnectClient) canceled() bool {
+	return r.ctx != nil && r.ctx.Err() != nil
+}
+
 // reconnect replaces failed if it is still the current upstream connection.
 //
 // The identity check prevents callers that failed concurrently on the same old
@@ -182,7 +200,7 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.closed || r.logContext().Err() != nil {
+	if r.closed || r.canceled() {
 		return false
 	}
 	if r.current.Load() != failed {
@@ -192,12 +210,12 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	// Dial the replacement **before** touching the live pointer.
 	client, conn, err := r.dial()
 	if err != nil {
-		if r.logContext().Err() == nil {
+		if !r.canceled() {
 			r.log.Warn("upstream reconnect failed, proxy may not work", "err", err)
 		}
 		return false // keep old connection intact
 	}
-	if r.logContext().Err() != nil {
+	if r.canceled() {
 		if err := conn.Close(); err != nil {
 			r.log.Warn("closing upstream connection dialed during shutdown", "err", err)
 		}
