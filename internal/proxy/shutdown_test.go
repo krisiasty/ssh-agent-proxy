@@ -60,7 +60,8 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 			}
 
 			ctx, cancel := context.WithCancel(t.Context())
-			srv := NewServer(ctx, upstream, 0, slog.New(slog.DiscardHandler))
+			var logs lockedBuffer
+			srv := NewServer(ctx, upstream, 0, slog.New(slog.NewJSONHandler(&logs, nil)))
 			if scenario.nilTelemetry {
 				srv.newUpstreamClient = func(ctx context.Context, socket string, log *slog.Logger, _ *proxyTelemetry) (*reconnectClient, error) {
 					return newReconnectClientWithTelemetry(ctx, socket, log, nil)
@@ -89,6 +90,10 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 				if !testutil.WaitForEvent(t, ready, "proxy readiness") {
 					return
 				}
+				// The startup listing runs in the background after readiness. Wait
+				// for it so the client's request is the upstream's second List
+				// instead of joining the startup refresh.
+				waitForLogMessage(t, &logs, "group keys resolved")
 				var dialer net.Dialer
 				conn, dialErr := dialer.DialContext(t.Context(), "unix", socket)
 				if dialErr != nil {
