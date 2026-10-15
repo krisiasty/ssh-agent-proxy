@@ -19,6 +19,9 @@ import (
 type upstreamConn struct {
 	client agent.ExtendedAgent
 	conn   net.Conn
+	// unanswered is set when the watchdog drops the connection because a
+	// request on it went unanswered.
+	unanswered atomic.Bool
 }
 
 // failureTrackingConn records I/O failures without changing the error returned
@@ -115,11 +118,12 @@ func (c upstreamCall) finish(err error, attrs ...any) {
 // reconnectClient wraps a shared upstream agent client and reconnects
 // transparently if the connection dies.
 //
-// The current pointer is an atomic.Pointer that is never nil — get() is
-// always a lock-free load. Reconnect is serialized so only one goroutine
-// dials at a time, and the new connection is dialed **before** swapping to
-// eliminate the nil-window panic that existed in the previous Swap(nil) →
-// dial → Store sequence.
+// The first connection is dialed on first use rather than at construction, so
+// an agent that is not running yet never keeps the group sockets unbound. The
+// current pointer is nil until that dial succeeds, and again after the
+// request watchdog drops a stuck connection; loading it is lock-free. Dialing
+// is serialized so only one goroutine dials at a time, and a replacement for a
+// failed connection is dialed **before** swapping.
 type reconnectClient struct {
 	upstream  string
 	log       *slog.Logger
@@ -128,11 +132,16 @@ type reconnectClient struct {
 	current   atomic.Pointer[upstreamConn]
 	telemetry *proxyTelemetry
 
+	// requestTimeout is how long a request may go unanswered before the
+	// connection is dropped; zero disables the watchdog.
+	requestTimeout time.Duration
+
 	dial func() (agent.ExtendedAgent, net.Conn, error)
 
-	mu       sync.Mutex // guards reconnect and shutdown
-	closed   bool
-	closeErr error
+	mu        sync.Mutex // guards reconnect and shutdown
+	closed    bool
+	closeErr  error
+	connected bool // a connection has been established before
 }
 
 func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
@@ -151,33 +160,68 @@ func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string,
 		}
 		trackedConn := &failureTrackingConn{Conn: conn}
 		// Cancellation interrupts every pending wire operation without closing
-		// resources outside the server's ordered teardown. Signing has no
-		// deadline until the lifetime of this connection is canceled.
+		// resources outside the server's ordered teardown. Requests carry no
+		// wire deadline; only cancellation and the request watchdog end them.
 		trackedConn.stopCancellation = context.AfterFunc(clientCtx, func() {
 			_ = conn.SetDeadline(time.Now())
 		})
 		call.finish(nil)
 		return agent.NewClient(trackedConn), trackedConn, nil
 	}
-	rc := &reconnectClient{
+	return &reconnectClient{
 		upstream:  upstream,
 		log:       log,
 		ctx:       clientCtx,
 		cancel:    cancelClient,
 		telemetry: telemetry,
 		dial:      dial,
-	}
-	client, conn, err := rc.dial()
-	if err != nil {
-		cancelClient()
-		return nil, fmt.Errorf("initial upstream connection: %w", err)
-	}
-	rc.current.Store(&upstreamConn{client: client, conn: conn})
-	return rc, nil
+	}, nil
 }
 
-func (r *reconnectClient) get() agent.ExtendedAgent {
-	return r.current.Load().client
+// errUpstreamClosed reports a request made after the client was closed or its
+// lifetime ended.
+var errUpstreamClosed = fmt.Errorf("upstream agent client closed: %w", net.ErrClosed)
+
+// connection returns the current upstream connection, dialing the first one
+// if none is open yet. A failed dial is returned to the caller and retried on
+// the next request, so the proxy connects as soon as the agent is available.
+func (r *reconnectClient) connection() (*upstreamConn, error) {
+	if current := r.current.Load(); current != nil {
+		return current, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed || r.canceled() {
+		return nil, errUpstreamClosed
+	}
+	if current := r.current.Load(); current != nil {
+		return current, nil
+	}
+	client, conn, err := r.dial()
+	if err != nil {
+		return nil, err
+	}
+	if r.canceled() {
+		if err := conn.Close(); err != nil {
+			r.log.Warn("closing upstream connection dialed during shutdown", "err", err)
+		}
+		return nil, errUpstreamClosed
+	}
+	current := &upstreamConn{client: client, conn: conn}
+	r.current.Store(current)
+	// A dial after an earlier connection, such as one the watchdog dropped, is
+	// a reconnect; only the first connection is not.
+	if r.connected {
+		if r.telemetry != nil {
+			r.telemetry.upstreamReconnects.Add(1)
+		}
+		r.log.Warn("upstream reconnected")
+	} else {
+		r.connected = true
+		r.log.Info("upstream connected")
+	}
+	return current, nil
 }
 
 func (r *reconnectClient) logContext() context.Context {
@@ -200,7 +244,9 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	if r.closed || r.canceled() {
 		return false
 	}
-	if r.current.Load() != failed {
+	// Another caller already installed a replacement. A nil pointer means the
+	// watchdog dropped the connection, so a replacement is still needed.
+	if current := r.current.Load(); current != failed && current != nil {
 		return true
 	}
 
@@ -220,14 +266,59 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	}
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
+	r.connected = true
 	if r.telemetry != nil {
 		r.telemetry.upstreamReconnects.Add(1)
 	}
 	r.log.Warn("upstream reconnected")
-	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "close", "connection", "replaced")
-	err = old.conn.Close()
-	call.finish(err)
+	if old != nil {
+		call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "close", "connection", "replaced")
+		err = old.conn.Close()
+		call.finish(err)
+	}
 	return true
+}
+
+// watch starts the request watchdog for one request on current and returns a
+// function that stops it once the request returns. The agent answers the
+// requests on a connection in order, so one left unanswered for
+// requestTimeout means the connection is stuck: everything queued behind it
+// would wait forever, even after the agent recovers. Dropping it fails those
+// requests, as they would fail against a hung agent anyway, and the next
+// request dials a fresh connection, so the proxy recovers on its own once the
+// agent answers again, as clients connecting to the agent directly would.
+func (r *reconnectClient) watch(current *upstreamConn) (stop func()) {
+	if r.requestTimeout <= 0 {
+		return func() {}
+	}
+	timer := time.AfterFunc(r.requestTimeout, func() { r.drop(current) })
+	return func() { timer.Stop() }
+}
+
+// drop closes current after a request on it went unanswered and clears it, so
+// the next request dials a replacement.
+func (r *reconnectClient) drop(current *upstreamConn) {
+	if !current.unanswered.CompareAndSwap(false, true) {
+		return
+	}
+	if !r.current.CompareAndSwap(current, nil) {
+		// Already replaced or closed by another path.
+		return
+	}
+	if !r.canceled() {
+		r.log.Warn("upstream request unanswered; dropping connection", "timeout", r.requestTimeout.String())
+	}
+	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "close", "connection", "unanswered")
+	call.finish(current.conn.Close())
+}
+
+// unansweredErr explains a request error caused by the watchdog dropping
+// current.
+func (r *reconnectClient) unansweredErr(current *upstreamConn, err error) error {
+	if err == nil || !current.unanswered.Load() {
+		return err
+	}
+	return fmt.Errorf("upstream agent left a request unanswered for %s: %w", r.requestTimeout, err)
 }
 
 // Close interrupts reconnects and closes the current upstream connection once.
@@ -253,20 +344,32 @@ func (r *reconnectClient) Close(ctx context.Context) error {
 }
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {
-	current := r.current.Load()
+	current, err := r.connection()
+	if err != nil {
+		return nil, err
+	}
 	ks, err := r.listAttempt(current, 1)
-	if err == nil || !current.transportFailed(err) {
+	// A request the watchdog dropped is not retried: an immediate retry would
+	// wait out the timeout again against the same stuck agent.
+	if err == nil || !current.transportFailed(err) || current.unanswered.Load() {
 		return ks, err
 	}
 	if !r.reconnect(current) {
 		return nil, err
 	}
-	return r.listAttempt(r.current.Load(), 2)
+	next, nextErr := r.connection()
+	if nextErr != nil {
+		return nil, err
+	}
+	return r.listAttempt(next, 2)
 }
 
 func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*agent.Key, error) {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "list", "attempt", attempt)
+	stop := r.watch(current)
 	ks, err := current.client.List()
+	stop()
+	err = r.unansweredErr(current, err)
 	call.finish(err, "keys", len(ks))
 	if err == nil && r.log.Enabled(r.logContext(), slog.LevelDebug) {
 		for i, key := range ks {
@@ -281,9 +384,12 @@ func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*ag
 }
 
 func (r *reconnectClient) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
-	current := r.current.Load()
+	current, err := r.connection()
+	if err != nil {
+		return nil, err
+	}
 	sig, err := r.signAttempt(current, key, data)
-	if current.transportFailed(err) {
+	if current.transportFailed(err) && !current.unanswered.Load() {
 		r.reconnect(current)
 	}
 	return sig, err
@@ -294,15 +400,21 @@ func (r *reconnectClient) signAttempt(current *upstreamConn, key ssh.PublicKey, 
 		"attempt", 1,
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"payload_bytes", len(data))
+	stop := r.watch(current)
 	sig, err := current.client.Sign(key, data)
+	stop()
+	err = r.unansweredErr(current, err)
 	call.finish(err)
 	return sig, err
 }
 
 func (r *reconnectClient) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	current := r.current.Load()
+	current, err := r.connection()
+	if err != nil {
+		return nil, err
+	}
 	sig, err := r.signWithFlagsAttempt(current, key, data, flags)
-	if current.transportFailed(err) {
+	if current.transportFailed(err) && !current.unanswered.Load() {
 		r.reconnect(current)
 	}
 	return sig, err
@@ -314,56 +426,82 @@ func (r *reconnectClient) signWithFlagsAttempt(current *upstreamConn, key ssh.Pu
 		"fingerprint", ssh.FingerprintSHA256(key),
 		"flags", flags,
 		"payload_bytes", len(data))
+	stop := r.watch(current)
 	sig, err := current.client.SignWithFlags(key, data, flags)
+	stop()
+	err = r.unansweredErr(current, err)
 	call.finish(err)
 	return sig, err
 }
 
 func (r *reconnectClient) Add(key agent.AddedKey) error {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "add")
-	err := r.get().Add(key)
+	err := r.withConnection(func(up agent.ExtendedAgent) error { return up.Add(key) })
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Remove(key ssh.PublicKey) error {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "remove", "fingerprint", ssh.FingerprintSHA256(key))
-	err := r.get().Remove(key)
+	err := r.withConnection(func(up agent.ExtendedAgent) error { return up.Remove(key) })
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) RemoveAll() error {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "remove-all")
-	err := r.get().RemoveAll()
+	err := r.withConnection(func(up agent.ExtendedAgent) error { return up.RemoveAll() })
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Lock(passphrase []byte) error {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "lock")
-	err := r.get().Lock(passphrase)
+	err := r.withConnection(func(up agent.ExtendedAgent) error { return up.Lock(passphrase) })
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Unlock(passphrase []byte) error {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "unlock")
-	err := r.get().Unlock(passphrase)
+	err := r.withConnection(func(up agent.ExtendedAgent) error { return up.Unlock(passphrase) })
 	call.finish(err)
 	return err
 }
 
 func (r *reconnectClient) Signers() ([]ssh.Signer, error) {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "signers")
-	signers, err := r.get().Signers()
+	var signers []ssh.Signer
+	err := r.withConnection(func(up agent.ExtendedAgent) error {
+		var err error
+		signers, err = up.Signers()
+		return err
+	})
 	call.finish(err, "signers", len(signers))
 	return signers, err
 }
 
 func (r *reconnectClient) Extension(s string, b []byte) ([]byte, error) {
 	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "extension", "extension", s, "payload_bytes", len(b))
-	result, err := r.get().Extension(s, b)
+	var result []byte
+	err := r.withConnection(func(up agent.ExtendedAgent) error {
+		var err error
+		result, err = up.Extension(s, b)
+		return err
+	})
 	call.finish(err, "result_bytes", len(result))
 	return result, err
+}
+
+// withConnection runs op on the current upstream connection, dialing it first
+// if needed.
+func (r *reconnectClient) withConnection(op func(agent.ExtendedAgent) error) error {
+	current, err := r.connection()
+	if err != nil {
+		return err
+	}
+	stop := r.watch(current)
+	err = op(current.client)
+	stop()
+	return r.unansweredErr(current, err)
 }

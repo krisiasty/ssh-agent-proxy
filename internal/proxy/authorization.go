@@ -35,6 +35,10 @@ type groupAuthorization struct {
 	mu        sync.Mutex
 	inFlight  *authorizationRefresh
 	unmatched []bool
+
+	// onJoin, when set, is called whenever a client starts waiting for a
+	// refresh that is already in flight. It must not block.
+	onJoin func()
 }
 
 func newGroupAuthorization(group string, matchers []keys.Matcher, log *slog.Logger) *groupAuthorization {
@@ -97,6 +101,9 @@ func (a *groupAuthorization) joinRefresh(trigger string) (*authorizationRefresh,
 
 func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRefresh, bool) {
 	if a.inFlight != nil {
+		if a.onJoin != nil {
+			a.onJoin()
+		}
 		return a.inFlight, false
 	}
 	refresh := &authorizationRefresh{done: make(chan struct{}), trigger: trigger}
@@ -106,6 +113,12 @@ func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRe
 
 func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authorizationRefresh) {
 	all, err := up.List()
+	a.finishRefresh(refresh, all, err)
+}
+
+// finishRefresh publishes the result of an upstream listing for refresh and
+// wakes every client waiting for it.
+func (a *groupAuthorization) finishRefresh(refresh *authorizationRefresh, all []*agent.Key, err error) {
 	var visible []*agent.Key
 	if err == nil {
 		visible = a.resolve(all, refresh.trigger)

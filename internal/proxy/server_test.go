@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -244,20 +243,43 @@ func TestServerRunSignalsReadyWithoutEnabledGroups(t *testing.T) {
 	}
 }
 
-func TestServerRunReturnsInitialDialError(t *testing.T) {
-	t.Parallel()
+func TestServerServesBeforeUpstreamAgentStarts(t *testing.T) {
+	dir := testutil.ShortSocketDir(t)
+	upstream := filepath.Join(dir, "upstream.sock")
+	socket := filepath.Join(dir, "group.sock")
+	var output lockedBuffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer(t.Context(), upstream, 0, log)
+	ready := make(chan struct{})
+	srv.SetReadyCallback(func() { close(ready) })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+	t.Cleanup(func() {
+		cancel()
+		if testutil.WaitForAsyncStop(t, done, "proxy server") && done.Err() != nil {
+			t.Errorf("Run() error = %v, want clean shutdown", done.Err())
+		}
+	})
 
-	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(t.Context(), missingUpstream, 0, slog.New(slog.DiscardHandler))
-	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
+	// No agent is listening yet: the socket is still served, and resolution
+	// is deferred until a client request.
+	if !testutil.WaitForEvent(t, ready, "readiness without an upstream agent") {
+		return
+	}
+	waitForLogMessage(t, &output, "initial config key resolution failed; deferring until client request")
 
-	err := srv.Run(t.Context(), groups)
-	if err == nil {
-		t.Fatal("Run() error = nil, want initial dial error")
+	// Once the agent starts, the next client request connects to it.
+	testutil.StartAgent(t, upstream, testutil.NewKeyring(t))
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "unix", socket)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "initial upstream connection") {
-		t.Fatalf("Run() error = %q, want initial upstream connection context", err)
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := agent.NewClient(conn).List(); err != nil {
+		t.Fatalf("client List() after the agent started: %v", err)
 	}
+	waitForLogMessage(t, &output, "upstream connected")
 }
 
 func TestServerRunReportsForeignCancellationError(t *testing.T) {
@@ -278,7 +300,7 @@ func TestServerRunReportsForeignCancellationError(t *testing.T) {
 }
 
 func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer(t.Context(), "unused", 0, log)
 	srv.SetReadyCallback(func() {
@@ -327,6 +349,7 @@ groups:
 	}
 	done = testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
 	waitForSocket(t, socket, done, nil)
+	waitForLogMessage(t, &output, "group keys resolved")
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during startup = %d, want 1", got)
 	}
@@ -340,16 +363,16 @@ groups:
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
-	serving := findDebugLog(t, entries, "serving group", "")
-	if serving["group"] != "test" || serving["keys"] != float64(2) {
-		t.Errorf("serving group log = %v, want 2 distinct matched keys", serving)
+	resolved := findDebugLog(t, entries, "group keys resolved", "")
+	if resolved["group"] != "test" || resolved["keys"] != float64(2) {
+		t.Errorf("group keys resolved log = %v, want 2 distinct matched keys", resolved)
 	}
 	resolution := findDebugLog(t, entries, "config keys resolved", "")
 	if resolution["trigger"] != "startup" || resolution["configured_keys"] != float64(4) ||
 		resolution["upstream_keys"] != float64(2) || resolution["resolved_keys"] != float64(2) {
 		t.Errorf("startup resolution log = %v", resolution)
 	}
-	servingIndex, readyIndex, readyCalls := -1, -1, 0
+	servingIndex, readyIndex, resolvedIndex, readyCalls := -1, -1, -1, 0
 	for i, entry := range entries {
 		switch entry["msg"] {
 		case "serving group":
@@ -357,10 +380,15 @@ groups:
 		case "server ready callback":
 			readyIndex = i
 			readyCalls++
+		case "group keys resolved":
+			resolvedIndex = i
 		}
 	}
 	if readyCalls != 1 || readyIndex <= servingIndex {
 		t.Errorf("ready callback calls = %d at index %d, serving group index = %d", readyCalls, readyIndex, servingIndex)
+	}
+	if resolvedIndex <= servingIndex {
+		t.Errorf("group keys resolved at index %d, want after serving group at index %d", resolvedIndex, servingIndex)
 	}
 
 	warnings := make(map[float64]string)
@@ -415,6 +443,7 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	done = testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
 	waitForSocket(t, socket, done, nil)
+	waitForLogMessage(t, &output, "initial config key resolution failed; deferring until client request")
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during failed startup resolution = %d, want 1", got)
 	}
@@ -465,6 +494,22 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	if _, ok := serving["keys"]; ok {
 		t.Errorf("serving group log reports a key count after failed resolution: %v", serving)
 	}
+}
+
+// waitForLogMessage waits until output holds a JSON log entry with message.
+// Startup key resolution logs from the background, after readiness.
+func waitForLogMessage(t *testing.T, output *lockedBuffer, message string) {
+	t.Helper()
+	deadline := time.Now().Add(testutil.WaitTimeout)
+	for time.Now().Before(deadline) {
+		for _, entry := range decodeDebugLogs(t, output.Bytes()) {
+			if entry["msg"] == message {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for log %q", message)
 }
 
 // lockedBuffer allows tests to inspect logs while asynchronous connection
