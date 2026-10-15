@@ -30,6 +30,12 @@ import (
 const (
 	// dialTimeout bounds how long connecting to the upstream agent may take.
 	dialTimeout = 10 * time.Second
+	// startupListTimeout bounds the initial identity listing, so an agent that
+	// accepts connections but never answers cannot keep the group sockets
+	// unbound. A responsive agent, even a locked one, answers almost at once.
+	// Requests made after startup, including interactive signing, are not
+	// bounded.
+	startupListTimeout = 10 * time.Second
 	// socketProbeTimeout bounds the live-owner check before a stale socket is
 	// removed. A timeout is ambiguous and therefore treated as a live owner.
 	socketProbeTimeout = time.Second
@@ -52,6 +58,7 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
+	startupTimeout    time.Duration
 	onReady           func()
 	telemetry         *proxyTelemetry
 	clientsMu         sync.Mutex
@@ -81,6 +88,7 @@ func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log
 	}
 	s.newUpstreamClient = newReconnectClientWithTelemetry
 	s.listen = s.listenUnix
+	s.startupTimeout = startupListTimeout
 	return s
 }
 
@@ -189,14 +197,17 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
 	}
-	allKeys, err := upstream.List()
+	allKeys, err := upstream.listUsing(func() ([]*agent.Key, error) { return rc.listWithin(ctx, s.startupTimeout) })
 	// A List interrupted by shutdown or reload is not an upstream failure.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err != nil {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		s.log.Warn("initial key listing timed out; deferring until client request", "timeout", s.startupTimeout.String())
+	case err != nil:
 		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
-	} else {
+	default:
 		for i := range egs {
 			egs[i].resolvedKeys = len(egs[i].authorization.resolve(allKeys, "startup"))
 			egs[i].resolved = true

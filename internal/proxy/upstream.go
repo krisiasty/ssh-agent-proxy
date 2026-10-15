@@ -193,7 +193,9 @@ func (r *reconnectClient) canceled() bool {
 // The identity check prevents callers that failed concurrently on the same old
 // connection from replacing and closing a replacement installed by another
 // caller. The return value reports whether a usable replacement is available.
-func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
+// logCtx scopes logging only; the replacement dial is bounded by the client's
+// lifetime, not by the caller's request.
+func (r *reconnectClient) reconnect(logCtx context.Context, failed *upstreamConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -224,7 +226,7 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 		r.telemetry.upstreamReconnects.Add(1)
 	}
 	r.log.Warn("upstream reconnected")
-	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "close", "connection", "replaced")
+	call := beginTrackedUpstreamCall(logCtx, r.log, r.telemetry, "close", "connection", "replaced")
 	err = old.conn.Close()
 	call.finish(err)
 	return true
@@ -254,21 +256,48 @@ func (r *reconnectClient) Close(ctx context.Context) error {
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {
 	current := r.current.Load()
-	ks, err := r.listAttempt(current, 1)
+	ks, err := r.listAttempt(r.logContext(), current, 1)
 	if err == nil || !current.transportFailed(err) {
 		return ks, err
 	}
-	if !r.reconnect(current) {
+	if !r.reconnect(r.logContext(), current) {
 		return nil, err
 	}
-	return r.listAttempt(r.current.Load(), 2)
+	return r.listAttempt(r.logContext(), r.current.Load(), 2)
 }
 
-func (r *reconnectClient) listAttempt(current *upstreamConn, attempt int) ([]*agent.Key, error) {
-	call := beginTrackedUpstreamCall(r.logContext(), r.log, r.telemetry, "list", "attempt", attempt)
+// listWithin lists identities with a single request that ends when ctx ends or
+// timeout elapses. It is meant for startup, before any client shares the
+// connection: the deadline it sets covers the whole connection, so once it
+// fires the connection is replaced and a late reply can never be matched to a
+// later request. It does not retry, because a replacement connection carries
+// no deadline and would stall again against an unresponsive agent.
+func (r *reconnectClient) listWithin(ctx context.Context, timeout time.Duration) ([]*agent.Key, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	current := r.current.Load()
+	stop := context.AfterFunc(ctx, func() {
+		_ = current.conn.SetDeadline(time.Now())
+	})
+	ks, err := r.listAttempt(ctx, current, 1)
+	if !stop() {
+		r.reconnect(ctx, current)
+		if err == nil {
+			return ks, nil
+		}
+		return nil, fmt.Errorf("listing upstream identities: %w", ctx.Err())
+	}
+	if current.transportFailed(err) {
+		r.reconnect(ctx, current)
+	}
+	return ks, err
+}
+
+func (r *reconnectClient) listAttempt(ctx context.Context, current *upstreamConn, attempt int) ([]*agent.Key, error) {
+	call := beginTrackedUpstreamCall(ctx, r.log, r.telemetry, "list", "attempt", attempt)
 	ks, err := current.client.List()
 	call.finish(err, "keys", len(ks))
-	if err == nil && r.log.Enabled(r.logContext(), slog.LevelDebug) {
+	if err == nil && r.log.Enabled(ctx, slog.LevelDebug) {
 		for i, key := range ks {
 			r.log.Debug(fmt.Sprintf("identity %d/%d", i+1, len(ks)),
 				"fingerprint", ssh.FingerprintSHA256(key),
@@ -284,7 +313,7 @@ func (r *reconnectClient) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, 
 	current := r.current.Load()
 	sig, err := r.signAttempt(current, key, data)
 	if current.transportFailed(err) {
-		r.reconnect(current)
+		r.reconnect(r.logContext(), current)
 	}
 	return sig, err
 }
@@ -303,7 +332,7 @@ func (r *reconnectClient) SignWithFlags(key ssh.PublicKey, data []byte, flags ag
 	current := r.current.Load()
 	sig, err := r.signWithFlagsAttempt(current, key, data, flags)
 	if current.transportFailed(err) {
-		r.reconnect(current)
+		r.reconnect(r.logContext(), current)
 	}
 	return sig, err
 }

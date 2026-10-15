@@ -174,7 +174,7 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			}
 			var reconnected bool
 			result := testutil.RunAsync(func() error {
-				reconnected = client.reconnect(original)
+				reconnected = client.reconnect(t.Context(), original)
 				return nil
 			})
 			if !testutil.WaitForEvent(t, entered, "replacement dial") {
@@ -222,7 +222,7 @@ func TestReconnectClientCloseIsFinalAndIdempotent(t *testing.T) {
 		})
 	}
 	calls.Wait()
-	if client.reconnect(client.current.Load()) {
+	if client.reconnect(t.Context(), client.current.Load()) {
 		t.Error("closed upstream reconnected")
 	}
 	if got := transport.closeCalls.Load(); got != 1 {

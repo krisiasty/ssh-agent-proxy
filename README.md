@@ -408,15 +408,18 @@ the config or upstream agent and reload the service. In `-foreground` mode it re
 the error and exits instead. With no enabled groups, it idles without connecting to the
 upstream agent because it has no sockets to serve.
 
-Stopping or reloading the service interrupts outstanding upstream requests, allowing
-recovery even when the upstream agent stops responding.
+Stopping or reloading the service interrupts outstanding upstream requests, so shutdown,
+restart, and reload complete even when the upstream agent stops responding.
 
 One shared upstream identity list resolves every enabled group during startup. If the
-connected upstream agent is locked or listing otherwise fails, the proxy still starts
-serving and defers resolution until a client request. It picks up matching keys after the
-agent is unlocked or populated. Successful upstream key lists are cached process-wide
-for the configured `--cache` interval. Concurrent refreshes across every group share one
-request; if a refresh fails, the last successful list is served until the next interval.
+connected upstream agent is locked, listing otherwise fails, or the agent does not answer
+within 10 seconds, the proxy still starts serving and defers resolution until a client
+request. It picks up matching keys after the agent is unlocked, populated, or responding
+again. Only this startup listing has a time limit: later requests, including signing that
+waits for interactive approval, wait as long as the agent needs. Successful upstream key
+lists are cached process-wide for the configured `--cache` interval. Concurrent refreshes
+across every group share one request; if a refresh fails, the last successful list is
+served until the next interval.
 
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup
