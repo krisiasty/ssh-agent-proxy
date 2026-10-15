@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -244,20 +243,43 @@ func TestServerRunSignalsReadyWithoutEnabledGroups(t *testing.T) {
 	}
 }
 
-func TestServerRunReturnsInitialDialError(t *testing.T) {
-	t.Parallel()
+func TestServerServesBeforeUpstreamAgentStarts(t *testing.T) {
+	dir := testutil.ShortSocketDir(t)
+	upstream := filepath.Join(dir, "upstream.sock")
+	socket := filepath.Join(dir, "group.sock")
+	var output lockedBuffer
+	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := NewServer(t.Context(), upstream, 0, log)
+	ready := make(chan struct{})
+	srv.SetReadyCallback(func() { close(ready) })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+	t.Cleanup(func() {
+		cancel()
+		if testutil.WaitForAsyncStop(t, done, "proxy server") && done.Err() != nil {
+			t.Errorf("Run() error = %v, want clean shutdown", done.Err())
+		}
+	})
 
-	missingUpstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	srv := NewServer(t.Context(), missingUpstream, 0, slog.New(slog.DiscardHandler))
-	groups := []config.Group{{Name: "test", Socket: filepath.Join(t.TempDir(), "group.sock")}}
+	// No agent is listening yet: the socket is still served, and resolution
+	// is deferred until a client request.
+	if !testutil.WaitForEvent(t, ready, "readiness without an upstream agent") {
+		return
+	}
+	waitForLogMessage(t, &output, "initial config key resolution failed; deferring until client request")
 
-	err := srv.Run(t.Context(), groups)
-	if err == nil {
-		t.Fatal("Run() error = nil, want initial dial error")
+	// Once the agent starts, the next client request connects to it.
+	testutil.StartAgent(t, upstream, testutil.NewKeyring(t))
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "unix", socket)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "initial upstream connection") {
-		t.Fatalf("Run() error = %q, want initial upstream connection context", err)
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := agent.NewClient(conn).List(); err != nil {
+		t.Fatalf("client List() after the agent started: %v", err)
 	}
+	waitForLogMessage(t, &output, "upstream connected")
 }
 
 func TestServerRunReportsForeignCancellationError(t *testing.T) {

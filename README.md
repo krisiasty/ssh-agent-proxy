@@ -141,7 +141,7 @@ proxy restores the last configuration that reached readiness. This also applies 
 a reload interrupts a stalled replacement and the newly saved configuration is invalid.
 With no ready configuration to restore, managed mode idles and foreground mode returns
 the startup error. A managed service that is idling
-after an initial config or upstream error can also recover when reloaded. A foreground
+after an initial config or startup error can also recover when reloaded. A foreground
 process accepts `SIGHUP` directly; `-reload` specifically targets the installed managed
 service. The command-line `--cache` value is not reloaded because it is stored in the
 service definition.
@@ -404,19 +404,22 @@ groups:
 Configuration is read at startup and on `SIGHUP`; run `ssh-agent-proxy -reload` to apply
 changes to a managed service.
 
-If the config cannot be read or validated, or the initial upstream connection cannot be
-opened, the service logs the error and idles rather than exiting into a restart loop. Fix
-the config or upstream agent and reload the service. In `-foreground` mode it returns
-the error and exits instead. With no enabled groups, it idles without connecting to the
-upstream agent because it has no sockets to serve.
+If the config cannot be read or validated, or a group socket cannot be bound, the service
+logs the error and idles rather than exiting into a restart loop. Fix the problem and
+reload the service. In `-foreground` mode it returns the error and exits instead. With no
+enabled groups, it idles without connecting to the upstream agent because it has no
+sockets to serve.
 
 Stopping or reloading the service interrupts outstanding upstream requests, so shutdown,
 restart, and reload complete even when the upstream agent stops responding.
 
-Binding the group sockets needs only the upstream connection described above, not an
-answer from the agent, so an agent that is slow, locked, or stops answering requests does
-not keep them unbound. Once the sockets are bound, one shared upstream identity list
-resolves every enabled group in the background, and clients that connect before it
+The upstream connection is opened on first use rather than at startup, and binding the
+group sockets waits neither for that connection nor for an answer from the agent. An
+agent that is not running yet, for example a password manager that starts after the proxy
+at login, or one that is slow, locked, or stops answering requests, does not keep the
+sockets unbound. Requests fail while the agent is unavailable, and the first request
+after it starts connects to it. Once the sockets are bound, one shared upstream identity
+list resolves every enabled group in the background, and clients that connect before it
 completes wait for that list instead of sending their own. No upstream request has a time
 limit, so an agent that waits for an unlock or for interactive approval is never cut off.
 If listing fails, the proxy defers resolution until a client request and picks up

@@ -172,7 +172,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	// cannot handle many concurrent connections. agent.NewClient pipelines
 	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
 	// The reconnecting wrapper will dial a fresh connection if the current one
-	// dies, so a single failure does not kill all clients.
+	// dies, so a single failure does not kill all clients. It dials on first
+	// use, so an agent that is missing or not accepting connections yet does
+	// not keep the group sockets unbound.
 	rc, err = s.newUpstreamClient(ctx, s.upstream, s.log, s.telemetry)
 	if err != nil {
 		return err

@@ -52,17 +52,16 @@ func TestRunDoesNotLogForegroundConfigError(t *testing.T) {
 }
 
 func TestRunReturnsForegroundProxyStartupError(t *testing.T) {
-	path := writeRuntimeConfig(t, filepath.Join(t.TempDir(), "missing-agent.sock"))
+	path, _ := writeOccupiedRuntimeConfig(t)
 
 	err := run(t.Context(), path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
-	if err == nil {
-		t.Fatal("run() error = nil, want proxy startup error")
+	if !errors.Is(err, proxy.ErrSocketInUse) {
+		t.Fatalf("run() error = %v, want proxy startup error for the occupied socket", err)
 	}
 }
 
 func TestRunLogsConfigBeforeUpstream(t *testing.T) {
-	upstream := filepath.Join(t.TempDir(), "missing-agent.sock")
-	path := writeRuntimeConfig(t, upstream)
+	path, upstream := writeOccupiedRuntimeConfig(t)
 
 	_, finish := captureRuntimeLogs(t)
 	runErr := run(t.Context(), path, true, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
@@ -95,14 +94,14 @@ func TestRunLogsConfigBeforeUpstream(t *testing.T) {
 
 func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 	events, _ := captureRuntimeLogs(t)
-	path := writeRuntimeConfig(t, filepath.Join(t.TempDir(), "missing-agent.sock"))
+	path, _ := writeOccupiedRuntimeConfig(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := testutil.RunAsync(func() error {
 		return run(ctx, path, false, 3*time.Second, Version{Version: "test", Commit: "none", Date: "unknown"})
 	})
 	t.Cleanup(func() { cancel(); testutil.WaitForAsyncStop(t, done, "runtime") })
 	waitForRuntimeLog(t, events, "proxy startup error")
-	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
+	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
 	select {
 	case <-done.Done():
 		t.Fatalf("run() returned before cancellation with error %v", done.Err())
@@ -161,13 +160,15 @@ func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) 
 	if _, err := agent.NewClient(secondConn).List(); err != nil {
 		t.Fatalf("listing through second persistent connection: %v", err)
 	}
-	failedSocket := filepath.Join(dir, "failed.sock")
-	writeReloadConfig(t, configPath, filepath.Join(dir, "missing-upstream.sock"), "failed", failedSocket)
+	// The replacement fails because another listener owns its socket, so the
+	// second configuration is restored and the other socket is left alone.
+	failedSocket := occupySocket(t, filepath.Join(dir, "failed.sock"))
+	writeReloadConfig(t, configPath, upstream, "failed", failedSocket)
 	reload <- syscall.SIGHUP
 	waitForConnectionClose(t, secondConn)
 	waitForAgentSocket(t, secondSocket)
-	if _, err := os.Lstat(failedSocket); !os.IsNotExist(err) {
-		t.Errorf("failed replacement left socket %q behind: %v", failedSocket, err)
+	if _, err := os.Lstat(failedSocket); err != nil {
+		t.Errorf("failed replacement removed socket %q owned by another listener: %v", failedSocket, err)
 	}
 
 	cancel()
@@ -176,6 +177,32 @@ func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) 
 			t.Fatalf("runWithReload() error = %v", err)
 		}
 	}
+}
+
+// occupySocket serves a Unix socket at path for the rest of the test, so a
+// runtime configured to bind it fails with proxy.ErrSocketInUse.
+func occupySocket(t *testing.T, path string) string {
+	t.Helper()
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(t.Context(), "unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return path
+}
+
+// writeOccupiedRuntimeConfig writes a config whose group socket is already
+// served by another listener, so the runtime fails at startup. The upstream
+// agent is absent, which no longer fails startup on its own.
+func writeOccupiedRuntimeConfig(t *testing.T) (path, upstream string) {
+	t.Helper()
+	dir := testutil.ShortSocketDir(t)
+	upstream = filepath.Join(dir, "missing-agent.sock")
+	socket := occupySocket(t, filepath.Join(dir, "group.sock"))
+	path = filepath.Join(dir, "config.yaml")
+	writeReloadConfig(t, path, upstream, "test", socket)
+	return path, upstream
 }
 
 func writeRuntimeConfig(t *testing.T, upstream string) string {
@@ -363,7 +390,8 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 			if !testutil.WaitForEvent(t, gate.Started(), "stalled runtime startup") {
 				return
 			}
-			writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
+			busy := occupySocket(t, filepath.Join(dir, "busy.sock"))
+			writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", busy)
 			reload <- syscall.SIGHUP
 			if foreground {
 				if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
@@ -373,7 +401,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 					}
 				}
 			} else {
-				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
+				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
 			}
 			if stalls := gate.Stalls(); stalls != 1 {
 				t.Errorf("unready config was relaunched: stalled startups = %d, want 1", stalls)
@@ -452,14 +480,18 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	events, finish := captureRuntimeLogs(t)
 	dir := testutil.ShortSocketDir(t)
 	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), testutil.NewKeyring(t))
+	gate := newStartupGate(t, upstream)
 	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 	writeReloadConfig(t, path, upstream, "ready", socket)
 	ctx, cancel := context.WithCancel(t.Context())
 	reload, done := make(chan os.Signal, 1), make(chan error, 1)
-	go func() { done <- runWithReload(ctx, reload, path, false, 0, Version{Version: "test"}) }()
+	go func() {
+		done <- runWithServers(ctx, reload, path, false, 0, Version{Version: "test"}, gate.newServer)
+	}()
 	finished := false
 	t.Cleanup(func() {
 		cancel()
+		gate.Release()
 		if !finished {
 			if err, ok := testutil.Receive(t, done, "runtime to stop"); ok && err != nil {
 				t.Errorf("shutdown: %v", err)
@@ -467,13 +499,18 @@ func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 		}
 	})
 	waitForAgentSocket(t, socket)
-	// Keep the existing upstream connection alive but prevent rollback from
-	// dialing it again. Both the candidate and the single rollback fail.
-	if err := os.Remove(upstream); err != nil {
-		t.Fatal(err)
-	}
-	writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
+	// The candidate cannot bind its socket. Its single rollback is held in
+	// startup while another listener takes the released group socket, so the
+	// rollback fails too.
+	gate.Block()
+	busy := occupySocket(t, filepath.Join(dir, "busy.sock"))
+	writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", busy)
 	reload <- syscall.SIGHUP
+	if !testutil.WaitForEvent(t, gate.Started(), "rollback startup") {
+		return
+	}
+	occupySocket(t, socket)
+	gate.Release()
 	waitForRuntimeLog(t, events, "restoring previous configuration failed")
 	waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the problem and send SIGHUP")
 	if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
@@ -528,8 +565,8 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 			})
 			waitForAgentSocket(t, socket)
 			gate.Block()
-			missing := filepath.Join(dir, "failed-candidate.sock")
-			writeReloadConfig(t, path, missing, "failed", socket)
+			busy := occupySocket(t, filepath.Join(dir, "failed-candidate.sock"))
+			writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", busy)
 			reload <- syscall.SIGHUP
 			if !testutil.WaitForEvent(t, gate.Started(), "rollback startup") {
 				return
@@ -563,8 +600,8 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 				return
 			}
 			if scenario.foreground {
-				if err := done.Err(); !errors.Is(err, proxy.ErrSocketInUse) || !strings.Contains(err.Error(), missing) {
-					t.Errorf("rollback error = %v, want both candidate dial and rollback bind failures", err)
+				if err := done.Err(); !errors.Is(err, proxy.ErrSocketInUse) || !strings.Contains(err.Error(), busy) {
+					t.Errorf("rollback error = %v, want both candidate and rollback bind failures", err)
 				}
 			} else if err := done.Err(); err != nil {
 				t.Errorf("shutdown: %v", err)
@@ -576,7 +613,7 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 					launches++
 				case "restoring previous configuration failed":
 					rollbackErrors++
-					if cause, ok := entry["err"].(string); !ok || !strings.Contains(cause, missing) {
+					if cause, ok := entry["err"].(string); !ok || !strings.Contains(cause, busy) {
 						t.Errorf("rollback log lost the candidate failure: %v", entry)
 					}
 				}

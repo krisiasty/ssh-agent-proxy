@@ -163,7 +163,10 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			original := client.current.Load()
+			original, err := client.connection()
+			if err != nil {
+				t.Fatal(err)
+			}
 			replacement := &testUpstreamTransport{}
 			entered := make(chan struct{})
 			client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
@@ -202,6 +205,44 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 				t.Errorf("Close() error = %v", closed.Err())
 			}
 		})
+	}
+}
+
+func TestReconnectClientShutdownDiscardsFirstDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client, err := newReconnectClientWithTelemetry(ctx, "unused", slog.New(slog.DiscardHandler), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(t.Context()) })
+	first := &testUpstreamTransport{}
+	entered := make(chan struct{})
+	client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
+		close(entered)
+		<-client.ctx.Done()
+		// Model the first dial succeeding as the runtime shuts down.
+		return testutil.NewKeyring(t), first, nil
+	}
+	result := testutil.RunAsync(func() error {
+		_, err := client.connection()
+		return err
+	})
+	if !testutil.WaitForEvent(t, entered, "first dial") {
+		return
+	}
+	cancel()
+	if !testutil.WaitForAsyncStop(t, result, "first dial during shutdown") {
+		return
+	}
+	if !errors.Is(result.Err(), net.ErrClosed) {
+		t.Errorf("connection() error = %v, want closed client", result.Err())
+	}
+	if client.current.Load() != nil {
+		t.Error("shutdown published the first upstream connection")
+	}
+	if got := first.closeCalls.Load(); got != 1 {
+		t.Errorf("discarded connection closes = %d, want 1", got)
 	}
 }
 

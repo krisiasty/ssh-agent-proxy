@@ -227,14 +227,12 @@ func runWithServers(
 			switch state {
 			case runtimeRollingBack:
 				log.Error("restoring previous configuration failed", "err", runtimeErr)
-				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 			case runtimeStarting:
 				log.Error("proxy startup error", "err", runtimeErr)
-				log.Error("idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
 			default:
 				log.Error("proxy runtime error", "err", runtimeErr)
-				log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 			}
+			log.Error("idling until stopped or reloaded; fix the problem and send SIGHUP")
 		}
 	}
 }
