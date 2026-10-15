@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -155,7 +156,7 @@ func TestLaunchdRestartFailures(t *testing.T) {
 	}{
 		{
 			name:    "job not loaded",
-			results: map[string]launchctlCall{listJob: {err: exitStatusError(1)}, guiKickstart: notFound, userKickstart: notFound},
+			results: map[string]launchctlCall{listJob: notFound, guiKickstart: notFound, userKickstart: notFound},
 			want:    "run -reinstall",
 		},
 		{
@@ -206,7 +207,8 @@ func TestLaunchdRestartFailures(t *testing.T) {
 }
 
 func TestLaunchdRestartRequiresInstalledJob(t *testing.T) {
-	fake := &fakeLaunchctl{results: map[string]launchctlCall{listJob: {err: exitStatusError(1)}}}
+	notFound := launchctlCall{stderr: "Could not find service", err: exitStatusError(launchctlServiceNotFound)}
+	fake := &fakeLaunchctl{results: map[string]launchctlCall{listJob: notFound}}
 	m := newTestLaunchdManager(t, fake, alwaysAlive)
 	if err := os.Remove(m.plistPath); err != nil {
 		t.Fatal(err)
@@ -217,6 +219,70 @@ func TestLaunchdRestartRequiresInstalledJob(t *testing.T) {
 	for _, call := range fake.calls {
 		if strings.HasPrefix(call, "kickstart") {
 			t.Errorf("Restart() of an uninstalled job ran %q", call)
+		}
+	}
+}
+
+func TestLaunchdStatusReportsRunningJob(t *testing.T) {
+	fake := &fakeLaunchctl{results: map[string]launchctlCall{listJob: {stdout: "{\n\t\"PID\" = 100;\n};\n"}}}
+	st, err := newTestLaunchdManager(t, fake, alwaysAlive).Status()
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if !st.Installed || !st.Running || st.PID != "100" {
+		t.Errorf("Status() = %+v, want installed and running with pid 100", st)
+	}
+}
+
+func TestLaunchdStatusTreatsUnloadedJobAsStopped(t *testing.T) {
+	fake := &fakeLaunchctl{results: map[string]launchctlCall{
+		listJob: {stderr: "Could not find service", err: exitStatusError(launchctlServiceNotFound)},
+	}}
+	st, err := newTestLaunchdManager(t, fake, alwaysAlive).Status()
+	if err != nil {
+		t.Fatalf("Status() error = %v, want an unloaded job reported as stopped", err)
+	}
+	if !st.Installed || st.Running || st.PID != "" {
+		t.Errorf("Status() = %+v, want installed and stopped", st)
+	}
+}
+
+func TestLaunchdStatusPropagatesInspectionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call launchctlCall
+		want string
+	}{
+		{name: "launchctl failure", call: launchctlCall{stderr: "Operation not permitted", err: exitStatusError(1)}, want: "Operation not permitted"},
+		{name: "timeout", call: launchctlCall{err: context.DeadlineExceeded}, want: "timed out"},
+		{name: "launchctl missing", call: launchctlCall{err: exec.ErrNotFound}, want: "executable file not found"},
+		{name: "malformed output", call: launchctlCall{stdout: "{\n\t\"Program\" = \"bad\\q\";\n};\n"}, want: "launchd program"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeLaunchctl{results: map[string]launchctlCall{listJob: tc.call}}
+			st, err := newTestLaunchdManager(t, fake, alwaysAlive).Status()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Status() error = %v, want %q", err, tc.want)
+			}
+			if st.Running {
+				t.Errorf("Status() = %+v, want no running claim on failure", st)
+			}
+		})
+	}
+}
+
+func TestLaunchdRestartStopsOnInspectionFailure(t *testing.T) {
+	fake := &fakeLaunchctl{results: map[string]launchctlCall{
+		listJob:      {stderr: "Operation not permitted", err: exitStatusError(1)},
+		guiKickstart: {stdout: "200\n"},
+	}}
+	err := newTestLaunchdManager(t, fake, alwaysAlive).Restart()
+	if err == nil || !strings.Contains(err.Error(), "Operation not permitted") {
+		t.Fatalf("Restart() error = %v, want the inspection failure", err)
+	}
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "kickstart") {
+			t.Errorf("Restart() acted on an unknown state: %q", call)
 		}
 	}
 }
