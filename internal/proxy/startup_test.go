@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
@@ -28,7 +29,9 @@ type startupFixture struct {
 	joined chan struct{}
 }
 
-func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent) *startupFixture {
+// startStartupFixture serves backend and runs a Server against it. A zero
+// requestTimeout keeps the production default.
+func startStartupFixture(t *testing.T, backend agent.Agent, requestTimeout time.Duration) *startupFixture {
 	t.Helper()
 	dir := testutil.ShortSocketDir(t)
 	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), backend)
@@ -52,6 +55,9 @@ func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent) *startup
 	f.cancel = cancel
 	log := slog.New(slog.NewJSONHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	f.srv = NewServer(ctx, upstream, 0, log)
+	if requestTimeout > 0 {
+		f.srv.requestTimeout = requestTimeout
+	}
 	f.srv.SetReadyCallback(func() { close(f.ready) })
 	var joinOnce sync.Once
 	f.srv.refreshJoined = func() { joinOnce.Do(func() { close(f.joined) }) }
@@ -80,7 +86,7 @@ func TestServerServesWhileStartupListingIsUnanswered(t *testing.T) {
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	addAgentKey(t, backend.ExtendedAgent, "allowed")
 	backend.BlockListFrom(1)
-	f := startStartupFixture(t, backend)
+	f := startStartupFixture(t, backend, 0)
 
 	if !testutil.WaitForEvent(t, backend.Started(), "unanswered startup listing") {
 		return
@@ -124,7 +130,7 @@ func TestShutdownDuringStartupListingIsNotAnUpstreamFailure(t *testing.T) {
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	addAgentKey(t, backend.ExtendedAgent, "allowed")
 	backend.BlockListFrom(1)
-	f := startStartupFixture(t, backend)
+	f := startStartupFixture(t, backend, 0)
 	if !testutil.WaitForEvent(t, f.ready, "proxy readiness") {
 		return
 	}

@@ -420,13 +420,19 @@ at login, or one that is slow, locked, or stops answering requests, does not kee
 sockets unbound. Requests fail while the agent is unavailable, and the first request
 after it starts connects to it. Once the sockets are bound, one shared upstream identity
 list resolves every enabled group in the background, and clients that connect before it
-completes wait for that list instead of sending their own. No upstream request has a time
-limit, so an agent that waits for an unlock or for interactive approval is never cut off.
-If listing fails, the proxy defers resolution until a client request and picks up
-matching keys after the agent is unlocked or populated. Successful upstream key lists are
-cached process-wide for the configured `--cache` interval. Concurrent refreshes across
-every group share one request; if a refresh fails, the last successful list is served
-until the next interval.
+completes wait for that list instead of sending their own. If listing fails, the proxy
+defers resolution until a client request and picks up matching keys after the agent is
+unlocked or populated. Successful upstream key lists are cached process-wide for the
+configured `--cache` interval. Concurrent refreshes across every group share one request;
+if a refresh fails, the last successful list is served until the next interval.
+
+All clients share one upstream connection, and the agent answers its requests in order,
+as it would answer clients connecting to it directly. If the agent leaves a request
+unanswered for 60 seconds, the proxy drops that connection: the requests waiting on it
+fail, as they would against a hung agent anyway, and the next request opens a fresh
+connection. The proxy therefore recovers on its own once the agent answers again, even if
+the old connection never does. An unlock or approval that takes longer than that fails
+only the waiting request; once the agent is unlocked, the next request succeeds.
 
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup

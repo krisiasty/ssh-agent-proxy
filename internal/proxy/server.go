@@ -30,6 +30,11 @@ import (
 const (
 	// dialTimeout bounds how long connecting to the upstream agent may take.
 	dialTimeout = 10 * time.Second
+	// upstreamRequestTimeout is how long an upstream request may go unanswered
+	// before the shared connection is dropped and redialed on the next
+	// request. It exists only so the proxy recovers once the agent answers
+	// again; it is long enough for an unlock or an interactive approval.
+	upstreamRequestTimeout = 60 * time.Second
 	// socketProbeTimeout bounds the live-owner check before a stale socket is
 	// removed. A timeout is ambiguous and therefore treated as a live owner.
 	socketProbeTimeout = time.Second
@@ -52,6 +57,7 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
+	requestTimeout    time.Duration
 	refreshJoined     func()
 	onReady           func()
 	telemetry         *proxyTelemetry
@@ -82,6 +88,7 @@ func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log
 	}
 	s.newUpstreamClient = newReconnectClientWithTelemetry
 	s.listen = s.listenUnix
+	s.requestTimeout = upstreamRequestTimeout
 	return s
 }
 
@@ -179,6 +186,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	if err != nil {
 		return err
 	}
+	rc.requestTimeout = s.requestTimeout
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
 	// Create one shared authorization state per group. One initial list seeds
