@@ -22,7 +22,7 @@ import (
 // context ends with parent (the test's or Run's context) if Close never runs.
 func newTestReconnectClient(parent context.Context, log *slog.Logger, telemetry *proxyTelemetry, current *upstreamConn) *reconnectClient {
 	ctx, cancel := context.WithCancel(parent)
-	client := &reconnectClient{upstream: "unused", log: log, ctx: ctx, cancel: cancel, telemetry: telemetry}
+	client := &reconnectClient{upstream: "unused", log: log, ctx: ctx, cancel: cancel, telemetry: telemetry, connected: current != nil}
 	client.current.Store(current)
 	return client
 }

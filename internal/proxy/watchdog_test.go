@@ -60,6 +60,9 @@ func TestWatchdogDropsConnectionWithUnansweredList(t *testing.T) {
 	if current := client.current.Load(); current == nil || current == first {
 		t.Error("recovery did not use a new connection")
 	}
+	if got := telemetry.upstreamReconnects.Load(); got != 1 {
+		t.Errorf("upstream reconnects after recovery = %d, want 1", got)
+	}
 }
 
 func TestWatchdogFailsRequestsQueuedBehindUnansweredOne(t *testing.T) {
@@ -106,6 +109,9 @@ func TestWatchdogDropsConnectionWithUnansweredSign(t *testing.T) {
 	backend.Release()
 	if _, err := client.SignWithFlags(pub, []byte("payload"), 0); err != nil {
 		t.Errorf("SignWithFlags() after the agent recovered: %v", err)
+	}
+	if got := telemetry.upstreamReconnects.Load(); got != 1 {
+		t.Errorf("upstream reconnects after recovery = %d, want 1", got)
 	}
 }
 
@@ -166,4 +172,8 @@ func TestServerRecoversWhenAgentAnswersNewConnections(t *testing.T) {
 	if len(keys) != 1 || keys[0].Comment != "allowed" {
 		t.Errorf("client List() = %v, want the allowed key", keys)
 	}
+	if got := f.srv.telemetry.upstreamReconnects.Load(); got != 1 {
+		t.Errorf("upstream reconnects after recovery = %d, want 1", got)
+	}
+	waitForLogMessage(t, f.logs, "upstream reconnected")
 }

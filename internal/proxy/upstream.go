@@ -138,9 +138,10 @@ type reconnectClient struct {
 
 	dial func() (agent.ExtendedAgent, net.Conn, error)
 
-	mu       sync.Mutex // guards reconnect and shutdown
-	closed   bool
-	closeErr error
+	mu        sync.Mutex // guards reconnect and shutdown
+	closed    bool
+	closeErr  error
+	connected bool // a connection has been established before
 }
 
 func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
@@ -209,7 +210,17 @@ func (r *reconnectClient) connection() (*upstreamConn, error) {
 	}
 	current := &upstreamConn{client: client, conn: conn}
 	r.current.Store(current)
-	r.log.Info("upstream connected")
+	// A dial after an earlier connection, such as one the watchdog dropped, is
+	// a reconnect; only the first connection is not.
+	if r.connected {
+		if r.telemetry != nil {
+			r.telemetry.upstreamReconnects.Add(1)
+		}
+		r.log.Warn("upstream reconnected")
+	} else {
+		r.connected = true
+		r.log.Info("upstream connected")
+	}
 	return current, nil
 }
 
@@ -255,6 +266,7 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	}
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
+	r.connected = true
 	if r.telemetry != nil {
 		r.telemetry.upstreamReconnects.Add(1)
 	}
