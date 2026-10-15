@@ -261,6 +261,23 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	}
 }
 
+func TestServerRunReportsForeignCancellationError(t *testing.T) {
+	t.Parallel()
+
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
+	foreign := fmt.Errorf("dependency gave up: %w", context.Canceled)
+	srv.newUpstreamClient = func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error) {
+		return nil, foreign
+	}
+	groups := []config.Group{{Name: "test", Socket: filepath.Join(testutil.ShortSocketDir(t), "group.sock")}}
+
+	// Run's own context is live, so context.Canceled from a dependency is a
+	// startup failure, not a clean shutdown.
+	if err := srv.Run(t.Context(), groups); !errors.Is(err, foreign) {
+		t.Fatalf("Run() error = %v, want %v", err, foreign)
+	}
+}
+
 func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -283,11 +300,12 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	stopped := make(chan struct{})
+	var done *testutil.AsyncResult
 	t.Cleanup(func() {
 		cancel()
-		testutil.WaitForEvent(t, stopped, "proxy server to stop")
+		if done != nil {
+			testutil.WaitForAsyncStop(t, done, "proxy server")
+		}
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
@@ -312,17 +330,14 @@ groups:
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		done <- srv.Run(ctx, cfg.Groups)
-		close(stopped)
-	}()
-	waitForSocket(t, socket, done)
+	done = testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
+	waitForSocket(t, socket, done, nil)
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during startup = %d, want 1", got)
 	}
 
 	cancel()
-	if err := <-done; err != nil {
+	if err := done.Err(); err != nil {
 		t.Fatalf("Server.Run() error = %v, want nil", err)
 	}
 	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -393,21 +408,19 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	stopped := make(chan struct{})
+	var done *testutil.AsyncResult
 	t.Cleanup(func() {
 		cancel()
-		testutil.WaitForEvent(t, stopped, "proxy server to stop")
+		if done != nil {
+			testutil.WaitForAsyncStop(t, done, "proxy server")
+		}
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
 	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
-	go func() {
-		done <- srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}})
-		close(stopped)
-	}()
-	waitForSocket(t, socket, done)
+	done = testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+	waitForSocket(t, socket, done, nil)
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during failed startup resolution = %d, want 1", got)
 	}
@@ -435,7 +448,7 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	}
 
 	cancel()
-	if err := <-done; err != nil {
+	if err := done.Err(); err != nil {
 		t.Fatalf("Server.Run() error = %v, want nil", err)
 	}
 	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -489,8 +502,16 @@ func (a *countingListAgent) List() ([]*agent.Key, error) {
 	return a.ExtendedAgent.List()
 }
 
-func waitForSocket(t *testing.T, path string, done <-chan error) {
+// waitForSocket waits until path is a socket and fails early if its owner
+// stops first. diagnostic, when non-nil, adds context to failure messages.
+func waitForSocket(t *testing.T, path string, owner *testutil.AsyncResult, diagnostic func() string) {
 	t.Helper()
+	details := func() string {
+		if diagnostic == nil {
+			return ""
+		}
+		return "\n" + diagnostic()
+	}
 	deadline := time.NewTimer(testutil.WaitTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -499,13 +520,13 @@ func waitForSocket(t *testing.T, path string, done <-chan error) {
 		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
 			return
 		} else if err != nil && !os.IsNotExist(err) {
-			t.Fatalf("inspecting group socket: %v", err)
+			t.Fatalf("inspecting socket %q: %v", path, err)
 		}
 		select {
-		case err := <-done:
-			t.Fatalf("Server.Run() returned before serving a socket: %v", err)
+		case <-owner.Done():
+			t.Fatalf("socket owner stopped before serving %q: %v%s", path, owner.Err(), details())
 		case <-deadline.C:
-			t.Fatal("timed out waiting for group socket")
+			t.Fatalf("timed out waiting for socket %q%s", path, details())
 		case <-ticker.C:
 		}
 	}

@@ -50,7 +50,7 @@ func TestOpenSSHClientInteroperability(t *testing.T) {
 		stopAgent()
 		_ = testutil.WaitForAsyncStop(t, agentResult, "OpenSSH agent")
 	})
-	waitForIntegrationSocket(t, upstreamSocket, agentResult, func() string {
+	waitForSocket(t, upstreamSocket, agentResult, func() string {
 		return string(agentOutput.Bytes())
 	})
 
@@ -88,7 +88,7 @@ groups:
 			t.Errorf("proxy server stopped with error: %v", proxyResult.Err())
 		}
 	})
-	waitForIntegrationSocket(t, groupSocket, proxyResult, func() string { return "" })
+	waitForSocket(t, groupSocket, proxyResult, nil)
 
 	listed, stderr, err := runOpenSSH(t, sshAdd, groupSocket, nil, "-L")
 	if err != nil {
@@ -114,28 +114,6 @@ groups:
 	if _, _, err := runOpenSSH(t, sshKeygen, groupSocket, message,
 		"-Y", "sign", "-f", excludedKey+".pub", "-n", openSSHTestNamespace); err == nil {
 		t.Fatal("signing with excluded key through proxy succeeded, want failure")
-	}
-}
-
-func waitForIntegrationSocket(t *testing.T, path string, result *testutil.AsyncResult, diagnostic func() string) {
-	t.Helper()
-	deadline := time.NewTimer(testutil.WaitTimeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
-			return
-		} else if err != nil && !os.IsNotExist(err) {
-			t.Fatalf("inspecting integration socket: %v", err)
-		}
-		select {
-		case <-result.Done():
-			t.Fatalf("socket owner stopped before serving %q: %v\n%s", path, result.Err(), diagnostic())
-		case <-deadline.C:
-			t.Fatalf("timed out waiting for integration socket %q\n%s", path, diagnostic())
-		case <-ticker.C:
-		}
 	}
 }
 

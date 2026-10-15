@@ -88,16 +88,16 @@ func runWithReload(
 		}
 		select {
 		case <-current.ready:
-			previousState := current.state()
-			current.phase = runtimeServing
+			restored := current.state() == runtimeRollingBack
+			current.serving = true
+			current.rollbackCause = nil
 			lastGood = current.cfg
 			switch {
-			case previousState == runtimeRollingBack:
+			case restored:
 				log.Info("previous configuration restored", "config", cfgPath, "groups", len(lastGood.Groups))
 			case current.reloaded:
 				log.Info("configuration reloaded", "config", cfgPath, "groups", len(lastGood.Groups))
 			}
-			current.rollbackCause = nil
 		default:
 		}
 	}
@@ -112,9 +112,6 @@ func runWithReload(
 		current = launchRuntime(ctx, cfgPath, cfg, cacheTTL, version)
 		current.reloaded = reloaded
 		current.rollbackCause = rollbackCause
-		if rollbackCause != nil {
-			current.phase = runtimeRollingBack
-		}
 		log = current.log
 		return nil
 	}
@@ -177,14 +174,16 @@ func runWithReload(
 		}
 		select {
 		case <-ctx.Done():
-			continue
+			return stopCurrent()
 		case <-reload:
 			if err := loadConfiguration(false); err != nil {
 				return err
 			}
 		case <-ready:
-			// Commit the configuration at the top of the loop, after checking
-			// shutdown, rather than treating a clean early exit as readiness.
+			// select picks randomly among ready arms, so readiness can win
+			// over a concurrent shutdown. Commit it at the top of the loop,
+			// after the shutdown check, so a runtime that is being stopped is
+			// never recorded as the last good configuration.
 			continue
 		case runtimeErr := <-done:
 			observeReadiness()
@@ -238,7 +237,7 @@ const (
 type runtimeInstance struct {
 	cfg           *config.Config
 	ready         <-chan struct{}
-	phase         runtimeState
+	serving       bool
 	reloaded      bool
 	rollbackCause error
 	cancel        context.CancelFunc
@@ -293,7 +292,6 @@ func launchRuntime(
 
 	instance := &runtimeInstance{
 		cfg:    cfg,
-		phase:  runtimeStarting,
 		ready:  ready,
 		cancel: cancel,
 		done:   make(chan error, 1),
@@ -309,12 +307,20 @@ func launchRuntime(
 	return instance
 }
 
-// state treats the absence of a runtime as idle.
+// state treats the absence of a runtime as idle. A runtime launched with a
+// rollback cause is rolling back until it becomes ready, so the cause is the
+// single record of that phase.
 func (r *runtimeInstance) state() runtimeState {
-	if r == nil {
+	switch {
+	case r == nil:
 		return runtimeIdle
+	case r.serving:
+		return runtimeServing
+	case r.rollbackCause != nil:
+		return runtimeRollingBack
+	default:
+		return runtimeStarting
 	}
-	return r.phase
 }
 
 // markFinished records a consumed completion result and releases the context.

@@ -36,15 +36,15 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
-			backend := newBlockingListAgent(t)
+			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
-			backend.blockListAt = 2
-			if scenario.startup {
-				backend.blockListAt = 1
-			}
-			if scenario.sign {
-				backend.blockListAt = -1
-				backend.blockSign = true
+			switch {
+			case scenario.sign:
+				backend.BlockSign()
+			case scenario.startup:
+				backend.BlockListFrom(1)
+			default:
+				backend.BlockListFrom(2)
 			}
 			upstream := filepath.Join(dir, "upstream.sock")
 			serveShutdownAgent(t, upstream, backend)
@@ -80,7 +80,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 			result := testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
 			t.Cleanup(func() {
 				cancel()
-				backend.unblock()
+				backend.Release()
 				testutil.WaitForAsyncStop(t, result, "proxy server")
 			})
 
@@ -105,7 +105,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 					return listErr
 				})
 			}
-			if !testutil.WaitForEvent(t, backend.started, "stalled upstream request") {
+			if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 				return
 			}
 			if scenario.terminal {
@@ -148,7 +148,7 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			name = "explicit close"
 		}
 		t.Run(name, func(t *testing.T) {
-			backend := newBlockingListAgent(t)
+			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
 			upstream := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
 			serveShutdownAgent(t, upstream, backend)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -319,10 +319,12 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 			name = "sign"
 		}
 		t.Run(name, func(t *testing.T) {
-			backend := newBlockingListAgent(t)
+			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
 			if signing {
-				backend.blockListAt, backend.blockSign = -1, true
+				backend.BlockSign()
+			} else {
+				backend.BlockListFrom(1)
 			}
 			socket := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
 			serveShutdownAgent(t, socket, backend)
@@ -341,7 +343,7 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 				_, err := client.List()
 				return err
 			})
-			if !testutil.WaitForEvent(t, backend.started, "blocked wire request") {
+			if !testutil.WaitForEvent(t, backend.Started(), "blocked wire request") {
 				return
 			}
 			cancel()
@@ -362,7 +364,7 @@ func (c *shutdownObservingTransport) Close() error {
 	return c.testUpstreamTransport.Close()
 }
 
-func serveShutdownAgent(t *testing.T, socket string, backend *blockingListAgent) {
+func serveShutdownAgent(t *testing.T, socket string, backend *testutil.BlockingAgent) {
 	t.Helper()
 	listener := listenUnix(t, socket)
 	accepted := make(chan net.Conn, 1)
@@ -378,7 +380,7 @@ func serveShutdownAgent(t *testing.T, socket string, backend *blockingListAgent)
 		return agent.ServeAgent(backend, conn)
 	})
 	t.Cleanup(func() {
-		backend.unblock()
+		backend.Release()
 		closeListener(t, listener)
 		if conn, ok := <-accepted; ok {
 			_ = conn.Close()

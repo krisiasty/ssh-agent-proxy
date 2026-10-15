@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -157,11 +158,8 @@ func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
 		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
 	}
 	pub := addAgentKey(t, keyring, "allowed")
-	up := &blockingListAgent{
-		ExtendedAgent: keyring,
-		started:       make(chan struct{}),
-		release:       make(chan struct{}),
-	}
+	up := testutil.NewBlockingAgent(t, keyring)
+	up.BlockListFrom(1)
 	matcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
 		t.Fatal(err)
@@ -194,15 +192,15 @@ func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
 	}
 	ready.Wait()
 	close(start)
-	<-up.started
-	close(up.release)
+	<-up.Started()
+	up.Release()
 
 	for range clients {
 		if err := <-errs; err != nil {
 			t.Errorf("concurrent Sign() failed: %v", err)
 		}
 	}
-	if got := up.listCalls.Load(); got != 1 {
+	if got := up.ListCalls(); got != 1 {
 		t.Errorf("upstream List() calls = %d, want 1", got)
 	}
 }
@@ -242,17 +240,6 @@ func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
 	assertSigns(t, fa, pub)
 }
 
-type blockingListAgent struct {
-	agent.ExtendedAgent
-	listCalls   atomic.Int64
-	blockListAt int64 // Zero blocks the first list; negative disables list blocking.
-	blockSign   bool
-	started     chan struct{}
-	release     chan struct{}
-	startOnce   sync.Once
-	releaseOnce sync.Once
-}
-
 type toggleListAgent struct {
 	agent.ExtendedAgent
 	fail      atomic.Bool
@@ -265,34 +252,6 @@ func (a *toggleListAgent) List() ([]*agent.Key, error) {
 		return nil, errors.New("test agent is locked")
 	}
 	return a.ExtendedAgent.List()
-}
-
-func newBlockingListAgent(t *testing.T) *blockingListAgent {
-	t.Helper()
-	return &blockingListAgent{ExtendedAgent: newTestKeyring(t), started: make(chan struct{}), release: make(chan struct{})}
-}
-
-func (a *blockingListAgent) List() ([]*agent.Key, error) {
-	if calls := a.listCalls.Add(1); a.blockListAt >= 0 && calls >= max(1, a.blockListAt) {
-		a.stall()
-	}
-	return a.ExtendedAgent.List()
-}
-
-func (a *blockingListAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	if a.blockSign {
-		a.stall()
-	}
-	return a.ExtendedAgent.SignWithFlags(key, data, flags)
-}
-
-func (a *blockingListAgent) stall() {
-	a.startOnce.Do(func() { close(a.started) })
-	<-a.release
-}
-
-func (a *blockingListAgent) unblock() {
-	a.releaseOnce.Do(func() { close(a.release) })
 }
 
 func addAgentKey(t *testing.T, up agent.ExtendedAgent, comment string) ssh.PublicKey {

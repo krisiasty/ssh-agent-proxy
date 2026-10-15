@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh/agent"
 )
 
@@ -77,11 +78,8 @@ func TestCachedAgentSharesSnapshotAcrossGroups(t *testing.T) {
 }
 
 func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
-	upstream := &blockingListAgent{
-		ExtendedAgent: newTestKeyring(t),
-		started:       make(chan struct{}),
-		release:       make(chan struct{}),
-	}
+	upstream := testutil.NewBlockingAgent(t, newTestKeyring(t))
+	upstream.BlockListFrom(1)
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 
 	const clients = 128
@@ -99,15 +97,15 @@ func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
 	}
 	ready.Wait()
 	close(start)
-	<-upstream.started
-	close(upstream.release)
+	<-upstream.Started()
+	upstream.Release()
 
 	for range clients {
 		if err := <-errs; err != nil {
 			t.Errorf("cached List() failed: %v", err)
 		}
 	}
-	if got := upstream.listCalls.Load(); got != 1 {
+	if got := upstream.ListCalls(); got != 1 {
 		t.Errorf("upstream List() calls = %d, want 1", got)
 	}
 }

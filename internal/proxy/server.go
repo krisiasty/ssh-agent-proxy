@@ -105,8 +105,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	var listeners []net.Listener
 	defer func() {
 		// Classify the operation result before joining teardown errors so that
-		// cancellation cannot hide a genuine startup or cleanup failure.
-		if errors.Is(runErr, context.Canceled) {
+		// cancellation cannot hide a genuine startup or cleanup failure. Only
+		// the caller's cancellation counts: cancel has not run yet, so a
+		// context.Canceled from any other source is a real failure.
+		if ctx.Err() != nil && errors.Is(runErr, context.Canceled) {
 			runErr = nil
 		}
 		// Parent cancellation may already have interrupted upstream I/O via

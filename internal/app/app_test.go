@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -225,7 +224,7 @@ func startTestAgentWithBackend(t *testing.T, socket string, backend agent.Agent)
 
 func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 	dir := testutil.ShortSocketDir(t)
-	backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	upstream := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
 	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
 	configPath := filepath.Join(dir, "config.yaml")
@@ -239,7 +238,7 @@ func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 	}()
 	t.Cleanup(func() {
 		cancel()
-		close(backend.release)
+		backend.Release()
 		if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 			if err != nil {
 				t.Errorf("runWithReload() shutdown error = %v", err)
@@ -253,13 +252,13 @@ func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	backend.stall.Store(true)
+	backend.BlockLists()
 	request := make(chan error, 1)
 	go func() {
 		_, err := agent.NewClient(conn).List()
 		request <- err
 	}()
-	if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+	if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 		return
 	}
 
@@ -283,8 +282,8 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
-			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
-			backend.stall.Store(true)
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
+			backend.BlockLists()
 			blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
 			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
 			configPath := filepath.Join(dir, "config.yaml")
@@ -302,7 +301,7 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 			}()
 			t.Cleanup(func() {
 				cancel()
-				close(backend.release)
+				backend.Release()
 				if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 					if err != nil {
 						t.Errorf("runtime shutdown: %v", err)
@@ -314,7 +313,7 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 				writeReloadConfig(t, configPath, blocked, "blocked", socket)
 				reload <- syscall.SIGHUP
 			}
-			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+			if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 				return
 			}
 			writeReloadConfig(t, configPath, healthy, "recovered", socket)
@@ -326,29 +325,11 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 	}
 }
 
-type reloadBlockingAgent struct {
-	agent.Agent
-	listCalls atomic.Int32
-	stall     atomic.Bool
-	blocked   chan struct{}
-	release   chan struct{}
-	blockOnce sync.Once
-}
-
-func (a *reloadBlockingAgent) List() ([]*agent.Key, error) {
-	a.listCalls.Add(1)
-	if a.stall.Load() {
-		a.blockOnce.Do(func() { close(a.blocked) })
-		<-a.release
-	}
-	return a.Agent.List()
-}
-
 func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	events, _ := captureRuntimeLogs(t)
 	dir := testutil.ShortSocketDir(t)
-	backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
-	backend.stall.Store(true)
+	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
+	backend.BlockLists()
 	blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
 	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
 	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
@@ -358,7 +339,7 @@ func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	go func() { done <- runWithReload(ctx, reload, path, false, 0, Version{Version: "test"}) }()
 	t.Cleanup(func() {
 		cancel()
-		close(backend.release)
+		backend.Release()
 		if err, ok := testutil.Receive(t, done, "runtime to stop"); ok {
 			if err != nil {
 				t.Errorf("shutdown: %v", err)
@@ -368,7 +349,7 @@ func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	waitForAgentSocket(t, socket)
 	writeReloadConfig(t, path, blocked, "never-ready", socket)
 	reload <- syscall.SIGHUP
-	if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+	if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 		return
 	}
 	if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
@@ -388,8 +369,8 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			events, _ := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
-			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
-			backend.stall.Store(true)
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
+			backend.BlockLists()
 			blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, blocked, "never-ready", socket)
@@ -399,7 +380,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 			finished := false
 			t.Cleanup(func() {
 				cancel()
-				close(backend.release)
+				backend.Release()
 				if finished {
 					return
 				}
@@ -409,7 +390,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 					}
 				}
 			})
-			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+			if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 				return
 			}
 			writeReloadConfig(t, path, filepath.Join(dir, "missing.sock"), "failed", socket)
@@ -424,7 +405,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 			} else {
 				waitForRuntimeLog(t, events, "idling until stopped or reloaded; fix the upstream agent and send SIGHUP")
 			}
-			if calls := backend.listCalls.Load(); calls != 1 {
+			if calls := backend.ListCalls(); calls != 1 {
 				t.Errorf("unready config was retried: List calls = %d, want 1", calls)
 			}
 		})
@@ -455,23 +436,22 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
-			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
-			backend.stall.Store(true)
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
+			backend.BlockLists()
 			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "initial", socket)
 			ctx, cancel := context.WithCancel(t.Context())
 			reload := make(chan os.Signal, 1)
 			done := testutil.RunAsync(func() error { return runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) })
-			var release sync.Once
 			t.Cleanup(func() {
 				cancel()
-				release.Do(func() { close(backend.release) })
+				backend.Release()
 				if testutil.WaitForAsyncStop(t, done, "runtime") && done.Err() != nil {
 					t.Errorf("shutdown: %v", done.Err())
 				}
 			})
-			if !testutil.WaitForEvent(t, backend.blocked, "stalled upstream request") {
+			if !testutil.WaitForEvent(t, backend.Started(), "stalled upstream request") {
 				return
 			}
 			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
@@ -481,7 +461,7 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			waitForRuntimeLog(t, events, "configuration reload failed; keeping current configuration")
 			// Readiness must still come from the original runtime, even though
 			// the config on disk is invalid and cannot be loaded again.
-			release.Do(func() { close(backend.release) })
+			backend.Release()
 			waitForAgentSocket(t, socket)
 			cancel()
 			if !testutil.WaitForAsyncStop(t, done, "runtime") {
@@ -560,7 +540,7 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 		t.Run(scenario.name, func(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
-			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "original", socket)
@@ -569,18 +549,17 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 			done := testutil.RunAsync(func() error {
 				return runWithReload(ctx, reload, path, scenario.foreground, 0, Version{Version: "test"})
 			})
-			var release sync.Once
 			t.Cleanup(func() {
 				cancel()
-				release.Do(func() { close(backend.release) })
+				backend.Release()
 				testutil.WaitForAsyncStop(t, done, "runtime")
 			})
 			waitForAgentSocket(t, socket)
-			backend.stall.Store(true)
+			backend.BlockLists()
 			missing := filepath.Join(dir, "failed-candidate.sock")
 			writeReloadConfig(t, path, missing, "failed", socket)
 			reload <- syscall.SIGHUP
-			if !testutil.WaitForEvent(t, backend.blocked, "rollback startup") {
+			if !testutil.WaitForEvent(t, backend.Started(), "rollback startup") {
 				return
 			}
 			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
@@ -598,7 +577,7 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = listener.Close() })
 			}
-			release.Do(func() { close(backend.release) })
+			backend.Release()
 			if !scenario.failRollback {
 				waitForRuntimeLog(t, events, "previous configuration restored")
 				waitForAgentSocket(t, socket)
@@ -645,7 +624,7 @@ func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
 		t.Run(exit, func(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
-			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			shared := startTestAgentWithBackend(t, filepath.Join(dir, "shared.sock"), backend)
 			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
@@ -655,20 +634,19 @@ func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
 			done := testutil.RunAsync(func() error {
 				return runWithReload(ctx, reload, path, false, 0, Version{Version: "test"})
 			})
-			var release sync.Once
 			t.Cleanup(func() {
 				cancel()
-				release.Do(func() { close(backend.release) })
+				backend.Release()
 				testutil.WaitForAsyncStop(t, done, "runtime")
 			})
 
 			// The readiness probe lists through the proxy, so the shared
 			// upstream has seen two List calls before it stalls.
 			waitForAgentSocket(t, socket)
-			backend.stall.Store(true)
+			backend.BlockLists()
 			writeReloadConfig(t, path, shared, "replacement", socket)
 			reload <- syscall.SIGHUP
-			if !testutil.WaitForEvent(t, backend.blocked, "stalled replacement") {
+			if !testutil.WaitForEvent(t, backend.Started(), "stalled replacement") {
 				return
 			}
 			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
@@ -678,10 +656,10 @@ func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
 			waitForRuntimeLog(t, events, "restoring previous configuration")
 			const stalledCalls = 4
 			deadline := time.Now().Add(testutil.WaitTimeout)
-			for backend.listCalls.Load() < stalledCalls && time.Now().Before(deadline) {
+			for backend.ListCalls() < stalledCalls && time.Now().Before(deadline) {
 				time.Sleep(5 * time.Millisecond)
 			}
-			if calls := backend.listCalls.Load(); calls != stalledCalls {
+			if calls := backend.ListCalls(); calls != stalledCalls {
 				t.Fatalf("restored rollback did not stall in List: calls = %d, want %d", calls, stalledCalls)
 			}
 
@@ -691,7 +669,7 @@ func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
 					reload <- syscall.SIGHUP
 					waitForRuntimeLog(t, events, "configuration reload failed; keeping current configuration")
 				}
-				if calls := backend.listCalls.Load(); calls != stalledCalls {
+				if calls := backend.ListCalls(); calls != stalledCalls {
 					t.Errorf("invalid reload relaunched the rollback: List calls = %d, want %d", calls, stalledCalls)
 				}
 			case "valid reload":
