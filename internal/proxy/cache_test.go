@@ -13,7 +13,7 @@ import (
 )
 
 func TestCachedAgentCachesListUntilTTLExpires(t *testing.T) {
-	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
+	upstream := &countingKeyring{ExtendedAgent: testutil.NewKeyring(t)}
 	now := time.Unix(1_000, 0)
 	telemetry := &proxyTelemetry{}
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), telemetry)
@@ -42,7 +42,7 @@ func TestCachedAgentCachesListUntilTTLExpires(t *testing.T) {
 }
 
 func TestCachedAgentZeroTTLDisablesCaching(t *testing.T) {
-	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
+	upstream := &countingKeyring{ExtendedAgent: testutil.NewKeyring(t)}
 	telemetry := &proxyTelemetry{}
 	cached := newCachedAgent(upstream, 0, slog.New(slog.DiscardHandler), telemetry)
 
@@ -60,7 +60,7 @@ func TestCachedAgentZeroTTLDisablesCaching(t *testing.T) {
 }
 
 func TestCachedAgentSharesSnapshotAcrossGroups(t *testing.T) {
-	upstream := &countingKeyring{ExtendedAgent: newTestKeyring(t)}
+	upstream := &countingKeyring{ExtendedAgent: testutil.NewKeyring(t)}
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 	log := slog.New(slog.DiscardHandler)
 	first := newGroupAuthorization("first", nil, log)
@@ -78,7 +78,7 @@ func TestCachedAgentSharesSnapshotAcrossGroups(t *testing.T) {
 }
 
 func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
-	upstream := testutil.NewBlockingAgent(t, newTestKeyring(t))
+	upstream := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	upstream.BlockListFrom(1)
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 
@@ -111,7 +111,7 @@ func TestCachedAgentCoalescesConcurrentRefreshes(t *testing.T) {
 }
 
 func TestCachedAgentServesStaleSnapshotAfterRefreshFailure(t *testing.T) {
-	upstream := &toggleListAgent{ExtendedAgent: newTestKeyring(t)}
+	upstream := &toggleListAgent{ExtendedAgent: testutil.NewKeyring(t)}
 	now := time.Unix(1_000, 0)
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 	cached.now = func() time.Time { return now }
@@ -134,7 +134,7 @@ func TestCachedAgentServesStaleSnapshotAfterRefreshFailure(t *testing.T) {
 
 func TestCachedAgentCachesInitialFailure(t *testing.T) {
 	wantErr := errors.New("upstream locked")
-	upstream := &failingListAgent{ExtendedAgent: newTestKeyring(t), err: wantErr}
+	upstream := &failingListAgent{ExtendedAgent: testutil.NewKeyring(t), err: wantErr}
 	cached := newCachedAgent(upstream, 3*time.Second, slog.New(slog.DiscardHandler), nil)
 
 	for range 2 {
@@ -166,13 +166,4 @@ type failingListAgent struct {
 func (a *failingListAgent) List() ([]*agent.Key, error) {
 	a.listCalls.Add(1)
 	return nil, a.err
-}
-
-func newTestKeyring(t *testing.T) agent.ExtendedAgent {
-	t.Helper()
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
-	return keyring
 }

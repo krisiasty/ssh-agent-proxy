@@ -107,8 +107,7 @@ func TestServerRunPropagatesTerminalAcceptFailure(t *testing.T) {
 		}
 	})
 	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger, ctx: ctx, telemetry: telemetry}
-		rc.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
+		rc := newTestReconnectClient(ctx, logger, telemetry, &upstreamConn{client: testutil.NewKeyring(t), conn: clientConn})
 		return rc, nil
 	}
 
@@ -285,17 +284,13 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	srv.SetReadyCallback(func() {
 		log.Info("server ready callback")
 	})
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	first := addAgentKey(t, keyring, "shared")
 	addAgentKey(t, keyring, "shared")
 	up := &countingListAgent{ExtendedAgent: keyring}
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: log, telemetry: telemetry}
-		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := newTestReconnectClient(ctx, log, telemetry, &upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
 
@@ -397,13 +392,12 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer(t.Context(), "unused", 0, log)
-	keyring := newTestKeyring(t)
+	keyring := testutil.NewKeyring(t)
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger, telemetry: telemetry}
-		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := newTestReconnectClient(ctx, logger, telemetry, &upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
 

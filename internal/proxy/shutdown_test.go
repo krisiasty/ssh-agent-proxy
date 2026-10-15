@@ -36,7 +36,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
-			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
 			switch {
 			case scenario.sign:
@@ -47,7 +47,7 @@ func TestServerShutdownInterruptsUpstreamRequests(t *testing.T) {
 				backend.BlockListFrom(2)
 			}
 			upstream := filepath.Join(dir, "upstream.sock")
-			serveShutdownAgent(t, upstream, backend)
+			testutil.StartAgent(t, upstream, backend)
 			socket := filepath.Join(dir, "group.sock")
 			cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 			body := fmt.Sprintf("upstream: %q\ngroups:\n  - name: test\n    socket: %q\n    keys:\n      - comment: allowed\n", upstream, socket)
@@ -148,9 +148,9 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 			name = "explicit close"
 		}
 		t.Run(name, func(t *testing.T) {
-			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			upstream := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
-			serveShutdownAgent(t, upstream, backend)
+			testutil.StartAgent(t, upstream, backend)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			client, err := newReconnectClientWithTelemetry(ctx, upstream, slog.New(slog.DiscardHandler), nil)
@@ -207,12 +207,11 @@ func TestReconnectClientShutdownDiscardsInFlightDial(t *testing.T) {
 
 func TestReconnectClientCloseIsFinalAndIdempotent(t *testing.T) {
 	transport := &testUpstreamTransport{}
-	client := &reconnectClient{log: slog.New(slog.DiscardHandler)}
-	client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: transport})
+	client := newTestReconnectClient(t.Context(), slog.New(slog.DiscardHandler), nil, &upstreamConn{client: testutil.NewKeyring(t), conn: transport})
 	var dials atomic.Int32
 	client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
 		dials.Add(1)
-		return newTestKeyring(t), &testUpstreamTransport{}, nil
+		return testutil.NewKeyring(t), &testUpstreamTransport{}, nil
 	}
 	var calls sync.WaitGroup
 	for range 16 {
@@ -251,8 +250,7 @@ func TestServerClosesListenersBeforeUpstream(t *testing.T) {
 		}
 	}}
 	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
-		client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
-		client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: transport})
+		client := newTestReconnectClient(ctx, log, telemetry, &upstreamConn{client: testutil.NewKeyring(t), conn: transport})
 		return client, nil
 	}
 	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
@@ -273,8 +271,7 @@ func TestServerListenCancellationIsClean(t *testing.T) {
 			log := slog.New(slog.DiscardHandler)
 			srv := NewServer(ctx, "unused", 0, log)
 			srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
-				client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
-				client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
+				client := newTestReconnectClient(ctx, log, telemetry, &upstreamConn{client: testutil.NewKeyring(t), conn: &testUpstreamTransport{}})
 				return client, nil
 			}
 			binding := make(chan struct{})
@@ -319,7 +316,7 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 			name = "sign"
 		}
 		t.Run(name, func(t *testing.T) {
-			backend := testutil.NewBlockingAgent(t, newTestKeyring(t))
+			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
 			if signing {
 				backend.BlockSign()
@@ -327,7 +324,7 @@ func TestUpstreamContextInterruptsWireRequests(t *testing.T) {
 				backend.BlockListFrom(1)
 			}
 			socket := filepath.Join(testutil.ShortSocketDir(t), "upstream.sock")
-			serveShutdownAgent(t, socket, backend)
+			testutil.StartAgent(t, socket, backend)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			client, err := newReconnectClientWithTelemetry(ctx, socket, slog.New(slog.DiscardHandler), nil)
@@ -364,31 +361,6 @@ func (c *shutdownObservingTransport) Close() error {
 	return c.testUpstreamTransport.Close()
 }
 
-func serveShutdownAgent(t *testing.T, socket string, backend *testutil.BlockingAgent) {
-	t.Helper()
-	listener := listenUnix(t, socket)
-	accepted := make(chan net.Conn, 1)
-	result := testutil.RunAsync(func() error {
-		conn, err := listener.Accept()
-		if err != nil {
-			close(accepted)
-			return err
-		}
-		accepted <- conn
-		close(accepted)
-		defer func() { _ = conn.Close() }()
-		return agent.ServeAgent(backend, conn)
-	})
-	t.Cleanup(func() {
-		backend.Release()
-		closeListener(t, listener)
-		if conn, ok := <-accepted; ok {
-			_ = conn.Close()
-		}
-		testutil.WaitForAsyncStop(t, result, "test upstream agent")
-	})
-}
-
 type shutdownFailureListener struct {
 	net.Listener
 	fail atomic.Bool
@@ -415,8 +387,7 @@ func TestServerStartupErrorsDuringCancellation(t *testing.T) {
 						cancel()
 						return nil, fmt.Errorf("dial: %w", cause)
 					}
-					client := &reconnectClient{ctx: ctx, log: log, telemetry: telemetry}
-					client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: &testUpstreamTransport{}})
+					client := newTestReconnectClient(ctx, log, telemetry, &upstreamConn{client: testutil.NewKeyring(t), conn: &testUpstreamTransport{}})
 					return client, nil
 				}
 				srv.listen = func(context.Context, string) (net.Listener, error) {

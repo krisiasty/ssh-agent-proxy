@@ -181,14 +181,11 @@ func (r *reconnectClient) get() agent.ExtendedAgent {
 }
 
 func (r *reconnectClient) logContext() context.Context {
-	if r.ctx != nil {
-		return r.ctx
-	}
-	return context.Background()
+	return r.ctx
 }
 
 func (r *reconnectClient) canceled() bool {
-	return r.ctx != nil && r.ctx.Err() != nil
+	return r.ctx.Err() != nil
 }
 
 // reconnect replaces failed if it is still the current upstream connection.
@@ -237,9 +234,7 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 // Repeated calls return the original close result.
 func (r *reconnectClient) Close(ctx context.Context) error {
 	// Cancel before taking mu so an in-progress reconnect dial can finish.
-	if r.cancel != nil {
-		r.cancel()
-	}
+	r.cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

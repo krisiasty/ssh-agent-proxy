@@ -26,10 +26,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	up := testutil.NewKeyring(t)
 	if err := up.Add(agent.AddedKey{PrivateKey: privAllowed, Comment: "allowed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +108,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 }
 
 func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
-	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	up := testutil.NewKeyring(t)
 	matcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
 		t.Fatal(err)
@@ -153,10 +147,7 @@ func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
 }
 
 func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
 	up := testutil.NewBlockingAgent(t, keyring)
 	up.BlockListFrom(1)
@@ -206,10 +197,7 @@ func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
 }
 
 func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)

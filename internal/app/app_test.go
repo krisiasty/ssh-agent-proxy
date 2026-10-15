@@ -114,7 +114,7 @@ func TestRunServiceIdlesAfterProxyStartupError(t *testing.T) {
 func TestRunReloadsConfigurationAndKeepsServingAfterInvalidReload(t *testing.T) {
 	dir := testutil.ShortSocketDir(t)
 
-	upstream := startTestAgent(t, filepath.Join(dir, "upstream.sock"))
+	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), testutil.NewKeyring(t))
 	configPath := filepath.Join(dir, "config.yaml")
 	firstSocket := filepath.Join(dir, "first.sock")
 	secondSocket := filepath.Join(dir, "second.sock")
@@ -187,46 +187,11 @@ func writeRuntimeConfig(t *testing.T, upstream string) string {
 	return path
 }
 
-func startTestAgent(t *testing.T, socket string) string {
-	t.Helper()
-	return startTestAgentWithBackend(t, socket, agent.NewKeyring())
-}
-
-func startTestAgentWithBackend(t *testing.T, socket string, backend agent.Agent) string {
-	t.Helper()
-	var listenConfig net.ListenConfig
-	listener, err := listenConfig.Listen(t.Context(), "unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go func(agentConn net.Conn) {
-				defer func() { _ = agentConn.Close() }()
-				_ = agent.ServeAgent(backend, agentConn)
-			}(conn)
-		}
-	}()
-	t.Cleanup(func() {
-		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Errorf("closing test agent: %v", err)
-		}
-		<-done
-	})
-	return socket
-}
-
 func TestRunReloadInterruptsBlockedUpstreamRequest(t *testing.T) {
 	dir := testutil.ShortSocketDir(t)
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-	upstream := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
-	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+	upstream := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), backend)
+	healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
 	configPath := filepath.Join(dir, "config.yaml")
 	socket := filepath.Join(dir, "group.sock")
 	writeReloadConfig(t, configPath, upstream, "first", socket)
@@ -284,8 +249,8 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
 			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			backend.BlockLists()
-			blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
-			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+			blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), backend)
+			healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
 			configPath := filepath.Join(dir, "config.yaml")
 			socket := filepath.Join(dir, "group.sock")
 			initial := blocked
@@ -330,8 +295,8 @@ func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	dir := testutil.ShortSocketDir(t)
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	backend.BlockLists()
-	blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
-	healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+	blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), backend)
+	healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
 	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 	writeReloadConfig(t, path, healthy, "ready", socket)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -371,7 +336,7 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
 			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			backend.BlockLists()
-			blocked := startTestAgentWithBackend(t, filepath.Join(dir, "blocked.sock"), backend)
+			blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, blocked, "never-ready", socket)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -438,7 +403,7 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
 			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 			backend.BlockLists()
-			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
+			upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "initial", socket)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -479,7 +444,7 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 func TestInvalidReloadLeavesFailedRollbackIdle(t *testing.T) {
 	events, finish := captureRuntimeLogs(t)
 	dir := testutil.ShortSocketDir(t)
-	upstream := startTestAgent(t, filepath.Join(dir, "upstream.sock"))
+	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), testutil.NewKeyring(t))
 	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 	writeReloadConfig(t, path, upstream, "ready", socket)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -541,7 +506,7 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-			upstream := startTestAgentWithBackend(t, filepath.Join(dir, "upstream.sock"), backend)
+			upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), backend)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "original", socket)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -625,8 +590,8 @@ func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-			shared := startTestAgentWithBackend(t, filepath.Join(dir, "shared.sock"), backend)
-			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+			shared := testutil.StartAgent(t, filepath.Join(dir, "shared.sock"), backend)
+			healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, shared, "original", socket)
 			ctx, cancel := context.WithCancel(t.Context())

@@ -12,17 +12,14 @@ import (
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 func TestUpstreamCallsAreLogged(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
 	otherPub := addAgentKey(t, keyring, "other")
 	clientConn, serverConn := net.Pipe()
@@ -35,8 +32,7 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 		}
 	})
 	telemetry := &proxyTelemetry{}
-	rc := &reconnectClient{log: log, telemetry: telemetry}
-	rc.current.Store(&upstreamConn{client: keyring, conn: clientConn})
+	rc := newTestReconnectClient(t.Context(), log, telemetry, &upstreamConn{client: keyring, conn: clientConn})
 
 	listed, err := rc.List()
 	if err != nil {
@@ -100,7 +96,7 @@ func TestUpstreamCallsAreLogged(t *testing.T) {
 func TestClientListLogsEachReturnedIdentity(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	keyring := newTestKeyring(t)
+	keyring := testutil.NewKeyring(t)
 	first := addAgentKey(t, keyring, "first")
 	second := addAgentKey(t, keyring, "second")
 	firstMatcher, err := keys.NewMatcher("comment", "first")
@@ -168,7 +164,7 @@ func TestClientListLogsEachReturnedIdentity(t *testing.T) {
 func TestInfoLogsClientRequestSummariesOnly(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	keyring := newTestKeyring(t)
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
 	matcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
@@ -238,8 +234,7 @@ func TestUpstreamCallsStayAtDebugLevel(t *testing.T) {
 			t.Errorf("closing server connection: %v", err)
 		}
 	})
-	client := &reconnectClient{log: log}
-	client.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
+	client := newTestReconnectClient(t.Context(), log, nil, &upstreamConn{client: testutil.NewKeyring(t), conn: clientConn})
 
 	if _, err := client.List(); err != nil {
 		t.Fatal(err)
@@ -252,10 +247,7 @@ func TestUpstreamCallsStayAtDebugLevel(t *testing.T) {
 func TestConfigKeyResolutionIsLogged(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	addAgentKey(t, keyring, "allowed")
 	addAgentKey(t, keyring, "hidden")
 	commentMatcher, err := keys.NewMatcher("comment", "allowed")
@@ -303,7 +295,7 @@ func TestConfigKeyResolutionIsLogged(t *testing.T) {
 func TestUnmatchedSelectorWarningIsLoggedOnTransitions(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	keyring := newTestKeyring(t)
+	keyring := testutil.NewKeyring(t)
 	matcher, err := keys.NewMatcher("comment", "dynamic")
 	if err != nil {
 		t.Fatal(err)
