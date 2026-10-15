@@ -1,6 +1,13 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/krisiasty/ssh-agent-proxy/internal/service"
+)
 
 func TestValidateCacheSeconds(t *testing.T) {
 	if defaultCacheSeconds != 3 {
@@ -26,5 +33,29 @@ func TestValidateCacheSeconds(t *testing.T) {
 				t.Errorf("validateCacheSeconds(%d) error = %v, wantErr %t", test.seconds, err, test.wantErr)
 			}
 		})
+	}
+}
+
+// statusManager is a service.Manager whose Status is fixed.
+type statusManager struct {
+	service.Manager
+	status service.Status
+}
+
+func (m statusManager) Status() (service.Status, error) { return m.status, nil }
+
+func TestCheckInstalledBinary(t *testing.T) {
+	present := filepath.Join(t.TempDir(), "ssh-agent-proxy")
+	if err := os.WriteFile(present, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "Caskroom", "ssh-agent-proxy", "0.9.0", "ssh-agent-proxy")
+
+	if err := checkInstalledBinary(statusManager{status: service.Status{Installed: true, Program: present}}); err != nil {
+		t.Errorf("checkInstalledBinary() with a present binary = %v, want nil", err)
+	}
+	err := checkInstalledBinary(statusManager{status: service.Status{Installed: true, Program: missing}})
+	if err == nil || !strings.Contains(err.Error(), "-reinstall") {
+		t.Errorf("checkInstalledBinary() with a removed binary = %v, want a -reinstall error", err)
 	}
 }

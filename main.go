@@ -149,6 +149,9 @@ func manageService(cfgPath, action string, cacheSeconds int) error {
 		}
 		fmt.Println("ssh-agent-proxy uninstalled.")
 	case "-start":
+		if err := checkInstalledBinary(mgr); err != nil {
+			return err
+		}
 		if err := mgr.Start(); err != nil {
 			return err
 		}
@@ -159,6 +162,9 @@ func manageService(cfgPath, action string, cacheSeconds int) error {
 		}
 		fmt.Println("ssh-agent-proxy stopped.")
 	case "-restart":
+		if err := checkInstalledBinary(mgr); err != nil {
+			return err
+		}
 		if err := mgr.Restart(); err != nil {
 			return err
 		}
@@ -183,6 +189,28 @@ func manageService(cfgPath, action string, cacheSeconds int) error {
 		}
 		fmt.Printf("config:    %s\n", cfgPath)
 		fmt.Printf("logs:      %s\n", mgr.LogHint())
+	}
+	return nil
+}
+
+// checkInstalledBinary stops a start or restart that cannot work because the
+// installed service binary no longer exists, and warns when the service runs a
+// different binary than this one. It never rewrites the installed definition;
+// -reinstall does that.
+func checkInstalledBinary(mgr service.Manager) error {
+	st, err := mgr.Status()
+	if err != nil {
+		return err
+	}
+	if err := service.CheckProgram(st); err != nil {
+		return err
+	}
+	if !st.Installed || st.Program == "" {
+		return nil
+	}
+	current, err := service.CurrentExecutable()
+	if err == nil && !service.SamePath(st.Program, current) {
+		fmt.Fprintf(os.Stderr, "warning: the installed service runs %s, not this executable (%s); run -reinstall to switch\n", st.Program, current)
 	}
 	return nil
 }

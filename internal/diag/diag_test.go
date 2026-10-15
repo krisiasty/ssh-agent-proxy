@@ -17,17 +17,19 @@ import (
 
 func TestRunReportsHealthyManagedServiceWithoutKeyDetails(t *testing.T) {
 	paths := writeTestConfig(t, true)
+	program := writeTestProgram(t)
 	key := &agent.Key{Format: "ssh-ed25519", Blob: []byte("key-one"), Comment: "private-key-comment"}
 	deps := testDependencies(service.Status{
 		Installed: true,
 		Running:   true,
 		PID:       "42",
-		Program:   "/usr/local/bin/ssh-agent-proxy",
+		Program:   program,
 		Config:    paths.config,
 	}, map[string][]*agent.Key{
 		paths.upstream: {key},
 		paths.group:    {key},
 	})
+	deps.currentExecutable = func() (string, error) { return program, nil }
 
 	var output bytes.Buffer
 	err := run(context.Background(), paths.config, 3, &output, deps)
@@ -149,6 +151,34 @@ groups:
 		t.Fatal(err)
 	}
 	return paths
+}
+
+func TestRunFailsWhenInstalledBinaryIsMissing(t *testing.T) {
+	paths := writeTestConfig(t, true)
+	key := &agent.Key{Format: "ssh-ed25519", Blob: []byte("key-one")}
+	missing := filepath.Join(t.TempDir(), "removed-by-upgrade", "ssh-agent-proxy")
+	deps := testDependencies(service.Status{Installed: true, Running: false, Program: missing, Config: paths.config}, map[string][]*agent.Key{
+		paths.upstream: {key},
+		paths.group:    {key},
+	})
+
+	var output bytes.Buffer
+	if err := run(context.Background(), paths.config, 3, &output, deps); !errors.Is(err, ErrFailures) {
+		t.Fatalf("run() error = %v, want ErrFailures\n%s", err, output.String())
+	}
+	if want := "[FAIL] service binary: installed service binary"; !strings.Contains(output.String(), want) || !strings.Contains(output.String(), "-reinstall") {
+		t.Errorf("output does not report the missing binary with a reinstall hint:\n%s", output.String())
+	}
+}
+
+// writeTestProgram creates a file standing in for the installed executable.
+func writeTestProgram(t *testing.T) string {
+	t.Helper()
+	program := filepath.Join(t.TempDir(), "ssh-agent-proxy")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return program
 }
 
 func testDependencies(status service.Status, socketKeys map[string][]*agent.Key) dependencies {

@@ -83,6 +83,16 @@ ssh-agent-proxy -install
 
 Runtime logs use JSON Lines; see [Logging](#logging) for the default and debug output.
 
+The service definition records the binary it runs. For a Homebrew installation that is
+the link in Homebrew's `bin` directory (for example `/opt/homebrew/bin/ssh-agent-proxy`),
+which Homebrew repoints on upgrade, so `brew upgrade` takes effect at the next
+`ssh-agent-proxy -restart` without reinstalling. Otherwise it is the resolved path of
+the binary that ran `-install`; after moving or replacing that binary, run
+`ssh-agent-proxy -reinstall`. `-start` and `-restart` refuse to run when the recorded
+binary no longer exists and warn when it differs from the binary you are running.
+Services installed by earlier versions record Homebrew's versioned path; reinstall them
+once to switch to the stable link.
+
 Then edit the config (see below) and reload:
 
 ```sh
@@ -103,7 +113,7 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 | Flag           | Description                                                            |
 | -------------- | ---------------------------------------------------------------------- |
 | `-install`     | Install and start the service, then exit. Fails if already installed.  |
-| `-reinstall`   | Reinstall (uninstall then install), then exit. Use to update the installed binary path. |
+| `-reinstall`   | Reinstall (uninstall then install), then exit. Use to update the installed binary path; see [Install as a service](#install-as-a-service). |
 | `-uninstall`   | Stop and remove the service, then exit.                                |
 | `-start`       | Start the service, then exit.                                          |
 | `-stop`        | Stop the service, then exit.                                           |

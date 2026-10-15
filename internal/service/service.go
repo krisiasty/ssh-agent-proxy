@@ -79,8 +79,19 @@ func reinstall(m Manager) error {
 	return m.Install()
 }
 
-// executablePath returns the absolute, symlink-resolved path to this binary.
+// executablePath returns the path a service definition should run: the
+// absolute, symlink-resolved path to this binary, or a stable link to it when
+// the resolved path is specific to one package version.
 func executablePath() (string, error) {
+	exe, err := CurrentExecutable()
+	if err != nil {
+		return "", err
+	}
+	return stableExecutable(exe), nil
+}
+
+// CurrentExecutable returns the absolute, symlink-resolved path to this binary.
+func CurrentExecutable() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locating executable: %w", err)
@@ -89,4 +100,71 @@ func executablePath() (string, error) {
 		exe = resolved
 	}
 	return exe, nil
+}
+
+// stableExecutable returns a path to the executable resolved that survives
+// package upgrades, or resolved itself. Homebrew keeps each version of a
+// formula or cask in its own directory under <prefix>/Cellar or
+// <prefix>/Caskroom and links the current version's binary into <prefix>/bin.
+// An upgrade repoints that link and removes the old version, so a service
+// that saved the versioned path would keep running the old binary or fail to
+// start. The link is used only when it is verifiably the same file.
+func stableExecutable(resolved string) string {
+	for dir := filepath.Dir(resolved); ; {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return resolved
+		}
+		if name := filepath.Base(parent); name == "Cellar" || name == "Caskroom" {
+			link := filepath.Join(filepath.Dir(parent), "bin", filepath.Base(resolved))
+			if sameFile(link, resolved) {
+				return link
+			}
+			return resolved
+		}
+		dir = parent
+	}
+}
+
+func sameFile(left, right string) bool {
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		return false
+	}
+	rightInfo, err := os.Stat(right)
+	return err == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+// SamePath reports whether two paths name the same file once made absolute,
+// cleaned, and resolved through symlinks.
+func SamePath(left, right string) bool {
+	return normalizedPath(left) == normalizedPath(right)
+}
+
+func normalizedPath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err == nil {
+		path = absolute
+	}
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return path
+}
+
+// CheckProgram reports an installed service whose executable no longer
+// exists, for example because a package upgrade removed the version it was
+// installed from. Starting such a service cannot succeed.
+func CheckProgram(st Status) error {
+	if !st.Installed || st.Program == "" {
+		return nil
+	}
+	if _, err := os.Stat(st.Program); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("installed service binary %q no longer exists; run -reinstall to install the current binary", st.Program)
+		}
+		return fmt.Errorf("checking installed service binary %q: %w", st.Program, err)
+	}
+	return nil
 }
