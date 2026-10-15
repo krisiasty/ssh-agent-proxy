@@ -247,6 +247,19 @@ type runtimeInstance struct {
 	runErr        error
 }
 
+// runtimeServer is the part of proxy.Server that a runtime drives.
+type runtimeServer interface {
+	Run(ctx context.Context, groups []config.Group) error
+	SetReadyCallback(callback func())
+	LogTelemetry()
+}
+
+// newRuntimeServer builds the proxy server for one runtime. Tests replace it
+// to hold a runtime in startup.
+var newRuntimeServer = func(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer {
+	return proxy.NewServer(ctx, upstream, cacheTTL, log)
+}
+
 func launchRuntime(
 	parent context.Context,
 	cfgPath string,
@@ -256,7 +269,7 @@ func launchRuntime(
 ) *runtimeInstance {
 	ctx, cancel := context.WithCancel(parent)
 	log := logging.Setup(cfg.Debug)
-	srv := proxy.NewServer(ctx, cfg.Upstream, cacheTTL, log)
+	srv := newRuntimeServer(ctx, cfg.Upstream, cacheTTL, log)
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	markReady := func() {

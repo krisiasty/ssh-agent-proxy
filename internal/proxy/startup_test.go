@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -23,9 +22,11 @@ type startupFixture struct {
 	socket string
 	ready  chan struct{}
 	logs   *lockedBuffer
+	cancel context.CancelFunc
+	result *testutil.AsyncResult
 }
 
-func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent, timeout time.Duration) *startupFixture {
+func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent) *startupFixture {
 	t.Helper()
 	dir := testutil.ShortSocketDir(t)
 	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), backend)
@@ -41,15 +42,15 @@ func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent, timeout 
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
+	f.cancel = cancel
 	log := slog.New(slog.NewJSONHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	f.srv = NewServer(ctx, upstream, 0, log)
-	f.srv.startupTimeout = timeout
 	f.srv.SetReadyCallback(func() { close(f.ready) })
-	result := testutil.RunAsync(func() error { return f.srv.Run(ctx, cfg.Groups) })
+	f.result = testutil.RunAsync(func() error { return f.srv.Run(ctx, cfg.Groups) })
 	t.Cleanup(func() {
 		cancel()
-		if testutil.WaitForAsyncStop(t, result, "proxy server") && result.Err() != nil {
-			t.Errorf("Run() error = %v, want clean shutdown", result.Err())
+		if testutil.WaitForAsyncStop(t, f.result, "proxy server") && f.result.Err() != nil {
+			t.Errorf("Run() error = %v, want clean shutdown", f.result.Err())
 		}
 	})
 	return f
@@ -66,154 +67,90 @@ func (f *startupFixture) dial(t *testing.T) agent.ExtendedAgent {
 	return agent.NewClient(conn)
 }
 
-func TestServerServesAfterStartupListTimeout(t *testing.T) {
+func TestServerServesWhileStartupListingIsUnanswered(t *testing.T) {
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
 	addAgentKey(t, backend.ExtendedAgent, "allowed")
 	backend.BlockListFrom(1)
-	f := startStartupFixture(t, backend, 100*time.Millisecond)
+	f := startStartupFixture(t, backend)
 
-	if !testutil.WaitForEvent(t, f.ready, "readiness after startup listing timeout") {
+	if !testutil.WaitForEvent(t, backend.Started(), "unanswered startup listing") {
+		return
+	}
+	if !testutil.WaitForEvent(t, f.ready, "readiness while the startup listing is unanswered") {
 		return
 	}
 	if info, err := os.Lstat(f.socket); err != nil || info.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("group socket after startup timeout: info=%v err=%v", info, err)
-	}
-	if got := backend.ListCalls(); got != 1 {
-		t.Errorf("startup List requests = %d, want 1 without retry", got)
-	}
-	if got := f.srv.telemetry.upstreamReconnects.Load(); got != 1 {
-		t.Errorf("upstream reconnects = %d, want the timed-out connection replaced once", got)
-	}
-	warning := findDebugLog(t, decodeDebugLogs(t, f.logs.Bytes()), "initial key listing timed out; deferring until client request", "")
-	if warning["timeout"] != "100ms" {
-		t.Errorf("timeout warning = %v, want timeout=100ms", warning)
+		t.Fatalf("group socket while the startup listing is unanswered: info=%v err=%v", info, err)
 	}
 
-	// Once the agent answers, the first client request resolves the group over
-	// the replacement connection.
+	// A client that arrives first, for example while the agent shows an unlock
+	// prompt, waits for the startup listing instead of sending its own.
+	client := f.dial(t)
+	var keys []*agent.Key
+	request := testutil.RunAsync(func() error {
+		var err error
+		keys, err = client.List()
+		return err
+	})
+	// The proxy counts the request just before it joins the group's pending
+	// startup refresh, so the agent answers only after the client is waiting.
+	deadline := time.Now().Add(testutil.WaitTimeout)
+	for f.srv.telemetry.listRequests.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-request.Done():
+		t.Fatalf("client List() finished before the agent answered: %v", request.Err())
+	default:
+	}
 	backend.Release()
-	keys, err := f.dial(t).List()
-	if err != nil {
-		t.Fatalf("client List() after agent recovery: %v", err)
+	if !testutil.WaitForAsyncStop(t, request, "client List") {
+		return
+	}
+	if err := request.Err(); err != nil {
+		t.Fatalf("client List() after the agent answered: %v", err)
 	}
 	if len(keys) != 1 || keys[0].Comment != "allowed" {
 		t.Errorf("client List() = %v, want the allowed key", keys)
 	}
-	if got := backend.ListCalls(); got != 2 {
-		t.Errorf("upstream List requests after client List = %d, want 2", got)
+	if got := backend.ListCalls(); got != 1 {
+		t.Errorf("upstream List requests = %d, want the client to share the startup listing", got)
 	}
+	waitForLogMessage(t, f.logs, "group keys resolved")
 }
 
-func TestStartupListTimeoutDoesNotBoundSigning(t *testing.T) {
+func TestShutdownDuringStartupListingIsNotAnUpstreamFailure(t *testing.T) {
 	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-	pub := addAgentKey(t, backend.ExtendedAgent, "allowed")
-	backend.BlockSign()
-	const timeout = 50 * time.Millisecond
-	f := startStartupFixture(t, backend, timeout)
+	addAgentKey(t, backend.ExtendedAgent, "allowed")
+	backend.BlockListFrom(1)
+	f := startStartupFixture(t, backend)
 	if !testutil.WaitForEvent(t, f.ready, "proxy readiness") {
 		return
 	}
-
+	if !testutil.WaitForEvent(t, backend.Started(), "unanswered startup listing") {
+		return
+	}
 	client := f.dial(t)
-	sign := testutil.RunAsync(func() error {
-		_, err := client.Sign(pub, []byte("payload"))
+	request := testutil.RunAsync(func() error {
+		_, err := client.List()
 		return err
 	})
-	if !testutil.WaitForEvent(t, backend.Started(), "stalled signing request") {
+
+	// Shutdown interrupts the listing, wakes the waiting client, and returns
+	// while the agent is still unanswered.
+	f.cancel()
+	if !testutil.WaitForAsyncStop(t, f.result, "proxy server with unanswered startup listing") {
 		return
 	}
-	select {
-	case <-sign.Done():
-		t.Fatalf("signing finished while the agent was still waiting: %v", sign.Err())
-	case <-time.After(4 * timeout):
+	if err := f.result.Err(); err != nil {
+		t.Errorf("Run() error = %v, want clean shutdown", err)
 	}
-	backend.Release()
-	if testutil.WaitForAsyncStop(t, sign, "signing request") && sign.Err() != nil {
-		t.Errorf("signing after a wait longer than the startup timeout: %v", sign.Err())
+	if testutil.WaitForAsyncStop(t, request, "client waiting for the startup listing") && request.Err() == nil {
+		t.Error("client List() succeeded although the startup listing was interrupted")
 	}
-}
-
-// startListWithinClient connects a reconnectClient to backend. The returned
-// context is the client's parent, as Server.Run's context is in production;
-// canceling it models shutdown.
-func startListWithinClient(t *testing.T, backend agent.Agent) (*reconnectClient, *proxyTelemetry, context.Context, context.CancelFunc) {
-	t.Helper()
-	socket := testutil.StartAgent(t, filepath.Join(testutil.ShortSocketDir(t), "upstream.sock"), backend)
-	ctx, cancel := context.WithCancel(t.Context())
-	telemetry := &proxyTelemetry{}
-	client, err := newReconnectClientWithTelemetry(ctx, socket, slog.New(slog.DiscardHandler), telemetry)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { cancel(); _ = client.Close(t.Context()) })
-	return client, telemetry, ctx, cancel
-}
-
-func TestListWithinKeepsAnsweredConnection(t *testing.T) {
-	keyring := testutil.NewKeyring(t)
-	addAgentKey(t, keyring, "allowed")
-	client, telemetry, ctx, _ := startListWithinClient(t, keyring)
-	original := client.current.Load()
-
-	keys, err := client.listWithin(ctx, testutil.WaitTimeout)
-	if err != nil || len(keys) != 1 {
-		t.Fatalf("listWithin() = %v, %v; want one key", keys, err)
-	}
-	// Releasing the timeout after the answer must not expire the connection.
-	if _, err := client.List(); err != nil {
-		t.Fatalf("List() after listWithin: %v", err)
-	}
-	if client.current.Load() != original || telemetry.upstreamReconnects.Load() != 0 {
-		t.Error("an answered listing replaced the connection")
-	}
-}
-
-func TestListWithinReplacesConnectionAfterDeadline(t *testing.T) {
-	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-	backend.BlockListFrom(1)
-	client, telemetry, ctx, _ := startListWithinClient(t, backend)
-	original := client.current.Load()
-
-	if _, err := client.listWithin(ctx, 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("listWithin() error = %v, want deadline exceeded", err)
-	}
-	if got := backend.ListCalls(); got != 1 {
-		t.Errorf("List requests = %d, want 1 without retry", got)
-	}
-	if client.current.Load() == original || telemetry.upstreamReconnects.Load() != 1 {
-		t.Error("the timed-out connection was not replaced")
-	}
-
-	backend.Release()
-	if _, err := client.List(); err != nil {
-		t.Errorf("List() on the replacement connection: %v", err)
-	}
-}
-
-func TestListWithinDoesNotReplaceConnectionOnShutdown(t *testing.T) {
-	backend := testutil.NewBlockingAgent(t, testutil.NewKeyring(t))
-	backend.BlockListFrom(1)
-	client, telemetry, ctx, shutdown := startListWithinClient(t, backend)
-	original := client.current.Load()
-
-	result := testutil.RunAsync(func() error {
-		_, err := client.listWithin(ctx, testutil.WaitTimeout)
-		return err
-	})
-	if !testutil.WaitForEvent(t, backend.Started(), "stalled startup listing") {
-		return
-	}
-	shutdown()
-	if !testutil.WaitForAsyncStop(t, result, "listing during shutdown") {
-		return
-	}
-	// Either the connection's lifetime hook or the listing deadline interrupts
-	// the request first; both must end it without a replacement connection.
-	if result.Err() == nil {
-		t.Error("listWithin() succeeded during shutdown")
-	}
-	if client.current.Load() != original || telemetry.upstreamReconnects.Load() != 0 {
-		t.Error("shutdown dialed a replacement connection")
+	for _, entry := range decodeDebugLogs(t, f.logs.Bytes()) {
+		if entry["msg"] == "initial config key resolution failed; deferring until client request" {
+			t.Errorf("interrupted startup listing was logged as an upstream failure: %v", entry)
+		}
 	}
 }

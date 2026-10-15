@@ -30,12 +30,6 @@ import (
 const (
 	// dialTimeout bounds how long connecting to the upstream agent may take.
 	dialTimeout = 10 * time.Second
-	// startupListTimeout bounds the initial identity listing, so an agent that
-	// accepts connections but never answers cannot keep the group sockets
-	// unbound. A responsive agent, even a locked one, answers almost at once.
-	// Requests made after startup, including interactive signing, are not
-	// bounded.
-	startupListTimeout = 10 * time.Second
 	// socketProbeTimeout bounds the live-owner check before a stale socket is
 	// removed. A timeout is ambiguous and therefore treated as a live owner.
 	socketProbeTimeout = time.Second
@@ -58,7 +52,6 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
-	startupTimeout    time.Duration
 	onReady           func()
 	telemetry         *proxyTelemetry
 	clientsMu         sync.Mutex
@@ -88,7 +81,6 @@ func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log
 	}
 	s.newUpstreamClient = newReconnectClientWithTelemetry
 	s.listen = s.listenUnix
-	s.startupTimeout = startupListTimeout
 	return s
 }
 
@@ -111,6 +103,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	var locks []socketLock
 	var rc *reconnectClient
 	var listeners []net.Listener
+	var startupResolution sync.WaitGroup
 	defer func() {
 		// Classify the operation result before joining teardown errors so that
 		// cancellation cannot hide a genuine startup or cleanup failure. Only
@@ -122,7 +115,9 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		// Parent cancellation may already have interrupted upstream I/O via
 		// deadlines. On error returns, refuse clients and close listeners before
 		// canceling upstream I/O. Both paths close upstream before waiting for
-		// existing client handlers, then release socket ownership last.
+		// existing client handlers, then release socket ownership last. The
+		// startup resolution ends once upstream I/O is interrupted, and it must
+		// finish first: client handlers may be waiting for its result.
 		s.refuseNewClients()
 		runErr = errors.Join(runErr, s.closeListeners(listeners))
 		cancel()
@@ -132,6 +127,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 				runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
 			}
 		}
+		startupResolution.Wait()
 		runErr = errors.Join(runErr, s.closeClients())
 		if err := closeSocketLocks(locks); err != nil {
 			s.log.Warn("releasing group socket locks", "err", err)
@@ -181,14 +177,12 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
-	// Create one shared authorization state per group. A successful initial list
-	// seeds every group from the same upstream snapshot; later requests refresh
-	// the snapshots so a locked or empty agent can recover without a restart.
+	// Create one shared authorization state per group. One initial list seeds
+	// every group from the same upstream snapshot; later requests refresh the
+	// snapshots so a locked or empty agent can recover without a restart.
 	type enrichedGroup struct {
 		g             config.Group
 		authorization *groupAuthorization
-		resolvedKeys  int
-		resolved      bool
 	}
 	egs := make([]enrichedGroup, 0, len(enabledGroups))
 	for _, g := range enabledGroups {
@@ -197,22 +191,20 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
 		})
 	}
-	allKeys, err := upstream.listUsing(func() ([]*agent.Key, error) { return rc.listWithin(ctx, s.startupTimeout) })
-	// A List interrupted by shutdown or reload is not an upstream failure.
-	if ctx.Err() != nil {
-		return ctx.Err()
+	// Binding never waits for the upstream: an agent that is slow, prompting
+	// for an unlock, or hung must not keep the sockets unbound. The initial
+	// list runs in the background, and each group's startup refresh is claimed
+	// before its socket exists, so early clients wait for that list instead of
+	// sending their own.
+	authorizations := make([]*groupAuthorization, len(egs))
+	startup := make([]*authorizationRefresh, len(egs))
+	for i, eg := range egs {
+		authorizations[i] = eg.authorization
+		startup[i] = eg.authorization.claimRefresh("startup")
 	}
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		s.log.Warn("initial key listing timed out; deferring until client request", "timeout", s.startupTimeout.String())
-	case err != nil:
-		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
-	default:
-		for i := range egs {
-			egs[i].resolvedKeys = len(egs[i].authorization.resolve(allKeys, "startup"))
-			egs[i].resolved = true
-		}
-	}
+	startupResolution.Go(func() {
+		s.resolveStartup(ctx, upstream, authorizations, startup)
+	})
 
 	acceptFailures := make(chan error, len(egs))
 	for _, eg := range egs {
@@ -229,11 +221,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		logAttrs := []any{"group", g.Name, "socket", g.Socket}
-		if eg.resolved {
-			logAttrs = append(logAttrs, "keys", eg.resolvedKeys)
-		}
-		s.log.Info("serving group", logAttrs...)
+		s.log.Info("serving group", "group", g.Name, "socket", g.Socket)
 		go func() {
 			if err := s.acceptLoop(ctx, ln, g, eg.authorization, upstream); err != nil {
 				acceptFailures <- err
@@ -250,6 +238,30 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		return nil
 	case err := <-acceptFailures:
 		return err
+	}
+}
+
+// resolveStartup lists the upstream once and completes every group's startup
+// refresh with the result. Run's teardown interrupts the list, so it always
+// returns and wakes any client waiting for a refresh.
+func (s *Server) resolveStartup(ctx context.Context, upstream agent.ExtendedAgent, groups []*groupAuthorization, refreshes []*authorizationRefresh) {
+	all, err := upstream.List()
+	for i, group := range groups {
+		if refreshes[i] != nil {
+			group.finishRefresh(refreshes[i], all, err)
+		}
+	}
+	switch {
+	case ctx.Err() != nil:
+		// A list interrupted by shutdown or reload is not an upstream failure.
+	case err != nil:
+		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
+	default:
+		for i, group := range groups {
+			if refreshes[i] != nil {
+				s.log.Info("group keys resolved", "group", group.group, "keys", len(refreshes[i].visible))
+			}
+		}
 	}
 }
 

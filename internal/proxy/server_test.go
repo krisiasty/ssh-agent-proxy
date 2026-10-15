@@ -278,7 +278,7 @@ func TestServerRunReportsForeignCancellationError(t *testing.T) {
 }
 
 func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer(t.Context(), "unused", 0, log)
 	srv.SetReadyCallback(func() {
@@ -327,6 +327,7 @@ groups:
 	}
 	done = testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
 	waitForSocket(t, socket, done, nil)
+	waitForLogMessage(t, &output, "group keys resolved")
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during startup = %d, want 1", got)
 	}
@@ -340,9 +341,9 @@ groups:
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
-	serving := findDebugLog(t, entries, "serving group", "")
-	if serving["group"] != "test" || serving["keys"] != float64(2) {
-		t.Errorf("serving group log = %v, want 2 distinct matched keys", serving)
+	resolved := findDebugLog(t, entries, "group keys resolved", "")
+	if resolved["group"] != "test" || resolved["keys"] != float64(2) {
+		t.Errorf("group keys resolved log = %v, want 2 distinct matched keys", resolved)
 	}
 	resolution := findDebugLog(t, entries, "config keys resolved", "")
 	if resolution["trigger"] != "startup" || resolution["configured_keys"] != float64(4) ||
@@ -415,6 +416,7 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	done = testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
 	waitForSocket(t, socket, done, nil)
+	waitForLogMessage(t, &output, "initial config key resolution failed; deferring until client request")
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during failed startup resolution = %d, want 1", got)
 	}
@@ -465,6 +467,22 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	if _, ok := serving["keys"]; ok {
 		t.Errorf("serving group log reports a key count after failed resolution: %v", serving)
 	}
+}
+
+// waitForLogMessage waits until output holds a JSON log entry with message.
+// Startup key resolution logs from the background, after readiness.
+func waitForLogMessage(t *testing.T, output *lockedBuffer, message string) {
+	t.Helper()
+	deadline := time.Now().Add(testutil.WaitTimeout)
+	for time.Now().Before(deadline) {
+		for _, entry := range decodeDebugLogs(t, output.Bytes()) {
+			if entry["msg"] == message {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for log %q", message)
 }
 
 // lockedBuffer allows tests to inspect logs while asynchronous connection

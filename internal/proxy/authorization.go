@@ -104,8 +104,26 @@ func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRe
 	return refresh, true
 }
 
+// claimRefresh starts a refresh that the caller completes with
+// finishRefresh. Clients that need the group before it completes wait for its
+// result instead of listing the upstream again. It returns nil if a refresh is
+// already in flight.
+func (a *groupAuthorization) claimRefresh(trigger string) *authorizationRefresh {
+	refresh, owner := a.joinRefresh(trigger)
+	if !owner {
+		return nil
+	}
+	return refresh
+}
+
 func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authorizationRefresh) {
 	all, err := up.List()
+	a.finishRefresh(refresh, all, err)
+}
+
+// finishRefresh publishes the result of an upstream listing for refresh and
+// wakes every client waiting for it.
+func (a *groupAuthorization) finishRefresh(refresh *authorizationRefresh, all []*agent.Key, err error) {
 	var visible []*agent.Key
 	if err == nil {
 		visible = a.resolve(all, refresh.trigger)

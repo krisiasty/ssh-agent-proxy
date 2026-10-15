@@ -199,7 +199,8 @@ for both command-line processing and ingestion by log-management systems.
 With the default `debug: false` configuration, the proxy logs:
 
 - version, configuration path, upstream socket, cache and telemetry intervals, and
-  group startup with the number of distinct matched keys;
+  group startup, followed by each group's number of distinct matched keys once the
+  initial upstream identity list resolves;
 - one warning for each configured selector that matches no upstream key, identifying
   its group, config index, and selector type without logging the selector value;
 - client connections and disconnections, including UID, PID, and process name when the
@@ -212,8 +213,9 @@ With the default `debug: false` configuration, the proxy logs:
 For example:
 
 ```jsonl
-{"time":"2026-08-09T22:55:55.850+02:00","level":"INFO","msg":"serving group","group":"work","socket":"/Users/example/.ssh/agent-work.sock","keys":2}
+{"time":"2026-08-09T22:55:55.850+02:00","level":"INFO","msg":"serving group","group":"work","socket":"/Users/example/.ssh/agent-work.sock"}
 {"time":"2026-08-09T22:55:55.851+02:00","level":"WARN","msg":"configured key selector matched no upstream key","group":"work","config_index":3,"selector_type":"comment"}
+{"time":"2026-08-09T22:55:55.851+02:00","level":"INFO","msg":"group keys resolved","group":"work","keys":2}
 {"time":"2026-08-09T22:55:55.870+02:00","level":"INFO","msg":"client connected","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh"}
 {"time":"2026-08-09T22:55:55.873+02:00","level":"INFO","msg":"list identities","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","count":2}
 {"time":"2026-08-09T22:55:55.893+02:00","level":"INFO","msg":"sign","conn":"67d54585","group":"work","uid":501,"pid":60181,"process":"ssh","fingerprint":"SHA256:5D4g5Lj3m9tn9r/lOD4vP42WHHyII1A6Y9+Myi1OqVM"}
@@ -411,15 +413,16 @@ upstream agent because it has no sockets to serve.
 Stopping or reloading the service interrupts outstanding upstream requests, so shutdown,
 restart, and reload complete even when the upstream agent stops responding.
 
-One shared upstream identity list resolves every enabled group during startup. If the
-connected upstream agent is locked, listing otherwise fails, or the agent does not answer
-within 10 seconds, the proxy still starts serving and defers resolution until a client
-request. It picks up matching keys after the agent is unlocked, populated, or responding
-again. Only this startup listing has a time limit: later requests, including signing that
-waits for interactive approval, wait as long as the agent needs. Successful upstream key
-lists are cached process-wide for the configured `--cache` interval. Concurrent refreshes
-across every group share one request; if a refresh fails, the last successful list is
-served until the next interval.
+Group sockets are bound without waiting for the upstream agent, so a slow, locked, or
+unresponsive agent never keeps them unbound. One shared upstream identity list then
+resolves every enabled group in the background, and clients that connect before it
+completes wait for that list instead of sending their own. No upstream request has a time
+limit, so an agent that waits for an unlock or for interactive approval is never cut off.
+If listing fails, the proxy defers resolution until a client request and picks up
+matching keys after the agent is unlocked or populated. Successful upstream key lists are
+cached process-wide for the configured `--cache` interval. Concurrent refreshes across
+every group share one request; if a refresh fails, the last successful list is served
+until the next interval.
 
 At startup, each enabled group socket is protected by a nonblocking file lock. If
 another proxy instance owns a lock or an existing socket accepts connections, startup

@@ -38,19 +38,12 @@ func newCachedAgent(upstream agent.ExtendedAgent, ttl time.Duration, log *slog.L
 }
 
 func (a *cachedAgent) List() ([]*agent.Key, error) {
-	return a.listUsing(a.ExtendedAgent.List)
-}
-
-// listUsing serves List from the shared cache and refreshes it with fetch. It
-// lets a caller bound the upstream request, as startup does, while keeping the
-// cache's coalescing, snapshot, and telemetry behavior.
-func (a *cachedAgent) listUsing(fetch func() ([]*agent.Key, error)) ([]*agent.Key, error) {
 	if a.ttl <= 0 {
 		if a.telemetry != nil {
 			a.telemetry.cacheMisses.Add(1)
 			a.telemetry.cacheRefreshes.Add(1)
 		}
-		return fetch()
+		return a.ExtendedAgent.List()
 	}
 
 	missed := false
@@ -87,7 +80,7 @@ func (a *cachedAgent) listUsing(fetch func() ([]*agent.Key, error)) ([]*agent.Ke
 			a.telemetry.cacheRefreshes.Add(1)
 		}
 
-		keys, err := fetch()
+		keys, err := a.ExtendedAgent.List()
 
 		a.mu.Lock()
 		stale := false
