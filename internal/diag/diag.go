@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
@@ -87,17 +85,8 @@ func defaultDependencies() dependencies {
 			}
 			return manager.Status()
 		},
-		listAgentKeys: proxy.ListAgentKeys,
-		currentExecutable: func() (string, error) {
-			executable, err := os.Executable()
-			if err != nil {
-				return "", err
-			}
-			if resolved, err := filepath.EvalSymlinks(executable); err == nil {
-				executable = resolved
-			}
-			return executable, nil
-		},
+		listAgentKeys:     proxy.ListAgentKeys,
+		currentExecutable: service.CurrentExecutable,
 	}
 }
 
@@ -163,7 +152,7 @@ func checkService(r *report, selectedConfig string, status service.Status, curre
 	switch {
 	case status.Config == "":
 		r.add(warn, "service config: installed definition has no explicit config path")
-	case samePath(status.Config, selectedConfig):
+	case service.SamePath(status.Config, selectedConfig):
 		r.add(pass, "service config: installed service uses selected config %q", selectedConfig)
 	default:
 		r.add(fail, "service config: installed service uses %q instead of selected config %q", status.Config, selectedConfig)
@@ -173,12 +162,16 @@ func checkService(r *report, selectedConfig string, status service.Status, curre
 		r.add(warn, "service binary: installed definition does not identify an executable")
 		return
 	}
+	if err := service.CheckProgram(status); err != nil {
+		r.add(fail, "service binary: %v", err)
+		return
+	}
 	current, err := currentExecutable()
 	if err != nil {
 		r.add(warn, "service binary: unable to locate current executable: %v", err)
 		return
 	}
-	if samePath(status.Program, current) {
+	if service.SamePath(status.Program, current) {
 		r.add(pass, "service binary: installed service uses the current executable")
 	} else {
 		r.add(warn, "service binary: installed service uses %q instead of current executable %q", status.Program, current)
@@ -279,22 +272,6 @@ func sameKeys(left, right []*agent.Key) bool {
 		}
 	}
 	return true
-}
-
-func samePath(left, right string) bool {
-	return normalizedPath(left) == normalizedPath(right)
-}
-
-func normalizedPath(path string) string {
-	absolute, err := filepath.Abs(path)
-	if err == nil {
-		path = absolute
-	}
-	path = filepath.Clean(path)
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	return path
 }
 
 func plural(count int, singular string) string {
