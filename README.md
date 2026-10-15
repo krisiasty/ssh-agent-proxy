@@ -107,7 +107,7 @@ manually if you want it gone. For Homebrew, also run `brew uninstall ssh-agent-p
 | `-uninstall`   | Stop and remove the service, then exit.                                |
 | `-start`       | Start the service, then exit.                                          |
 | `-stop`        | Stop the service, then exit.                                           |
-| `-restart`     | Restart the service, then exit.                                        |
+| `-restart`     | Restart the service, then exit. On macOS the running process is replaced in one launchd operation, and the command fails unless a new process starts. |
 | `-reload`      | Ask the running managed service to reload its config, then exit.       |
 | `-status`      | Print service status (installed / running), then exit.                 |
 | `-diag`        | Check configuration, service, upstream, and group health, then exit.   |
