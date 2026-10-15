@@ -40,6 +40,13 @@ func processAlive(pid int) bool {
 // not loaded in the targeted domain ("Could not find specified service").
 const launchctlServiceNotFound = 113
 
+// launchctlNotFound reports whether err is launchctl's "service not loaded"
+// exit status.
+func launchctlNotFound(err error) bool {
+	var exitErr interface{ ExitCode() int }
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == launchctlServiceNotFound
+}
+
 type launchdManager struct {
 	cfgPath      string
 	cacheSeconds int
@@ -163,8 +170,7 @@ func (m *launchdManager) kickstart() (int, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 		stdout, stderr, err := m.run(ctx, args...)
 		cancel()
-		var exitErr interface{ ExitCode() int }
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == launchctlServiceNotFound {
+		if launchctlNotFound(err) {
 			continue
 		}
 		if err != nil {
@@ -202,28 +208,38 @@ func (m *launchdManager) Status() (Status, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	stdout, stderr, err := m.run(ctx, "list", Label)
-	if err == nil {
-		s := string(append(stdout, stderr...))
-		if mt := reLaunchdPID.FindStringSubmatch(s); mt != nil {
-			st.Running = true
-			st.PID = mt[1]
-		}
-		program, parseErr := parseLaunchdProgram(s)
-		if parseErr != nil {
-			return st, parseErr
-		}
-		if program != "" {
-			st.Program = program
-		}
-		args, parseErr := parseLaunchdArguments(s)
-		if parseErr != nil {
-			return st, parseErr
-		}
-		if len(args) > 0 {
-			st.Program = args[0]
-			st.Config = configArgument(args)
-		}
+	listArgs := []string{"list", Label}
+	stdout, stderr, err := m.run(ctx, listArgs...)
+	switch {
+	case err == nil:
+	case ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded):
+		return st, fmt.Errorf("inspecting launchd job: launchctl %s timed out after %s", strings.Join(listArgs, " "), commandTimeout)
+	case launchctlNotFound(err):
+		// The job is not loaded, so it is not running. Any other failure means
+		// the state is unknown and must not be reported as stopped.
+		return st, nil
+	default:
+		return st, fmt.Errorf("inspecting launchd job: %w", launchctlCommandError(listArgs, append(stderr, stdout...), err))
+	}
+	s := string(append(stdout, stderr...))
+	if mt := reLaunchdPID.FindStringSubmatch(s); mt != nil {
+		st.Running = true
+		st.PID = mt[1]
+	}
+	program, parseErr := parseLaunchdProgram(s)
+	if parseErr != nil {
+		return st, parseErr
+	}
+	if program != "" {
+		st.Program = program
+	}
+	args, parseErr := parseLaunchdArguments(s)
+	if parseErr != nil {
+		return st, parseErr
+	}
+	if len(args) > 0 {
+		st.Program = args[0]
+		st.Config = configArgument(args)
 	}
 	return st, nil
 }
