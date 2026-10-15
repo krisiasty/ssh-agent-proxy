@@ -52,6 +52,7 @@ type Server struct {
 	log               *slog.Logger
 	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
+	refreshJoined     func()
 	onReady           func()
 	telemetry         *proxyTelemetry
 	clientsMu         sync.Mutex
@@ -115,9 +116,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		// Parent cancellation may already have interrupted upstream I/O via
 		// deadlines. On error returns, refuse clients and close listeners before
 		// canceling upstream I/O. Both paths close upstream before waiting for
-		// existing client handlers, then release socket ownership last. The
-		// startup resolution ends once upstream I/O is interrupted, and it must
-		// finish first: client handlers may be waiting for its result.
+		// existing client handlers, then release socket ownership last.
+		// Interrupting upstream I/O ends the startup listing, which completes
+		// every startup refresh and so wakes any client waiting for one; Run
+		// waits for it so that nothing outlives Run.
 		s.refuseNewClients()
 		runErr = errors.Join(runErr, s.closeListeners(listeners))
 		cancel()
@@ -180,30 +182,29 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	// Create one shared authorization state per group. One initial list seeds
 	// every group from the same upstream snapshot; later requests refresh the
 	// snapshots so a locked or empty agent can recover without a restart.
-	type enrichedGroup struct {
-		g             config.Group
-		authorization *groupAuthorization
-	}
+	//
+	// Binding never waits for an answer from the upstream: an agent that is
+	// slow, prompting for an unlock, or hung must not keep the sockets unbound.
+	// Each group's startup refresh is claimed before its socket exists, so
+	// early clients wait for the initial list instead of sending their own.
+	// A new group has no refresh in flight, so the claim always owns it.
 	egs := make([]enrichedGroup, 0, len(enabledGroups))
 	for _, g := range enabledGroups {
-		egs = append(egs, enrichedGroup{
-			g:             g,
-			authorization: newGroupAuthorization(g.Name, g.Matchers(), s.log),
-		})
+		authorization := newGroupAuthorization(g.Name, g.Matchers(), s.log)
+		authorization.onJoin = s.refreshJoined
+		startup, _ := authorization.joinRefresh("startup")
+		egs = append(egs, enrichedGroup{g: g, authorization: authorization, startup: startup})
 	}
-	// Binding never waits for the upstream: an agent that is slow, prompting
-	// for an unlock, or hung must not keep the sockets unbound. The initial
-	// list runs in the background, and each group's startup refresh is claimed
-	// before its socket exists, so early clients wait for that list instead of
-	// sending their own.
-	authorizations := make([]*groupAuthorization, len(egs))
-	startup := make([]*authorizationRefresh, len(egs))
-	for i, eg := range egs {
-		authorizations[i] = eg.authorization
-		startup[i] = eg.authorization.claimRefresh("startup")
-	}
+	// The initial list starts once every socket is bound, so its results are
+	// logged after "serving group", or as soon as Run is canceled. Either way it
+	// completes every startup refresh and wakes any waiting client.
+	bound := make(chan struct{})
 	startupResolution.Go(func() {
-		s.resolveStartup(ctx, upstream, authorizations, startup)
+		select {
+		case <-bound:
+		case <-ctx.Done():
+		}
+		s.resolveStartup(ctx, upstream, egs)
 	})
 
 	acceptFailures := make(chan error, len(egs))
@@ -228,6 +229,7 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			}
 		}()
 	}
+	close(bound)
 	if s.onReady != nil {
 		s.onReady()
 	}
@@ -241,15 +243,21 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	}
 }
 
+// enrichedGroup is one served group with its shared authorization state and
+// the startup refresh that the initial upstream list completes.
+type enrichedGroup struct {
+	g             config.Group
+	authorization *groupAuthorization
+	startup       *authorizationRefresh
+}
+
 // resolveStartup lists the upstream once and completes every group's startup
 // refresh with the result. Run's teardown interrupts the list, so it always
 // returns and wakes any client waiting for a refresh.
-func (s *Server) resolveStartup(ctx context.Context, upstream agent.ExtendedAgent, groups []*groupAuthorization, refreshes []*authorizationRefresh) {
+func (s *Server) resolveStartup(ctx context.Context, upstream agent.ExtendedAgent, groups []enrichedGroup) {
 	all, err := upstream.List()
-	for i, group := range groups {
-		if refreshes[i] != nil {
-			group.finishRefresh(refreshes[i], all, err)
-		}
+	for _, eg := range groups {
+		eg.authorization.finishRefresh(eg.startup, all, err)
 	}
 	switch {
 	case ctx.Err() != nil:
@@ -257,10 +265,8 @@ func (s *Server) resolveStartup(ctx context.Context, upstream agent.ExtendedAgen
 	case err != nil:
 		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
 	default:
-		for i, group := range groups {
-			if refreshes[i] != nil {
-				s.log.Info("group keys resolved", "group", group.group, "keys", len(refreshes[i].visible))
-			}
+		for _, eg := range groups {
+			s.log.Info("group keys resolved", "group", eg.g.Name, "keys", len(eg.startup.visible))
 		}
 	}
 }

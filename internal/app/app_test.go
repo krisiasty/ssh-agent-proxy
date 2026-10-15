@@ -252,7 +252,7 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
 			blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), testutil.NewKeyring(t))
 			healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
-			gate := stallRuntimeStartup(t, blocked)
+			gate := newStartupGate(t, blocked)
 			gate.Block()
 			configPath := filepath.Join(dir, "config.yaml")
 			socket := filepath.Join(dir, "group.sock")
@@ -265,7 +265,7 @@ func TestRunReloadInterruptsBlockedStartup(t *testing.T) {
 			reload := make(chan os.Signal, 1)
 			done := make(chan error, 1)
 			go func() {
-				done <- runWithReload(ctx, reload, configPath, false, 0, Version{Version: "test"})
+				done <- runWithServers(ctx, reload, configPath, false, 0, Version{Version: "test"}, gate.newServer)
 			}()
 			t.Cleanup(func() {
 				cancel()
@@ -298,13 +298,13 @@ func TestInvalidReloadRestoresLastReadyConfiguration(t *testing.T) {
 	dir := testutil.ShortSocketDir(t)
 	blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), testutil.NewKeyring(t))
 	healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
-	gate := stallRuntimeStartup(t, blocked)
+	gate := newStartupGate(t, blocked)
 	gate.Block()
 	path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 	writeReloadConfig(t, path, healthy, "ready", socket)
 	ctx, cancel := context.WithCancel(t.Context())
 	reload, done := make(chan os.Signal, 1), make(chan error, 1)
-	go func() { done <- runWithReload(ctx, reload, path, false, 0, Version{Version: "test"}) }()
+	go func() { done <- runWithServers(ctx, reload, path, false, 0, Version{Version: "test"}, gate.newServer) }()
 	t.Cleanup(func() {
 		cancel()
 		gate.Release()
@@ -338,13 +338,15 @@ func TestUnreadyInitialConfigurationIsNeverRestored(t *testing.T) {
 			events, _ := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			blocked := testutil.StartAgent(t, filepath.Join(dir, "blocked.sock"), testutil.NewKeyring(t))
-			gate := stallRuntimeStartup(t, blocked)
+			gate := newStartupGate(t, blocked)
 			gate.Block()
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, blocked, "never-ready", socket)
 			ctx, cancel := context.WithCancel(t.Context())
 			reload, done := make(chan os.Signal, 1), make(chan error, 1)
-			go func() { done <- runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) }()
+			go func() {
+				done <- runWithServers(ctx, reload, path, foreground, 0, Version{Version: "test"}, gate.newServer)
+			}()
 			finished := false
 			t.Cleanup(func() {
 				cancel()
@@ -405,13 +407,15 @@ func TestInvalidReloadKeepsInitialStartup(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), testutil.NewKeyring(t))
-			gate := stallRuntimeStartup(t, upstream)
+			gate := newStartupGate(t, upstream)
 			gate.Block()
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "initial", socket)
 			ctx, cancel := context.WithCancel(t.Context())
 			reload := make(chan os.Signal, 1)
-			done := testutil.RunAsync(func() error { return runWithReload(ctx, reload, path, foreground, 0, Version{Version: "test"}) })
+			done := testutil.RunAsync(func() error {
+				return runWithServers(ctx, reload, path, foreground, 0, Version{Version: "test"}, gate.newServer)
+			})
 			t.Cleanup(func() {
 				cancel()
 				gate.Release()
@@ -509,13 +513,13 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 			events, finish := captureRuntimeLogs(t)
 			dir := testutil.ShortSocketDir(t)
 			upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), testutil.NewKeyring(t))
-			gate := stallRuntimeStartup(t, upstream)
+			gate := newStartupGate(t, upstream)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, upstream, "original", socket)
 			ctx, cancel := context.WithCancel(t.Context())
 			reload := make(chan os.Signal, 1)
 			done := testutil.RunAsync(func() error {
-				return runWithReload(ctx, reload, path, scenario.foreground, 0, Version{Version: "test"})
+				return runWithServers(ctx, reload, path, scenario.foreground, 0, Version{Version: "test"}, gate.newServer)
 			})
 			t.Cleanup(func() {
 				cancel()
@@ -594,13 +598,13 @@ func TestStalledRollbackStaysInterruptible(t *testing.T) {
 			dir := testutil.ShortSocketDir(t)
 			shared := testutil.StartAgent(t, filepath.Join(dir, "shared.sock"), testutil.NewKeyring(t))
 			healthy := testutil.StartAgent(t, filepath.Join(dir, "healthy.sock"), testutil.NewKeyring(t))
-			gate := stallRuntimeStartup(t, shared)
+			gate := newStartupGate(t, shared)
 			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
 			writeReloadConfig(t, path, shared, "original", socket)
 			ctx, cancel := context.WithCancel(t.Context())
 			reload := make(chan os.Signal, 1)
 			done := testutil.RunAsync(func() error {
-				return runWithReload(ctx, reload, path, false, 0, Version{Version: "test"})
+				return runWithServers(ctx, reload, path, false, 0, Version{Version: "test"}, gate.newServer)
 			})
 			t.Cleanup(func() {
 				cancel()
@@ -719,7 +723,9 @@ func TestRuntimeLogCaptureRetainsBufferedEvents(t *testing.T) {
 // startupGate holds runtimes for one upstream in startup until Release, or
 // until the runtime is stopped. A hung upstream no longer delays readiness, so
 // the gate stands in for a runtime whose startup is slow, such as an upstream
-// dial that takes its full timeout.
+// dial that takes its full timeout. Like such a runtime, a held runtime owns
+// its group socket locks: a replacement launched before it stopped would fail
+// to take them.
 type startupGate struct {
 	upstream    string
 	blocked     atomic.Bool
@@ -730,24 +736,22 @@ type startupGate struct {
 	releaseOnce sync.Once
 }
 
-// stallRuntimeStartup installs a startupGate for runtimes that use upstream.
-// It holds nothing until Block is called.
-func stallRuntimeStartup(t *testing.T, upstream string) *startupGate {
+// newStartupGate returns a gate for runtimes that use upstream. It holds
+// nothing until Block is called; pass its newServer to runWithServers.
+func newStartupGate(t *testing.T, upstream string) *startupGate {
 	t.Helper()
 	gate := &startupGate{upstream: upstream, started: make(chan struct{}), release: make(chan struct{})}
-	previous := newRuntimeServer
-	newRuntimeServer = func(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer {
-		srv := previous(ctx, upstream, cacheTTL, log)
-		if upstream != gate.upstream {
-			return srv
-		}
-		return &gatedServer{runtimeServer: srv, gate: gate}
-	}
-	t.Cleanup(func() {
-		gate.Release()
-		newRuntimeServer = previous
-	})
+	t.Cleanup(gate.Release)
 	return gate
+}
+
+// newServer is a serverFactory that gates runtimes using the gate's upstream.
+func (g *startupGate) newServer(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer {
+	srv := newProxyServer(ctx, upstream, cacheTTL, log)
+	if upstream != g.upstream {
+		return srv
+	}
+	return &gatedServer{runtimeServer: srv, gate: g}
 }
 
 // Block holds every later startup until Release.
@@ -768,14 +772,21 @@ type gatedServer struct {
 }
 
 func (s *gatedServer) Run(ctx context.Context, groups []config.Group) error {
-	if s.gate.blocked.Load() {
-		s.gate.stalls.Add(1)
-		s.gate.startOnce.Do(func() { close(s.gate.started) })
-		select {
-		case <-s.gate.release:
-		case <-ctx.Done():
-			return nil
-		}
+	if !s.gate.blocked.Load() {
+		return s.runtimeServer.Run(ctx, groups)
+	}
+	releaseLocks, err := holdSocketLocks(groups)
+	if err != nil {
+		return err
+	}
+	s.gate.stalls.Add(1)
+	s.gate.startOnce.Do(func() { close(s.gate.started) })
+	select {
+	case <-s.gate.release:
+		releaseLocks()
+	case <-ctx.Done():
+		releaseLocks()
+		return nil
 	}
 	return s.runtimeServer.Run(ctx, groups)
 }

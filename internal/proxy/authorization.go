@@ -35,6 +35,10 @@ type groupAuthorization struct {
 	mu        sync.Mutex
 	inFlight  *authorizationRefresh
 	unmatched []bool
+
+	// onJoin, when set, is called whenever a client starts waiting for a
+	// refresh that is already in flight. It must not block.
+	onJoin func()
 }
 
 func newGroupAuthorization(group string, matchers []keys.Matcher, log *slog.Logger) *groupAuthorization {
@@ -97,23 +101,14 @@ func (a *groupAuthorization) joinRefresh(trigger string) (*authorizationRefresh,
 
 func (a *groupAuthorization) joinRefreshLocked(trigger string) (*authorizationRefresh, bool) {
 	if a.inFlight != nil {
+		if a.onJoin != nil {
+			a.onJoin()
+		}
 		return a.inFlight, false
 	}
 	refresh := &authorizationRefresh{done: make(chan struct{}), trigger: trigger}
 	a.inFlight = refresh
 	return refresh, true
-}
-
-// claimRefresh starts a refresh that the caller completes with
-// finishRefresh. Clients that need the group before it completes wait for its
-// result instead of listing the upstream again. It returns nil if a refresh is
-// already in flight.
-func (a *groupAuthorization) claimRefresh(trigger string) *authorizationRefresh {
-	refresh, owner := a.joinRefresh(trigger)
-	if !owner {
-		return nil
-	}
-	return refresh
 }
 
 func (a *groupAuthorization) runRefresh(up agent.ExtendedAgent, refresh *authorizationRefresh) {

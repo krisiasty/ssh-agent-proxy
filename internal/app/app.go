@@ -70,6 +70,20 @@ func runWithReload(
 	cacheTTL time.Duration,
 	version Version,
 ) error {
+	return runWithServers(ctx, reload, cfgPath, foreground, cacheTTL, version, newProxyServer)
+}
+
+// runWithServers is runWithReload with the factory that builds each runtime's
+// proxy server, so tests can hold a runtime in startup.
+func runWithServers(
+	ctx context.Context,
+	reload <-chan os.Signal,
+	cfgPath string,
+	foreground bool,
+	cacheTTL time.Duration,
+	version Version,
+	newServer serverFactory,
+) error {
 	log := logging.Setup(false)
 	var current *runtimeInstance
 	var lastGood *config.Config
@@ -109,7 +123,7 @@ func runWithReload(
 		if stopErr != nil {
 			log.Warn("stopping current runtime for reload", "err", stopErr)
 		}
-		current = launchRuntime(ctx, cfgPath, cfg, cacheTTL, version)
+		current = launchRuntime(ctx, newServer, cfgPath, cfg, cacheTTL, version)
 		current.reloaded = reloaded
 		current.rollbackCause = rollbackCause
 		log = current.log
@@ -254,14 +268,16 @@ type runtimeServer interface {
 	LogTelemetry()
 }
 
-// newRuntimeServer builds the proxy server for one runtime. Tests replace it
-// to hold a runtime in startup.
-var newRuntimeServer = func(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer {
+// serverFactory builds the proxy server for one runtime.
+type serverFactory func(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer
+
+func newProxyServer(ctx context.Context, upstream string, cacheTTL time.Duration, log *slog.Logger) runtimeServer {
 	return proxy.NewServer(ctx, upstream, cacheTTL, log)
 }
 
 func launchRuntime(
 	parent context.Context,
+	newServer serverFactory,
 	cfgPath string,
 	cfg *config.Config,
 	cacheTTL time.Duration,
@@ -269,7 +285,7 @@ func launchRuntime(
 ) *runtimeInstance {
 	ctx, cancel := context.WithCancel(parent)
 	log := logging.Setup(cfg.Debug)
-	srv := newRuntimeServer(ctx, cfg.Upstream, cacheTTL, log)
+	srv := newServer(ctx, cfg.Upstream, cacheTTL, log)
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	markReady := func() {

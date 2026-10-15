@@ -350,7 +350,7 @@ groups:
 		resolution["upstream_keys"] != float64(2) || resolution["resolved_keys"] != float64(2) {
 		t.Errorf("startup resolution log = %v", resolution)
 	}
-	servingIndex, readyIndex, readyCalls := -1, -1, 0
+	servingIndex, readyIndex, resolvedIndex, readyCalls := -1, -1, -1, 0
 	for i, entry := range entries {
 		switch entry["msg"] {
 		case "serving group":
@@ -358,10 +358,15 @@ groups:
 		case "server ready callback":
 			readyIndex = i
 			readyCalls++
+		case "group keys resolved":
+			resolvedIndex = i
 		}
 	}
 	if readyCalls != 1 || readyIndex <= servingIndex {
 		t.Errorf("ready callback calls = %d at index %d, serving group index = %d", readyCalls, readyIndex, servingIndex)
+	}
+	if resolvedIndex <= servingIndex {
+		t.Errorf("group keys resolved at index %d, want after serving group at index %d", resolvedIndex, servingIndex)
 	}
 
 	warnings := make(map[float64]string)

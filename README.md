@@ -413,8 +413,9 @@ upstream agent because it has no sockets to serve.
 Stopping or reloading the service interrupts outstanding upstream requests, so shutdown,
 restart, and reload complete even when the upstream agent stops responding.
 
-Group sockets are bound without waiting for the upstream agent, so a slow, locked, or
-unresponsive agent never keeps them unbound. One shared upstream identity list then
+Binding the group sockets needs only the upstream connection described above, not an
+answer from the agent, so an agent that is slow, locked, or stops answering requests does
+not keep them unbound. Once the sockets are bound, one shared upstream identity list
 resolves every enabled group in the background, and clients that connect before it
 completes wait for that list instead of sending their own. No upstream request has a time
 limit, so an agent that waits for an unlock or for interactive approval is never cut off.

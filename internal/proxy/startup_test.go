@@ -7,8 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
 	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
@@ -24,13 +24,20 @@ type startupFixture struct {
 	logs   *lockedBuffer
 	cancel context.CancelFunc
 	result *testutil.AsyncResult
+	// joined is closed when the first client waits for a refresh in flight.
+	joined chan struct{}
 }
 
 func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent) *startupFixture {
 	t.Helper()
 	dir := testutil.ShortSocketDir(t)
 	upstream := testutil.StartAgent(t, filepath.Join(dir, "upstream.sock"), backend)
-	f := &startupFixture{socket: filepath.Join(dir, "group.sock"), ready: make(chan struct{}), logs: &lockedBuffer{}}
+	f := &startupFixture{
+		socket: filepath.Join(dir, "group.sock"),
+		ready:  make(chan struct{}),
+		logs:   &lockedBuffer{},
+		joined: make(chan struct{}),
+	}
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	body := fmt.Sprintf("upstream: %q\ngroups:\n  - name: test\n    socket: %q\n    keys:\n      - comment: allowed\n", upstream, f.socket)
 	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
@@ -46,6 +53,8 @@ func startStartupFixture(t *testing.T, backend *testutil.BlockingAgent) *startup
 	log := slog.New(slog.NewJSONHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	f.srv = NewServer(ctx, upstream, 0, log)
 	f.srv.SetReadyCallback(func() { close(f.ready) })
+	var joinOnce sync.Once
+	f.srv.refreshJoined = func() { joinOnce.Do(func() { close(f.joined) }) }
 	f.result = testutil.RunAsync(func() error { return f.srv.Run(ctx, cfg.Groups) })
 	t.Cleanup(func() {
 		cancel()
@@ -92,16 +101,8 @@ func TestServerServesWhileStartupListingIsUnanswered(t *testing.T) {
 		keys, err = client.List()
 		return err
 	})
-	// The proxy counts the request just before it joins the group's pending
-	// startup refresh, so the agent answers only after the client is waiting.
-	deadline := time.Now().Add(testutil.WaitTimeout)
-	for f.srv.telemetry.listRequests.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	select {
-	case <-request.Done():
-		t.Fatalf("client List() finished before the agent answered: %v", request.Err())
-	default:
+	if !testutil.WaitForEvent(t, f.joined, "client waiting for the startup listing") {
+		return
 	}
 	backend.Release()
 	if !testutil.WaitForAsyncStop(t, request, "client List") {
@@ -135,9 +136,12 @@ func TestShutdownDuringStartupListingIsNotAnUpstreamFailure(t *testing.T) {
 		_, err := client.List()
 		return err
 	})
+	if !testutil.WaitForEvent(t, f.joined, "client waiting for the startup listing") {
+		return
+	}
 
-	// Shutdown interrupts the listing, wakes the waiting client, and returns
-	// while the agent is still unanswered.
+	// Shutdown interrupts the listing, which must still complete the startup
+	// refresh: a client left waiting for it would keep Run from returning.
 	f.cancel()
 	if !testutil.WaitForAsyncStop(t, f.result, "proxy server with unanswered startup listing") {
 		return
