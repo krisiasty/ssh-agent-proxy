@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,9 +11,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+// newTestReconnectClient wraps an injected upstream connection. Like
+// newReconnectClientWithTelemetry, it always has a lifecycle context, derived
+// here from parent, so Close and cancellation behave as in production. The
+// context ends with parent (the test's or Run's context) if Close never runs.
+func newTestReconnectClient(parent context.Context, log *slog.Logger, telemetry *proxyTelemetry, current *upstreamConn) *reconnectClient {
+	ctx, cancel := context.WithCancel(parent)
+	client := &reconnectClient{upstream: "unused", log: log, ctx: ctx, cancel: cancel, telemetry: telemetry}
+	client.current.Store(current)
+	return client
+}
 
 func TestAgentClientTransportFailureIsDetected(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
@@ -36,7 +49,7 @@ func TestAgentFailureReplyIsNotATransportFailure(t *testing.T) {
 	trackedConn := &failureTrackingConn{Conn: clientConn}
 	upstream := &upstreamConn{client: agent.NewClient(trackedConn), conn: trackedConn}
 	semanticAgent := &scriptedAgent{
-		ExtendedAgent:    newTestKeyring(t),
+		ExtendedAgent:    testutil.NewKeyring(t),
 		signWithFlagsErr: errors.New("confirmation rejected"),
 	}
 	serverDone := make(chan error, 1)
@@ -44,7 +57,7 @@ func TestAgentFailureReplyIsNotATransportFailure(t *testing.T) {
 		serverDone <- agent.ServeAgent(semanticAgent, serverConn)
 	}()
 
-	pub := addAgentKey(t, newTestKeyring(t), "test")
+	pub := addAgentKey(t, testutil.NewKeyring(t), "test")
 	_, err := upstream.client.SignWithFlags(pub, []byte("payload"), 0)
 	if err == nil {
 		t.Fatal("SignWithFlags() error = nil after agent failure reply")
@@ -65,7 +78,7 @@ func TestAgentFailureReplyIsNotATransportFailure(t *testing.T) {
 
 func TestSemanticAgentFailuresDoNotReconnectOrRetry(t *testing.T) {
 	semanticErr := errors.New("agent refused request")
-	pub := addAgentKey(t, newTestKeyring(t), "test")
+	pub := addAgentKey(t, testutil.NewKeyring(t), "test")
 
 	tests := []struct {
 		name string
@@ -100,19 +113,18 @@ func TestSemanticAgentFailuresDoNotReconnectOrRetry(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			upstream := &scriptedAgent{ExtendedAgent: newTestKeyring(t)}
+			upstream := &scriptedAgent{ExtendedAgent: testutil.NewKeyring(t)}
 			tt.set(upstream)
 			conn := &testUpstreamTransport{}
 			// Simulate another concurrent request observing an I/O failure.
 			// This semantic error must still not be mistaken for that failure.
 			conn.failed.Store(true)
 			current := &upstreamConn{client: upstream, conn: conn}
-			client := &reconnectClient{log: slog.New(slog.DiscardHandler)}
-			client.current.Store(current)
+			client := newTestReconnectClient(t.Context(), slog.New(slog.DiscardHandler), nil, current)
 			var dialCalls atomic.Int32
 			client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
 				dialCalls.Add(1)
-				return newTestKeyring(t), &testUpstreamTransport{}, nil
+				return testutil.NewKeyring(t), &testUpstreamTransport{}, nil
 			}
 
 			err := tt.call(client)
@@ -137,7 +149,7 @@ func TestSemanticAgentFailuresDoNotReconnectOrRetry(t *testing.T) {
 
 func TestSigningTransportFailureReconnectsWithoutRetry(t *testing.T) {
 	transportErr := errors.New("agent: client error: unexpected EOF")
-	pub := addAgentKey(t, newTestKeyring(t), "test")
+	pub := addAgentKey(t, testutil.NewKeyring(t), "test")
 
 	tests := []struct {
 		name string
@@ -164,14 +176,13 @@ func TestSigningTransportFailureReconnectsWithoutRetry(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			failedAgent := &scriptedAgent{ExtendedAgent: newTestKeyring(t)}
+			failedAgent := &scriptedAgent{ExtendedAgent: testutil.NewKeyring(t)}
 			tt.set(failedAgent)
 			failedConn := &testUpstreamTransport{}
 			failedConn.failed.Store(true)
-			client := &reconnectClient{log: slog.New(slog.DiscardHandler)}
-			client.current.Store(&upstreamConn{client: failedAgent, conn: failedConn})
+			client := newTestReconnectClient(t.Context(), slog.New(slog.DiscardHandler), nil, &upstreamConn{client: failedAgent, conn: failedConn})
 
-			replacementAgent := &scriptedAgent{ExtendedAgent: newTestKeyring(t)}
+			replacementAgent := &scriptedAgent{ExtendedAgent: testutil.NewKeyring(t)}
 			replacementConn := &testUpstreamTransport{}
 			var dialCalls atomic.Int32
 			client.dial = func() (agent.ExtendedAgent, net.Conn, error) {
@@ -205,17 +216,16 @@ func TestSigningTransportFailureReconnectsWithoutRetry(t *testing.T) {
 func TestConcurrentTransportFailuresInstallOneReplacement(t *testing.T) {
 	const callers = 128
 	failedAgent := &barrierListAgent{
-		ExtendedAgent: newTestKeyring(t),
+		ExtendedAgent: testutil.NewKeyring(t),
 		wantCallers:   callers,
 		ready:         make(chan struct{}),
 		release:       make(chan struct{}),
 	}
 	failedConn := &testUpstreamTransport{}
 	failedConn.failed.Store(true)
-	client := &reconnectClient{log: slog.New(slog.DiscardHandler)}
-	client.current.Store(&upstreamConn{client: failedAgent, conn: failedConn})
+	client := newTestReconnectClient(t.Context(), slog.New(slog.DiscardHandler), nil, &upstreamConn{client: failedAgent, conn: failedConn})
 
-	replacementAgent := newTestKeyring(t)
+	replacementAgent := testutil.NewKeyring(t)
 	replacementConn := &testUpstreamTransport{}
 	var dialCalls atomic.Int32
 	client.dial = func() (agent.ExtendedAgent, net.Conn, error) {

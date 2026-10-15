@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/keys"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -25,10 +26,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	up := testutil.NewKeyring(t)
 	if err := up.Add(agent.AddedKey{PrivateKey: privAllowed, Comment: "allowed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -110,10 +108,7 @@ func TestFilterAgentEnforcement(t *testing.T) {
 }
 
 func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
-	up, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	up := testutil.NewKeyring(t)
 	matcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
 		t.Fatal(err)
@@ -152,16 +147,10 @@ func TestFilterAgentTracksUpstreamKeyChanges(t *testing.T) {
 }
 
 func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
-	up := &blockingListAgent{
-		ExtendedAgent: keyring,
-		started:       make(chan struct{}),
-		release:       make(chan struct{}),
-	}
+	up := testutil.NewBlockingAgent(t, keyring)
+	up.BlockListFrom(1)
 	matcher, err := keys.NewMatcher("comment", "allowed")
 	if err != nil {
 		t.Fatal(err)
@@ -194,24 +183,21 @@ func TestConcurrentSignAuthorizationCoalescesRefresh(t *testing.T) {
 	}
 	ready.Wait()
 	close(start)
-	<-up.started
-	close(up.release)
+	<-up.Started()
+	up.Release()
 
 	for range clients {
 		if err := <-errs; err != nil {
 			t.Errorf("concurrent Sign() failed: %v", err)
 		}
 	}
-	if got := up.listCalls.Load(); got != 1 {
+	if got := up.ListCalls(); got != 1 {
 		t.Errorf("upstream List() calls = %d, want 1", got)
 	}
 }
 
 func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	pub := addAgentKey(t, keyring, "allowed")
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)
@@ -242,14 +228,6 @@ func TestFilterAgentRecoversAfterListFailure(t *testing.T) {
 	assertSigns(t, fa, pub)
 }
 
-type blockingListAgent struct {
-	agent.ExtendedAgent
-	listCalls atomic.Int64
-	started   chan struct{}
-	release   chan struct{}
-	startOnce sync.Once
-}
-
 type toggleListAgent struct {
 	agent.ExtendedAgent
 	fail      atomic.Bool
@@ -261,13 +239,6 @@ func (a *toggleListAgent) List() ([]*agent.Key, error) {
 	if a.fail.Load() {
 		return nil, errors.New("test agent is locked")
 	}
-	return a.ExtendedAgent.List()
-}
-
-func (a *blockingListAgent) List() ([]*agent.Key, error) {
-	a.listCalls.Add(1)
-	a.startOnce.Do(func() { close(a.started) })
-	<-a.release
 	return a.ExtendedAgent.List()
 }
 

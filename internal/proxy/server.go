@@ -50,7 +50,7 @@ type Server struct {
 	upstream          string
 	cacheTTL          time.Duration
 	log               *slog.Logger
-	newUpstreamClient func(context.Context, string, *slog.Logger) (*reconnectClient, error)
+	newUpstreamClient func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error)
 	listen            func(context.Context, string) (net.Listener, error)
 	onReady           func()
 	telemetry         *proxyTelemetry
@@ -79,9 +79,7 @@ func NewServer(ctx context.Context, upstream string, cacheTTL time.Duration, log
 		telemetry: newProxyTelemetry(ctx, log),
 		clients:   make(map[net.Conn]struct{}),
 	}
-	s.newUpstreamClient = func(ctx context.Context, upstream string, log *slog.Logger) (*reconnectClient, error) {
-		return newReconnectClientWithTelemetry(ctx, upstream, log, s.telemetry)
-	}
+	s.newUpstreamClient = newReconnectClientWithTelemetry
 	s.listen = s.listenUnix
 	return s
 }
@@ -101,6 +99,38 @@ func (s *Server) SetReadyCallback(callback func()) {
 // Run binds every group socket and serves connections until ctx is cancelled,
 // then removes the sockets. Run returns nil on clean shutdown.
 func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	var locks []socketLock
+	var rc *reconnectClient
+	var listeners []net.Listener
+	defer func() {
+		// Classify the operation result before joining teardown errors so that
+		// cancellation cannot hide a genuine startup or cleanup failure. Only
+		// the caller's cancellation counts: cancel has not run yet, so a
+		// context.Canceled from any other source is a real failure.
+		if ctx.Err() != nil && errors.Is(runErr, context.Canceled) {
+			runErr = nil
+		}
+		// Parent cancellation may already have interrupted upstream I/O via
+		// deadlines. On error returns, refuse clients and close listeners before
+		// canceling upstream I/O. Both paths close upstream before waiting for
+		// existing client handlers, then release socket ownership last.
+		s.refuseNewClients()
+		runErr = errors.Join(runErr, s.closeListeners(listeners))
+		cancel()
+		if rc != nil {
+			if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
+				s.log.Warn("closing upstream connection", "err", err)
+				runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
+			}
+		}
+		runErr = errors.Join(runErr, s.closeClients())
+		if err := closeSocketLocks(locks); err != nil {
+			s.log.Warn("releasing group socket locks", "err", err)
+			runErr = errors.Join(runErr, fmt.Errorf("releasing group socket locks: %w", err))
+		}
+	}()
+
 	enabledGroups := make([]config.Group, 0, len(groups))
 	for _, g := range groups {
 		if !g.IsEnabled() {
@@ -117,21 +147,19 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		<-ctx.Done()
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	socketPaths := make([]string, 0, len(enabledGroups))
 	for _, g := range enabledGroups {
 		socketPaths = append(socketPaths, g.Socket)
 	}
-	locks, err := acquireSocketLocks(socketPaths)
+	var err error
+	locks, err = acquireSocketLocks(socketPaths)
 	if err != nil {
 		return fmt.Errorf("acquiring group socket locks: %w", err)
 	}
-	defer func() {
-		if err := closeSocketLocks(locks); err != nil {
-			s.log.Warn("releasing group socket locks", "err", err)
-			runErr = errors.Join(runErr, fmt.Errorf("releasing group socket locks: %w", err))
-		}
-	}()
 
 	// Open a single shared connection to the upstream agent. All proxy clients
 	// funnel through it — this avoids overwhelming agents (e.g. Bitwarden) that
@@ -139,19 +167,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	// requests with a 32-slot FIFO queue, so writes are serialized on the wire.
 	// The reconnecting wrapper will dial a fresh connection if the current one
 	// dies, so a single failure does not kill all clients.
-	rc, err := s.newUpstreamClient(ctx, s.upstream, s.log)
+	rc, err = s.newUpstreamClient(ctx, s.upstream, s.log, s.telemetry)
 	if err != nil {
 		return err
 	}
-	if rc.telemetry == nil {
-		rc.telemetry = s.telemetry
-	}
-	defer func() {
-		if err := rc.Close(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.log.Warn("closing upstream connection", "err", err)
-			runErr = errors.Join(runErr, fmt.Errorf("closing upstream connection: %w", err))
-		}
-	}()
 	upstream := newCachedAgent(rc, s.cacheTTL, s.log, s.telemetry)
 
 	// Create one shared authorization state per group. A successful initial list
@@ -171,6 +190,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		})
 	}
 	allKeys, err := upstream.List()
+	// A List interrupted by shutdown or reload is not an upstream failure.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
 	} else {
@@ -180,16 +203,21 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		}
 	}
 
-	var listeners []net.Listener
 	acceptFailures := make(chan error, len(egs))
 	for _, eg := range egs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		g := eg.g
 		ln, err := s.listen(ctx, g.Socket)
 		if err != nil {
 			listenErr := fmt.Errorf("group %q socket %q: %w", g.Name, g.Socket, err)
-			return errors.Join(listenErr, s.closeServing(listeners))
+			return listenErr
 		}
 		listeners = append(listeners, ln)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		logAttrs := []any{"group", g.Name, "socket", g.Socket}
 		if eg.resolved {
 			logAttrs = append(logAttrs, "keys", eg.resolvedKeys)
@@ -208,14 +236,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 	select {
 	case <-ctx.Done():
 		s.log.Info("shutting down")
-		return s.closeServing(listeners)
+		return nil
 	case err := <-acceptFailures:
-		return errors.Join(err, s.closeServing(listeners))
+		return err
 	}
-}
-
-func (s *Server) closeServing(listeners []net.Listener) error {
-	return errors.Join(s.closeListeners(listeners), s.closeClients())
 }
 
 func (s *Server) closeListeners(listeners []net.Listener) error {
@@ -375,7 +399,7 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, g config.Group
 
 func (s *Server) startClient(ctx context.Context, conn net.Conn, g config.Group, authorization *groupAuthorization, upClient agent.ExtendedAgent) {
 	s.clientsMu.Lock()
-	if s.clientsClosing {
+	if s.clientsClosing || ctx.Err() != nil {
 		s.clientsMu.Unlock()
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.log.Debug("closing client accepted during shutdown", "err", err)
@@ -397,9 +421,14 @@ func (s *Server) startClient(ctx context.Context, conn net.Conn, g config.Group,
 	}()
 }
 
-func (s *Server) closeClients() error {
+func (s *Server) refuseNewClients() {
 	s.clientsMu.Lock()
 	s.clientsClosing = true
+	s.clientsMu.Unlock()
+}
+
+func (s *Server) closeClients() error {
+	s.clientsMu.Lock()
 	clients := make([]net.Conn, 0, len(s.clients))
 	for conn := range s.clients {
 		clients = append(clients, conn)

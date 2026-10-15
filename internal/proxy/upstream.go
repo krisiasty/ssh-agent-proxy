@@ -26,7 +26,15 @@ type upstreamConn struct {
 // reads, which lets reconnectClient distinguish them from a broken transport.
 type failureTrackingConn struct {
 	net.Conn
-	failed atomic.Bool
+	failed           atomic.Bool
+	stopCancellation func() bool
+}
+
+func (c *failureTrackingConn) Close() error {
+	if c.stopCancellation != nil {
+		c.stopCancellation()
+	}
+	return c.Conn.Close()
 }
 
 func (c *failureTrackingConn) Read(p []byte) (int, error) {
@@ -116,19 +124,23 @@ type reconnectClient struct {
 	upstream  string
 	log       *slog.Logger
 	ctx       context.Context
+	cancel    context.CancelFunc
 	current   atomic.Pointer[upstreamConn]
 	telemetry *proxyTelemetry
 
 	dial func() (agent.ExtendedAgent, net.Conn, error)
 
-	mu sync.Mutex // guards reconnect: only one goroutine reconnects at a time
+	mu       sync.Mutex // guards reconnect and shutdown
+	closed   bool
+	closeErr error
 }
 
 func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+	clientCtx, cancelClient := context.WithCancel(parentCtx)
 	var connectionAttempt atomic.Uint64
 	dial := func() (agent.ExtendedAgent, net.Conn, error) {
 		attempt := connectionAttempt.Add(1)
-		ctx, cancel := context.WithTimeout(parentCtx, dialTimeout)
+		ctx, cancel := context.WithTimeout(clientCtx, dialTimeout)
 		defer cancel()
 		call := beginTrackedUpstreamCall(ctx, log, telemetry, "connect", "attempt", attempt, "upstream", upstream)
 
@@ -138,18 +150,26 @@ func newReconnectClientWithTelemetry(parentCtx context.Context, upstream string,
 			return nil, nil, fmt.Errorf("connecting to upstream agent: %w", err)
 		}
 		trackedConn := &failureTrackingConn{Conn: conn}
+		// Cancellation interrupts every pending wire operation without closing
+		// resources outside the server's ordered teardown. Signing has no
+		// deadline until the lifetime of this connection is canceled.
+		trackedConn.stopCancellation = context.AfterFunc(clientCtx, func() {
+			_ = conn.SetDeadline(time.Now())
+		})
 		call.finish(nil)
 		return agent.NewClient(trackedConn), trackedConn, nil
 	}
 	rc := &reconnectClient{
 		upstream:  upstream,
 		log:       log,
-		ctx:       parentCtx,
+		ctx:       clientCtx,
+		cancel:    cancelClient,
 		telemetry: telemetry,
 		dial:      dial,
 	}
 	client, conn, err := rc.dial()
 	if err != nil {
+		cancelClient()
 		return nil, fmt.Errorf("initial upstream connection: %w", err)
 	}
 	rc.current.Store(&upstreamConn{client: client, conn: conn})
@@ -161,10 +181,11 @@ func (r *reconnectClient) get() agent.ExtendedAgent {
 }
 
 func (r *reconnectClient) logContext() context.Context {
-	if r.ctx != nil {
-		return r.ctx
-	}
-	return context.Background()
+	return r.ctx
+}
+
+func (r *reconnectClient) canceled() bool {
+	return r.ctx.Err() != nil
 }
 
 // reconnect replaces failed if it is still the current upstream connection.
@@ -176,6 +197,9 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.closed || r.canceled() {
+		return false
+	}
 	if r.current.Load() != failed {
 		return true
 	}
@@ -183,8 +207,16 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	// Dial the replacement **before** touching the live pointer.
 	client, conn, err := r.dial()
 	if err != nil {
-		r.log.Warn("upstream reconnect failed, proxy may not work", "err", err)
+		if !r.canceled() {
+			r.log.Warn("upstream reconnect failed, proxy may not work", "err", err)
+		}
 		return false // keep old connection intact
+	}
+	if r.canceled() {
+		if err := conn.Close(); err != nil {
+			r.log.Warn("closing upstream connection dialed during shutdown", "err", err)
+		}
+		return false
 	}
 
 	old := r.current.Swap(&upstreamConn{client: client, conn: conn})
@@ -198,19 +230,26 @@ func (r *reconnectClient) reconnect(failed *upstreamConn) bool {
 	return true
 }
 
-// Close closes the current upstream connection.
+// Close interrupts reconnects and closes the current upstream connection once.
+// Repeated calls return the original close result.
 func (r *reconnectClient) Close(ctx context.Context) error {
+	// Cancel before taking mu so an in-progress reconnect dial can finish.
+	r.cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.closed {
+		return r.closeErr
+	}
+	r.closed = true
 	current := r.current.Load()
 	if current == nil {
 		return nil
 	}
 	call := beginTrackedUpstreamCall(ctx, r.log, r.telemetry, "close", "connection", "current")
-	err := current.conn.Close()
-	call.finish(err)
-	return err
+	r.closeErr = current.conn.Close()
+	call.finish(r.closeErr)
+	return r.closeErr
 }
 
 func (r *reconnectClient) List() ([]*agent.Key, error) {

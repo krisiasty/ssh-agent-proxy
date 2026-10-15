@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/krisiasty/ssh-agent-proxy/internal/config"
+	"github.com/krisiasty/ssh-agent-proxy/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -105,9 +106,8 @@ func TestServerRunPropagatesTerminalAcceptFailure(t *testing.T) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
-	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger, ctx: ctx}
-		rc.current.Store(&upstreamConn{client: newTestKeyring(t), conn: clientConn})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := newTestReconnectClient(ctx, logger, telemetry, &upstreamConn{client: testutil.NewKeyring(t), conn: clientConn})
 		return rc, nil
 	}
 
@@ -260,6 +260,23 @@ func TestServerRunReturnsInitialDialError(t *testing.T) {
 	}
 }
 
+func TestServerRunReportsForeignCancellationError(t *testing.T) {
+	t.Parallel()
+
+	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
+	foreign := fmt.Errorf("dependency gave up: %w", context.Canceled)
+	srv.newUpstreamClient = func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error) {
+		return nil, foreign
+	}
+	groups := []config.Group{{Name: "test", Socket: filepath.Join(testutil.ShortSocketDir(t), "group.sock")}}
+
+	// Run's own context is live, so context.Canceled from a dependency is a
+	// startup failure, not a clean shutdown.
+	if err := srv.Run(t.Context(), groups); !errors.Is(err, foreign) {
+		t.Fatalf("Run() error = %v, want %v", err, foreign)
+	}
+}
+
 func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	var output bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -267,36 +284,29 @@ func TestServerRunResolvesGroupsWithSingleStartupList(t *testing.T) {
 	srv.SetReadyCallback(func() {
 		log.Info("server ready callback")
 	})
-	keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
-	if !ok {
-		t.Fatal("agent.NewKeyring does not implement agent.ExtendedAgent")
-	}
+	keyring := testutil.NewKeyring(t)
 	first := addAgentKey(t, keyring, "shared")
 	addAgentKey(t, keyring, "shared")
 	up := &countingListAgent{ExtendedAgent: keyring}
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, log *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: log}
-		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, log *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := newTestReconnectClient(ctx, log, telemetry, &upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	stopped := make(chan struct{})
+	var done *testutil.AsyncResult
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-stopped:
-		case <-time.After(5 * time.Second):
-			t.Error("Server.Run() did not stop during cleanup")
+		if done != nil {
+			testutil.WaitForAsyncStop(t, done, "proxy server")
 		}
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
 
-	socket := filepath.Join(shortSocketDir(t), "group.sock")
+	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	cfgData := fmt.Sprintf(`upstream: /tmp/upstream.sock
 groups:
@@ -315,17 +325,14 @@ groups:
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		done <- srv.Run(ctx, cfg.Groups)
-		close(stopped)
-	}()
-	waitForSocket(t, socket, done)
+	done = testutil.RunAsync(func() error { return srv.Run(ctx, cfg.Groups) })
+	waitForSocket(t, socket, done, nil)
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during startup = %d, want 1", got)
 	}
 
 	cancel()
-	if err := <-done; err != nil {
+	if err := done.Err(); err != nil {
 		t.Fatalf("Server.Run() error = %v, want nil", err)
 	}
 	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -385,36 +392,29 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	var output lockedBuffer
 	log := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := NewServer(t.Context(), "unused", 0, log)
-	keyring := newTestKeyring(t)
+	keyring := testutil.NewKeyring(t)
 	up := &toggleListAgent{ExtendedAgent: keyring}
 	up.fail.Store(true)
 	clientConn, serverConn := net.Pipe()
-	srv.newUpstreamClient = func(_ context.Context, _ string, logger *slog.Logger) (*reconnectClient, error) {
-		rc := &reconnectClient{upstream: "unused", log: logger}
-		rc.current.Store(&upstreamConn{client: up, conn: clientConn})
+	srv.newUpstreamClient = func(ctx context.Context, _ string, logger *slog.Logger, telemetry *proxyTelemetry) (*reconnectClient, error) {
+		rc := newTestReconnectClient(ctx, logger, telemetry, &upstreamConn{client: up, conn: clientConn})
 		return rc, nil
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	stopped := make(chan struct{})
+	var done *testutil.AsyncResult
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-stopped:
-		case <-time.After(5 * time.Second):
-			t.Error("Server.Run() did not stop during cleanup")
+		if done != nil {
+			testutil.WaitForAsyncStop(t, done, "proxy server")
 		}
 		if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("closing upstream server connection: %v", err)
 		}
 	})
-	socket := filepath.Join(shortSocketDir(t), "group.sock")
-	go func() {
-		done <- srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}})
-		close(stopped)
-	}()
-	waitForSocket(t, socket, done)
+	socket := filepath.Join(testutil.ShortSocketDir(t), "group.sock")
+	done = testutil.RunAsync(func() error { return srv.Run(ctx, []config.Group{{Name: "test", Socket: socket}}) })
+	waitForSocket(t, socket, done, nil)
 	if got := up.listCalls.Load(); got != 1 {
 		t.Errorf("upstream List() calls during failed startup resolution = %d, want 1", got)
 	}
@@ -442,11 +442,18 @@ func TestServerRunDefersResolutionAfterStartupListFailure(t *testing.T) {
 	}
 
 	cancel()
-	if err := <-done; err != nil {
+	if err := done.Err(); err != nil {
 		t.Fatalf("Server.Run() error = %v, want nil", err)
 	}
 	if err := serverConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closing upstream server connection: %v", err)
+	}
+
+	if got := srv.telemetry.upstreamCalls.Load(); got != 3 {
+		t.Errorf("injected client upstream calls = %d, want failed list, successful list and close", got)
+	}
+	if got := srv.telemetry.upstreamErrors.Load(); got != 1 {
+		t.Errorf("injected client upstream errors = %d, want 1", got)
 	}
 
 	entries := decodeDebugLogs(t, output.Bytes())
@@ -489,9 +496,17 @@ func (a *countingListAgent) List() ([]*agent.Key, error) {
 	return a.ExtendedAgent.List()
 }
 
-func waitForSocket(t *testing.T, path string, done <-chan error) {
+// waitForSocket waits until path is a socket and fails early if its owner
+// stops first. diagnostic, when non-nil, adds context to failure messages.
+func waitForSocket(t *testing.T, path string, owner *testutil.AsyncResult, diagnostic func() string) {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	details := func() string {
+		if diagnostic == nil {
+			return ""
+		}
+		return "\n" + diagnostic()
+	}
+	deadline := time.NewTimer(testutil.WaitTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -499,20 +514,20 @@ func waitForSocket(t *testing.T, path string, done <-chan error) {
 		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
 			return
 		} else if err != nil && !os.IsNotExist(err) {
-			t.Fatalf("inspecting group socket: %v", err)
+			t.Fatalf("inspecting socket %q: %v", path, err)
 		}
 		select {
-		case err := <-done:
-			t.Fatalf("Server.Run() returned before serving a socket: %v", err)
+		case <-owner.Done():
+			t.Fatalf("socket owner stopped before serving %q: %v%s", path, owner.Err(), details())
 		case <-deadline.C:
-			t.Fatal("timed out waiting for group socket")
+			t.Fatalf("timed out waiting for socket %q%s", path, details())
 		case <-ticker.C:
 		}
 	}
 }
 
 func TestListenRefusesLiveSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	live := listenUnix(t, path)
 
@@ -534,7 +549,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 }
 
 func TestListenReplacesOnlyStaleSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	stale := listenUnix(t, path)
 	closeListener(t, stale)
@@ -554,7 +569,7 @@ func TestListenReplacesOnlyStaleSocket(t *testing.T) {
 }
 
 func TestListenerClosePreservesReplacementSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 
@@ -583,7 +598,7 @@ func TestListenerClosePreservesReplacementSocket(t *testing.T) {
 }
 
 func TestSecondServerProcessCannotTakeOverSocket(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := testutil.ShortSocketDir(t)
 	path := filepath.Join(dir, "group.sock")
 	lock, err := acquireSocketLock(path)
 	if err != nil {
@@ -617,7 +632,7 @@ func TestSocketLockHelper(t *testing.T) {
 	case "blocked":
 		srv := NewServer(t.Context(), "unused", 0, slog.New(slog.DiscardHandler))
 		upstreamCalled := false
-		srv.newUpstreamClient = func(context.Context, string, *slog.Logger) (*reconnectClient, error) {
+		srv.newUpstreamClient = func(context.Context, string, *slog.Logger, *proxyTelemetry) (*reconnectClient, error) {
 			upstreamCalled = true
 			return nil, errors.New("upstream constructor must not run while socket is locked")
 		}
@@ -655,21 +670,6 @@ func runSocketLockHelper(t *testing.T, path, expectation string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("socket lock subprocess failed: %v\n%s", err, output)
 	}
-}
-
-func shortSocketDir(t *testing.T) string {
-	t.Helper()
-	//nolint:usetesting // Unix socket paths on macOS cannot safely fit beneath t.TempDir().
-	dir, err := os.MkdirTemp("/tmp", "ssh-agent-proxy-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Errorf("removing socket test directory: %v", err)
-		}
-	})
-	return dir
 }
 
 func listenUnix(t *testing.T, path string) net.Listener {

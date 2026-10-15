@@ -130,12 +130,17 @@ ssh-agent-proxy -reload
 
 sends `SIGHUP` to the running managed service. The process reads and validates its
 configured file before disturbing the active proxy. If validation fails, it logs the
-error and keeps serving the current configuration. After successful validation it
+error and keeps a serving runtime or a rollback already in progress. If no configuration
+has reached readiness yet, it also keeps a runtime that is still starting. An invalid
+reload leaves an already idle service idle. After successful validation it
 replaces the upstream connection and group listeners; existing client connections are
 closed so clients reconnect against the new authorization state.
 
 If replacement startup fails—for example, because a new socket cannot be bound—the
-proxy restores the previous working configuration. A managed service that is idling
+proxy restores the last configuration that reached readiness. This also applies when
+a reload interrupts a stalled replacement and the newly saved configuration is invalid.
+With no ready configuration to restore, managed mode idles and foreground mode returns
+the startup error. A managed service that is idling
 after an initial config or upstream error can also recover when reloaded. A foreground
 process accepts `SIGHUP` directly; `-reload` specifically targets the installed managed
 service. The command-line `--cache` value is not reloaded because it is stored in the
@@ -402,6 +407,9 @@ opened, the service logs the error and idles rather than exiting into a restart 
 the config or upstream agent and reload the service. In `-foreground` mode it returns
 the error and exits instead. With no enabled groups, it idles without connecting to the
 upstream agent because it has no sockets to serve.
+
+Stopping or reloading the service interrupts outstanding upstream requests, allowing
+recovery even when the upstream agent stops responding.
 
 One shared upstream identity list resolves every enabled group during startup. If the
 connected upstream agent is locked or listing otherwise fails, the proxy still starts
