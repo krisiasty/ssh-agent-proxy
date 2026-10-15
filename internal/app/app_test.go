@@ -640,6 +640,84 @@ func TestInvalidReloadKeepsPendingRollback(t *testing.T) {
 	}
 }
 
+func TestRestoredRollbackOnStalledUpstreamStaysInterruptible(t *testing.T) {
+	for _, exit := range []string{"shutdown", "repeated invalid reload", "valid reload"} {
+		t.Run(exit, func(t *testing.T) {
+			events, finish := captureRuntimeLogs(t)
+			dir := testutil.ShortSocketDir(t)
+			backend := &reloadBlockingAgent{Agent: agent.NewKeyring(), blocked: make(chan struct{}), release: make(chan struct{})}
+			shared := startTestAgentWithBackend(t, filepath.Join(dir, "shared.sock"), backend)
+			healthy := startTestAgent(t, filepath.Join(dir, "healthy.sock"))
+			path, socket := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "group.sock")
+			writeReloadConfig(t, path, shared, "original", socket)
+			ctx, cancel := context.WithCancel(t.Context())
+			reload := make(chan os.Signal, 1)
+			done := testutil.RunAsync(func() error {
+				return runWithReload(ctx, reload, path, false, 0, Version{Version: "test"})
+			})
+			var release sync.Once
+			t.Cleanup(func() {
+				cancel()
+				release.Do(func() { close(backend.release) })
+				testutil.WaitForAsyncStop(t, done, "runtime")
+			})
+
+			// The readiness probe lists through the proxy, so the shared
+			// upstream has seen two List calls before it stalls.
+			waitForAgentSocket(t, socket)
+			backend.stall.Store(true)
+			writeReloadConfig(t, path, shared, "replacement", socket)
+			reload <- syscall.SIGHUP
+			if !testutil.WaitForEvent(t, backend.blocked, "stalled replacement") {
+				return
+			}
+			if err := os.WriteFile(path, []byte("not: valid: yaml\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reload <- syscall.SIGHUP
+			waitForRuntimeLog(t, events, "restoring previous configuration")
+			const stalledCalls = 4
+			deadline := time.Now().Add(testutil.WaitTimeout)
+			for backend.listCalls.Load() < stalledCalls && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if calls := backend.listCalls.Load(); calls != stalledCalls {
+				t.Fatalf("restored rollback did not stall in List: calls = %d, want %d", calls, stalledCalls)
+			}
+
+			switch exit {
+			case "repeated invalid reload":
+				for range 3 {
+					reload <- syscall.SIGHUP
+					waitForRuntimeLog(t, events, "configuration reload failed; keeping current configuration")
+				}
+				if calls := backend.listCalls.Load(); calls != stalledCalls {
+					t.Errorf("invalid reload relaunched the rollback: List calls = %d, want %d", calls, stalledCalls)
+				}
+			case "valid reload":
+				writeReloadConfig(t, path, healthy, "recovered", socket)
+				reload <- syscall.SIGHUP
+				waitForRuntimeLog(t, events, "configuration reloaded")
+				waitForAgentSocket(t, socket)
+			}
+
+			// Shut down while the shared upstream is still stalled.
+			cancel()
+			if !testutil.WaitForAsyncStop(t, done, "runtime with stalled upstream") {
+				return
+			}
+			if err := done.Err(); err != nil {
+				t.Errorf("shutdown: %v", err)
+			}
+			for _, entry := range finish() {
+				if entry["msg"] == "initial config key resolution failed; deferring until client request" {
+					t.Errorf("canceled startup List was logged as an upstream failure: %v", entry)
+				}
+			}
+		})
+	}
+}
+
 func TestRuntimeLogCaptureRetainsBufferedEvents(t *testing.T) {
 	events, finish := captureRuntimeLogs(t)
 	encoder := json.NewEncoder(os.Stdout)

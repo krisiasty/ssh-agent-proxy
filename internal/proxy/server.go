@@ -188,6 +188,10 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 		})
 	}
 	allKeys, err := upstream.List()
+	// A List interrupted by shutdown or reload is not an upstream failure.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err != nil {
 		s.log.Warn("initial config key resolution failed; deferring until client request", "err", err)
 	} else {
@@ -195,9 +199,6 @@ func (s *Server) Run(ctx context.Context, groups []config.Group) (runErr error) 
 			egs[i].resolvedKeys = len(egs[i].authorization.resolve(allKeys, "startup"))
 			egs[i].resolved = true
 		}
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 
 	acceptFailures := make(chan error, len(egs))
